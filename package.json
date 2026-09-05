@@ -1,0 +1,40 @@
+{
+  "name": "wealthflow-bms",
+  "version": "1.1.0",
+  "private": true,
+  "type": "module",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js",
+    "build": "echo 'Frontend pre-built in public folder'",
+    "test:extractor": "node src/lib/extractor.test.mjs",
+    "test:rates": "node src/lib/effectiveRates.test.mjs",
+    "test": "node src/lib/extractor.test.mjs && node src/lib/effectiveRates.test.mjs && node src/lib/clawback.test.mjs && node src/lib/residual.test.mjs",
+    "test:residual": "node src/lib/residual.test.mjs"
+  },
+  "dependencies": {
+    "bcrypt": "^5.1.1",
+    "compression": "^1.8.1",
+    "cors": "^2.8.5",
+    "dotenv": "^16.3.1",
+    "express": "^4.21.1",
+    "express-rate-limit": "^7.1.5",
+    "jsonwebtoken": "^9.0.2",
+    "multer": "^1.4.5-lts.1",
+    "mysql2": "^3.11.0",
+    "nodemailer": "^6.9.14",
+    "pdf-parse": "^1.1.1",
+    "pdfjs-dist": "^4.4.168",
+    "xlsx": "^0.18.5"
+  },
+  "optionalDependencies": {
+    "canvas": "^3.2.1",
+    "tesseract.js": "^7.0.0"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  },
+  "devDependencies": {
+    "tailwindcss": "^4.2.1"
+  }
+}

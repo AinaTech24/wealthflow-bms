@@ -1,0 +1,1 @@
+import{_ as n}from"./index-DVnkPU6O.js";async function a(e,s,_="Sheet1"){const t=await n(()=>import("./xlsx-D_0l8YDs.js"),[]),i=t.utils.json_to_sheet(e),o=t.utils.book_new();t.utils.book_append_sheet(o,i,_),t.writeFile(o,`${s}.xlsx`)}export{a as e};

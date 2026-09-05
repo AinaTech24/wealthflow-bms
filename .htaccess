@@ -1,0 +1,8 @@
+PassengerEnabled on
+PassengerAppRoot /home/u477139614/domains/nflx.in/public_html
+PassengerAppType node
+PassengerNodejs /opt/alt/alt-nodejs22/root/bin/node
+# Production runs server.js (verified in public_html/.htaccess on the host).
+# Keep this in sync with the live config. index.js is the retired legacy backend.
+PassengerStartupFile server.js
+PassengerBaseURI /

@@ -1,0 +1,73 @@
+name: Deploy Frontend
+
+# Builds the SPA in "Source Code/" and ships dist/ to the Hostinger web root.
+# Mirrors the manual steps in DEPLOY.md.
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'Source Code/**'
+      - '.github/workflows/deploy-frontend.yml'
+  workflow_dispatch:
+
+concurrency:
+  group: deploy-frontend
+  cancel-in-progress: false
+
+env:
+  SSH_HOST: 72.60.207.128
+  SSH_PORT: '65002'
+  SSH_USER: u477139614
+  REMOTE_DIR: /home/u477139614/domains/nflx.in/nodejs
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+          cache-dependency-path: 'Source Code/package-lock.json'
+
+      - name: Install dependencies
+        working-directory: 'Source Code'
+        run: npm ci
+
+      - name: Build (tsc && vite build)
+        working-directory: 'Source Code'
+        run: npm run build
+
+      - name: Configure SSH
+        run: |
+          mkdir -p ~/.ssh
+          printf '%s\n' "${{ secrets.SSH_PRIVATE_KEY }}" > ~/.ssh/deploy_key
+          chmod 600 ~/.ssh/deploy_key
+          ssh-keyscan -p "$SSH_PORT" "$SSH_HOST" >> ~/.ssh/known_hosts 2>/dev/null
+
+      - name: Back up live index.html (keep last 5)
+        run: |
+          ssh -i ~/.ssh/deploy_key -p "$SSH_PORT" "$SSH_USER@$SSH_HOST" \
+            "cd $REMOTE_DIR/public && cp index.html index.html.bak-ci-\$(date +%Y%m%d-%H%M%S) && \
+             ls -1t index.html.bak-ci-* 2>/dev/null | tail -n +6 | xargs -r rm --"
+
+      - name: Upload bundles + index.html
+        run: |
+          scp -i ~/.ssh/deploy_key -P "$SSH_PORT" "Source Code/dist/assets/"* \
+            "$SSH_USER@$SSH_HOST:$REMOTE_DIR/public/assets/"
+          scp -i ~/.ssh/deploy_key -P "$SSH_PORT" "Source Code/dist/index.html" \
+            "$SSH_USER@$SSH_HOST:$REMOTE_DIR/public/index.html"
+
+      - name: Restart Passenger
+        run: |
+          ssh -i ~/.ssh/deploy_key -p "$SSH_PORT" "$SSH_USER@$SSH_HOST" \
+            "touch $REMOTE_DIR/tmp/restart.txt"
+
+      - name: Verify live bundle + health
+        run: |
+          sleep 15
+          echo "Live bundle: $(curl -fsS https://nflx.in/ | grep -oE 'assets/index-[A-Za-z0-9_.-]+\.js' | head -1)"
+          curl -fsS https://nflx.in/api/health

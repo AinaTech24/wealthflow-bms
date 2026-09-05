@@ -1,0 +1,74 @@
+name: Deploy Backend
+
+# Ships server.js (the live entrypoint - index.js is retired) and src/ to Hostinger.
+# Mirrors the manual steps in DEPLOY.md.
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'server.js'
+      - 'src/**'
+      - 'package.json'
+      - 'package-lock.json'
+      - '.htaccess'
+      - '.github/workflows/deploy-backend.yml'
+  workflow_dispatch:
+
+concurrency:
+  group: deploy-backend
+  cancel-in-progress: false
+
+env:
+  SSH_HOST: 72.60.207.128
+  SSH_PORT: '65002'
+  SSH_USER: u477139614
+  REMOTE_DIR: /home/u477139614/domains/nflx.in/nodejs
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 2
+
+      - name: Configure SSH
+        run: |
+          mkdir -p ~/.ssh
+          printf '%s\n' "${{ secrets.SSH_PRIVATE_KEY }}" > ~/.ssh/deploy_key
+          chmod 600 ~/.ssh/deploy_key
+          ssh-keyscan -p "$SSH_PORT" "$SSH_HOST" >> ~/.ssh/known_hosts 2>/dev/null
+
+      - name: Back up live server.js (keep last 5)
+        run: |
+          ssh -i ~/.ssh/deploy_key -p "$SSH_PORT" "$SSH_USER@$SSH_HOST" \
+            "cd $REMOTE_DIR && cp server.js server.js.bak-ci-\$(date +%Y%m%d-%H%M%S) && \
+             ls -1t server.js.bak-ci-* 2>/dev/null | tail -n +6 | xargs -r rm --"
+
+      - name: Upload server.js + src/
+        run: |
+          scp -i ~/.ssh/deploy_key -P "$SSH_PORT" server.js \
+            "$SSH_USER@$SSH_HOST:$REMOTE_DIR/server.js"
+          scp -i ~/.ssh/deploy_key -P "$SSH_PORT" -r src/lib src/middleware src/routes \
+            "$SSH_USER@$SSH_HOST:$REMOTE_DIR/src/"
+
+      - name: Warn if dependencies changed
+        run: |
+          if git diff --name-only HEAD~1 HEAD 2>/dev/null | grep -qE '^package(-lock)?\.json$'; then
+            echo "::warning::package.json changed - run 'npm install --omit=dev' on the server manually."
+            echo "  ssh -i ~/.ssh/hostinger_nflx_deploy -p 65002 $SSH_USER@$SSH_HOST"
+            echo "  cd $REMOTE_DIR && export PATH=/opt/alt/alt-nodejs22/root/usr/bin:\$PATH && npm install --omit=dev"
+          fi
+
+      - name: Restart Passenger
+        run: |
+          ssh -i ~/.ssh/deploy_key -p "$SSH_PORT" "$SSH_USER@$SSH_HOST" \
+            "touch $REMOTE_DIR/tmp/restart.txt"
+
+      - name: Verify /api/health
+        run: |
+          sleep 15
+          body=$(curl -fsS https://nflx.in/api/health)
+          echo "$body"
+          echo "$body" | grep -q '"database":"connected"' || { echo "::error::DB not connected after deploy"; exit 1; }
