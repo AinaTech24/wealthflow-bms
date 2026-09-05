@@ -43,6 +43,10 @@ jobs:
 
       - name: Configure SSH
         run: |
+          if [ -z "${{ secrets.SSH_PRIVATE_KEY }}" ]; then
+            echo "::error::SSH_PRIVATE_KEY secret is not set. Run: gh secret set SSH_PRIVATE_KEY --repo AinaTech24/wealthflow-bms < ~/.ssh/hostinger_nflx_deploy"
+            exit 1
+          fi
           mkdir -p ~/.ssh
           printf '%s\n' "${{ secrets.SSH_PRIVATE_KEY }}" > ~/.ssh/deploy_key
           chmod 600 ~/.ssh/deploy_key

@@ -5,12 +5,12 @@
   "type": "module",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/JDPATEL-1410/wealthflowbms.git"
+    "url": "git+https://github.com/AinaTech24/wealthflow-bms.git"
   },
   "bugs": {
-    "url": "https://github.com/JDPATEL-1410/wealthflowbms/issues"
+    "url": "https://github.com/AinaTech24/wealthflow-bms/issues"
   },
-  "homepage": "https://github.com/JDPATEL-1410/wealthflowbms#readme",
+  "homepage": "https://github.com/AinaTech24/wealthflow-bms#readme",
   "scripts": {
     "dev": "vite",
     "build": "tsc && vite build",
