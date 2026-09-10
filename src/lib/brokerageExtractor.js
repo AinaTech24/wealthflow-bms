@@ -327,7 +327,7 @@ export const cleanSchemeName = (line) => {
         // the whole scheme name so the row was silently dropped (real case:
         // "Bajaj FinServ Balance Advantage Fund" vanished while every sibling
         // scheme parsed fine). Never cut a scheme name at "Balance(d) Advantage".
-        s = s.replace(/\s*\b(NAV|investment|remaining|amount|balanced?(?!\s+advantage)|units|period|allotment)\b.*/gi, "").trim();
+        s = s.replace(/\s*\b(NAV|investment|remaining|amount|balanced?(?!\s+(?:advantage|hybrid|fund))|units|period|allotment)\b.*/gi, "").trim();
         // Only strip pure category section headers, NOT legitimate fund type suffixes like "Fund of Fund"
         s = s.replace(/\s+\b(Sectoral|Thematic|Sectoral\/ Thematic|Sectoral \/Thematic|Sectoral \/ Thematic)\b.*$/gi, "").trim();
         s = s.replace(/\s*[<>]\s*$/g, "").trim();
@@ -601,9 +601,36 @@ const splitCategoryScheme = (raw) => {
  * e.g. "Equity360 ONE Flexicap Fund0.75%" → "360 ONE Flexicap Fund 0.75%"
  * Also handles "Hybrid360 ONE ...", "Debt360 ONE ...", "Liquid360 ONE ..."
  */
+/**
+ * Cut an exit-load clause out of a line that also carries the scheme and its rates.
+ *
+ * Several AMCs put all three on ONE line:
+ *   "Edelweiss Multi cap Fund Exit load of 1% if redeemed within 90 Days 0.98% 0.98% 0.98%"
+ *   "Canara Robeco Value Fund1.00% - if redeemed/switched out within 365 days
+ *    from the date of allotment.1.25 1.25"
+ *
+ * isNoiseLine() drops any line that mentions an exit load next to a number, so the
+ * WHOLE row went — the scheme name and its trail rates with it. Edelweiss lost every
+ * one of its schemes that way, and Canara lost seven.
+ *
+ * The clause runs from the exit-load rate up to the trailing run of trail rates that
+ * ends the line, so that run is what we anchor on. A line that is ONLY an exit-load
+ * note has no such trailing run, nothing is removed, and isNoiseLine still drops it.
+ */
+const EXIT_LOAD_CLAUSE =
+    /(?:exit\s*load\b[^%\d]{0,30})?\d+(?:\.\d+)?\s*%?\s*[-–]?\s*[^%\d]{0,30}?(?:if\s+redeemed|if\s+units|if\s+switched|redeemed\s*\/?\s*switched?(?:[-\s]*out)?)[\s\S]*?[.,]?(?=\s*(?:\d+(?:\.\d+)?\s*%?[\s,]*){1,8}$)/gi;
+
+const stripExitLoadClause = (line) => {
+    if (!/exit\s*load|if\s+redeemed|redeemed\s*\/?\s*switch|switched[-\s]*out|if\s+units/i.test(line)) return line;
+    return line.replace(EXIT_LOAD_CLAUSE, ' ').replace(/\s{2,}/g, ' ').trim();
+};
+
 const preProcessConcatenatedLines = (lines) => {
     const CATEGORY_PREFIXES = ['Equity', 'Hybrid', 'Debt', 'Liquid', 'Index', 'Cash', 'Solution', 'Other'];
     return lines.map(line => {
+        // Take the exit-load clause out FIRST, so a real scheme row that happens to
+        // carry its exit load inline survives isNoiseLine().
+        line = stripExitLoadClause(line);
         // Pattern: CategoryBrandName SchemeName FundRate%
         // e.g. "Equity360 ONE Flexicap Fund0.75%"
         for (const cat of CATEGORY_PREFIXES) {

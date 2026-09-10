@@ -79,6 +79,39 @@ shouldSkip('Exit load 1.00% if redeemed within 12 months');
 shouldSkip('Scheme Name Trail (%)');
 shouldSkip('Total T30 Payout 1.50');
 
+// ── Exit load on the SAME line as the scheme and its rates ─────────────────
+// isNoiseLine() drops any line mentioning an exit load next to a number. That is
+// right for a standalone note, but several AMCs put the scheme, its exit load and
+// its trail rates all on one line — and the whole row went. Edelweiss lost every
+// scheme it has this way; Canara lost seven.
+shouldParse('Edelweiss Multi cap Fund Exit load of 1% if redeemed within 90 Days 0.98% 0.98% 0.98%',
+  { nameHas: 'Multi cap', rate: 0.98 });
+shouldParse('Edelweiss Altiva Hybrid Long-Short Fund Exit load of 0.50% if redeemed within 30 Days 0.60% 0.60% 0.60%',
+  { nameHas: 'Long-Short', rate: 0.60 });
+// The clause can end in "thereafter Nil" before the rates resume.
+shouldParse('Edelweiss Silver ETF Fund of Fund Exit load of 0.10% if redeemed within 15 Days, thereafter Nil 0.35% 0.35%',
+  { nameHas: 'Silver', rate: 0.35 });
+// Canara writes the load with no "exit load" words at all — just a rate, a
+// redemption condition, and the trail glued on after "allotment".
+shouldParse('Canara Robeco Value Fund1.00% - if redeemed/switched out within 365 days from the date of allotment.1.25 1.25',
+  { nameHas: 'Value Fund', rate: 1.25 });
+shouldParse('Canara Robeco Small Cap Fund1.00% if redeemed / switched-out within 1 year from the date of allotment. 0.90 0.90',
+  { nameHas: 'Small Cap', rate: 0.90 });
+// A line that is ONLY an exit-load note has no trailing rates, so nothing is cut
+// and it is still discarded.
+shouldSkip('Exit load 1.00% if redeemed within 12 months');
+shouldSkip('1% if redeemed or switched out within 365 days from the date of allotment');
+
+// ── "Balanced <something> Fund" is a scheme, not boilerplate ───────────────
+// The stripper cuts a name at "balance/balanced" to kill "… on the balance units".
+// It exempted "Balanced Advantage" only, so "Balanced Hybrid Fund" — a real SEBI
+// category — was truncated to the brand alone and then dropped as too short.
+shouldParse('Hybrid360 ONE Balanced Hybrid Fund0.80%', { nameHas: 'Balanced Hybrid', rate: 0.80 });
+shouldParse('Kotak Balanced Hybrid Fund 0.95%', { nameHas: 'Balanced Hybrid', rate: 0.95 });
+shouldParse('HDFC Balanced Advantage Fund 1.10%', { nameHas: 'Balanced Advantage', rate: 1.10 });
+shouldSkip('Some Fund on the balance units 1.20');
+
+
 // ── Basis-point tables (Motilal Oswal) ────────────────────────────────────
 // The whole structure is bare integers in bps: "70 13 83" = Trail, GST, Total.
 // extractPercentages() needs a "%" or a decimal point, so every one of these
