@@ -993,22 +993,29 @@ export const Reports: React.FC<ReportsProps> = ({ currentUser }) => {
         // row routinely carries a date from March. Both windows then picked the very
         // same rows and month-over-month growth came out 0.00% for everyone.
         // Order within a window by period first, then date, so the latest month wins.
-        if (tx.currentValue != null) {
+        // A ZERO is an import that carried no AUM, not a folio worth nothing. June
+        // 2026 has 32,937 such rows, and because they rank latest they were
+        // overwriting April and May's real snapshots with nothing.
+        const aum = Number(tx.currentValue) || 0;
+        if (aum > 0) {
           const rank = `${period}|${txDate}`;
           // Compared by month for the same reason as inRange above — relying on
           // "2026-07" <= "2026-07-31" happening to be true is luck, not intent.
-          if (monthOf(period) <= monthOf(currEnd)) upsertSnap(snapCurr, folioKey, rank, tx.currentValue);
-          if (monthOf(period) <= monthOf(prevEnd)) upsertSnap(snapPrev, folioKey, rank, tx.currentValue);
+          if (monthOf(period) <= monthOf(currEnd)) upsertSnap(snapCurr, folioKey, rank, aum);
+          if (monthOf(period) <= monthOf(prevEnd)) upsertSnap(snapPrev, folioKey, rank, aum);
         }
 
         if (inRange(period, currStart, currEnd)) {
           txCurr++;
-          if (tx.currentValue != null) { avgAUMCurr += tx.currentValue; aumRowsCurr++; }
+          // Count rows that actually CARRY an AUM. Testing for non-null counted the
+          // zeros too, so a month with no AUM at all looked fully covered and the
+          // guard below never fired — June read as a 100% collapse.
+          if (aum > 0) { avgAUMCurr += aum; aumRowsCurr++; }
           brokerageCurr += calculateUserShare(tx, broker, globalConfig);
         }
         if (inRange(period, prevStart, prevEnd)) {
           txPrev++;
-          if (tx.currentValue != null) { avgAUMPrev += tx.currentValue; aumRowsPrev++; }
+          if (aum > 0) { avgAUMPrev += aum; aumRowsPrev++; }
           brokeragePrev += calculateUserShare(tx, broker, globalConfig);
         }
       }
@@ -1025,14 +1032,22 @@ export const Reports: React.FC<ReportsProps> = ({ currentUser }) => {
       // whose rows all lack an AUM (June 2026: 40 transactions, none carrying
       // avg_assets) is a gap in the import, not a portfolio that vanished.
       const noData = txCurr === 0 || txPrev === 0;
-      const aumGap = !noData && (aumRowsCurr === 0 || aumRowsPrev === 0);
+      // Comparing AUM only means something when both months are covered to a similar
+      // degree. June 2026 carries an AUM on 47% of its rows against 100% in May,
+      // because the CAMS half of that import arrived without avg_assets — so an RM
+      // whose clients are CAMS-only read −100% and a mixed book read −65%. Neither
+      // book shrank; the figure is missing on one side. More than 20 points apart and
+      // the two are not like-for-like, so no percentage is offered.
+      const covCurr = txCurr ? aumRowsCurr / txCurr : 0;
+      const covPrev = txPrev ? aumRowsPrev / txPrev : 0;
+      const aumGap = !noData && (aumRowsCurr === 0 || aumRowsPrev === 0 || Math.abs(covCurr - covPrev) > 0.2);
 
       return {
         member: broker,
         avgAUMCurr, avgAUMPrev,
         avgAUMGrowth: (noData || aumGap) ? null : pct(avgAUMCurr, avgAUMPrev),
         aumIncomplete: aumRowsCurr === 0 && aumRowsPrev === 0,
-        noData, aumGap, txCurr, txPrev,
+        noData, aumGap, txCurr, txPrev, aumRowsCurr, aumRowsPrev,
         snapAUMCurr, snapAUMPrev, snapAUMGrowth: noData ? null : pct(snapAUMCurr, snapAUMPrev),
         brokerageCurr, brokeragePrev,
         brokerageGrowth: noData ? null : pct(brokerageCurr, brokeragePrev),
@@ -1074,7 +1089,13 @@ export const Reports: React.FC<ReportsProps> = ({ currentUser }) => {
     const anyCurr = growthRows.some(r => r.txCurr > 0);
     const anyPrev = growthRows.some(r => r.txPrev > 0);
     const noData = growthRows.length > 0 && (!anyCurr || !anyPrev);
-    const aumGap = !noData && growthRows.every(r => r.aumGap);
+    // Judge the headline on the WHOLE book's coverage, not on every member having a
+    // gap — with one month covered 47% and the other 100%, the total is as misleading
+    // as any single row.
+    const sum = (f: (r: typeof growthRows[number]) => number) => growthRows.reduce((a, r) => a + f(r), 0);
+    const covCurr = sum(r => r.txCurr) ? sum(r => r.aumRowsCurr) / sum(r => r.txCurr) : 0;
+    const covPrev = sum(r => r.txPrev) ? sum(r => r.aumRowsPrev) / sum(r => r.txPrev) : 0;
+    const aumGap = !noData && (covCurr === 0 || covPrev === 0 || Math.abs(covCurr - covPrev) > 0.2);
     return {
       ...t,
       noData, aumGap,
