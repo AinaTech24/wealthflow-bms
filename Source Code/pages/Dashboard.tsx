@@ -247,7 +247,11 @@ export const Dashboard: React.FC<DashboardProps> = ({ currentUser }) => {
   // period-filtered view falls back to the (capped) client-side aggregation.
   const isAllTime = filterMode === 'all';
   const useServerTotals = isAllTime && !!serverSummary;
-  const txTruncated = !!serverSummary && serverSummary.totalTx > transactions.length;
+  // Only a LOADED-but-capped set is truncated. Without the txLoaded guard this fired
+  // while the fetch was still in flight and announced "the most recent 0 of 562,417
+  // transactions" — on a page that was, at that moment, showing server-authoritative
+  // totals and nothing subset-based at all.
+  const txTruncated = txLoaded && !!serverSummary && serverSummary.totalTx > transactions.length;
 
   const displayGross = useServerTotals ? serverSummary!.totalGross : (txLoaded ? stats.totalGrossVolume : (serverSummary?.totalGross ?? 0));
   const displayMyNet = txLoaded ? stats.totalMyNet : (serverSummary?.myTotal ?? 0);

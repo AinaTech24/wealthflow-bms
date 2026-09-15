@@ -13,7 +13,7 @@ interface ClientsAndHierarchyProps {
 }
 
 export const ClientsAndHierarchy: React.FC<ClientsAndHierarchyProps> = ({ currentUser }) => {
-  const { clients, updateClients, deleteClient, team, upsertTeamMember, deleteTeamMember, globalConfig, amcMappings, schemeMappings, updateAmcMappings, updateSchemeMappings, recalculateAllTransactions } = useData();
+  const { clients, updateClients, deleteClient, team, upsertTeamMember, deleteTeamMember, globalConfig, amcMappings, schemeMappings, updateAmcMappings, updateSchemeMappings, recalculateAllTransactions, transactions } = useData();
   const { showToast, showConfirm } = useToast();
 
   const isAdmin = currentUser.role === Role.ADMIN;
@@ -91,10 +91,50 @@ export const ClientsAndHierarchy: React.FC<ClientsAndHierarchyProps> = ({ curren
   const [bulkUserId, setBulkUserId] = useState<string>('');
 
   const isFinance = currentUser.role === Role.FINANCE;
+
+  // AUM here used to be read straight off `client.totalAum`, a value written ONLY
+  // when a WBR9 / MFSD211 folio master is imported. The most recent one loaded was
+  // May's, and it covered a single investor of this RM's seven — so six rows showed
+  // "—" and the seventh showed a two-month-old ₹1,000 against a real ₹11,252.
+  //
+  // Derive it from the transactions instead: the latest currentValue per folio +
+  // scheme, which is the same snapshot rule the Growth tab uses, and which refreshes
+  // with every brokerage import rather than waiting on a folio master.
+  const liveAum = useMemo(() => {
+    const perClient = new Map<string, Map<string, { period: string; value: number }>>();
+    for (const tx of transactions) {
+      const cid = (tx as any).mappedClientId;
+      const value = Number((tx as any).currentValue);
+      if (!cid || !(value > 0)) continue;
+      const period = String(tx.brokeragePeriod || tx.transactionDate || '');
+      const key = `${(tx as any).folio}|${tx.schemeName}`;
+      let folios = perClient.get(cid);
+      if (!folios) { folios = new Map(); perClient.set(cid, folios); }
+      const prev = folios.get(key);
+      if (!prev || period > prev.period) folios.set(key, { period, value });
+    }
+    const out = new Map<string, { total: number; asOf: string }>();
+    for (const [cid, folios] of perClient) {
+      let total = 0, asOf = '';
+      for (const v of folios.values()) { total += v.value; if (v.period > asOf) asOf = v.period; }
+      if (total > 0) out.set(cid, { total, asOf });
+    }
+    return out;
+  }, [transactions]);
+
+  // One place decides a client's AUM, so the table, the sort and the export can
+  // never disagree. Live wins; the stored folio-master figure is the fallback.
+  const aumOf = (c: Client): { total: number; asOf: string; source: string } => {
+    const live = liveAum.get(c.id);
+    if (live) return { total: live.total, asOf: live.asOf, source: 'LIVE' };
+    return { total: Number(c.totalAum) || 0, asOf: c.aumAsOf || '', source: c.aumSource || '' };
+  };
+
   const filteredClients = useMemo(() => {
     return clients
       .filter(c => {
         let hasAccess = false;
+
         if (isAdmin || isFinance) {
           // Finance needs firm-wide visibility for payment cross-checks (read-only).
           hasAccess = true;
@@ -120,8 +160,8 @@ export const ClientsAndHierarchy: React.FC<ClientsAndHierarchyProps> = ({ curren
           c.pan.toLowerCase().includes(searchTerm.toLowerCase());
       })
       // Sort by AUM desc by default — biggest clients first
-      .sort((a, b) => (b.totalAum || 0) - (a.totalAum || 0));
-  }, [clients, searchTerm, currentUser, isAdmin, gapFilter]);
+      .sort((a, b) => aumOf(b).total - aumOf(a).total);
+  }, [clients, searchTerm, currentUser, isAdmin, gapFilter, liveAum]);
 
   const openTeamModal = (member?: TeamMember) => {
     if (!isAdmin) return;
@@ -622,9 +662,9 @@ export const ClientsAndHierarchy: React.FC<ClientsAndHierarchyProps> = ({ curren
         'Assigned User': assignedUser ? assignedUser.name : 'Unassigned',
         'User Level': assignedUser ? `L${assignedUser.level}` : '',
         'Folios': c.folios.join(', '),
-        'AUM (Rs.)': c.totalAum ? Math.round(c.totalAum) : '',
-        'AUM Source': c.aumSource || '',
-        'AUM As Of': c.aumAsOf || '',
+        'AUM (Rs.)': aumOf(c).total ? Math.round(aumOf(c).total) : '',
+        'AUM Source': aumOf(c).source,
+        'AUM As Of': aumOf(c).asOf,
       };
     });
 
@@ -987,19 +1027,21 @@ export const ClientsAndHierarchy: React.FC<ClientsAndHierarchyProps> = ({ curren
                         <div className="text-[9px] text-slate-400 uppercase font-black tracking-widest mt-0.5">{client.folios.length} Linked Folios</div>
                       </td>
                       <td className="px-6 py-4 text-right">
-                        {client.totalAum && client.totalAum > 0 ? (
-                          <>
-                            <div className={`font-black ${client.aumSource === 'WBR9' ? 'text-emerald-600 dark:text-emerald-400' : 'text-slate-700 dark:text-slate-300'}`}>
-                              {formatCompactINR(client.totalAum)}
-                            </div>
-                            <div className="text-[9px] text-slate-400 font-bold uppercase tracking-widest mt-0.5">
-                              {client.aumSource === 'WBR9' ? 'Snapshot' : 'Estimated'}
-                              {client.aumAsOf ? ` · ${client.aumAsOf}` : ''}
-                            </div>
-                          </>
-                        ) : (
-                          <span className="text-slate-300 dark:text-slate-600 text-xs">—</span>
-                        )}
+                        {(() => {
+                          const a = aumOf(client);
+                          if (!(a.total > 0)) return <span className="text-slate-300 dark:text-slate-600 text-xs">—</span>;
+                          const label = a.source === 'LIVE' ? 'Latest' : a.source === 'WBR9' ? 'Snapshot' : 'Estimated';
+                          return (
+                            <>
+                              <div className={`font-black ${a.source === 'LIVE' || a.source === 'WBR9' ? 'text-emerald-600 dark:text-emerald-400' : 'text-slate-700 dark:text-slate-300'}`}>
+                                {formatCompactINR(a.total)}
+                              </div>
+                              <div className="text-[9px] text-slate-400 font-bold uppercase tracking-widest mt-0.5">
+                                {label}{a.asOf ? ` · ${a.asOf}` : ''}
+                              </div>
+                            </>
+                          );
+                        })()}
                       </td>
                       {isAdmin && (
                         <td className="px-6 py-4">

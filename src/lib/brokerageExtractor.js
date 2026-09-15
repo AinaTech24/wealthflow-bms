@@ -199,8 +199,158 @@ const isNoiseLine = (line) => {
     return false;
 };
 
+/**
+ * Text that rides along on a scheme name but is not part of it.
+ *
+ * Cards carry link labels, footnote markers, a benchmark and date range, a leaked
+ * category column, a half-cut "(Formerly known…" — 104 names in the master had one
+ * of these glued on, "Bank of India Liquid Fund Click Here" among them.
+ *
+ * There is deliberately NO generic "trailing number" rule: it would eat the 50 in
+ * "Nifty 50", the 200 in "BSE 200" and the series number on an FMP.
+ */
+const SCHEME_NOISE = [
+    /\s*click\s*here\s*$/i,                                              // link label
+    /\s*\*+\s*$/,                                                        // footnote marker
+    /\s*[.,;:\-–]+\s*$/,                                                 // trailing punctuation
+    /\s*\(?\s*formerly\s+known\b.*$/i,                                   // truncated parenthetical
+    /\s+erstwhile\s+[A-Za-z]+\s*$/i,
+    /\s+an\s+open-?ended\b.*$/i,                                         // prospectus prose
+    /\s+S?\s*ARE\s+MARKET\s+RISKS\b.*$/i,                                // disclaimer
+    /\s*(?:AGGRESSIVE|CONSERVATIVE)?\s*INDEX\s+[A-Za-z]{3}-\d{4,6}\s*$/i, // benchmark + date
+    /\s*(?:NA)?\d{2}-[A-Za-z]{3}-\d{4,6}\s*$/i,
+    /\s*[A-Za-z ]*TRI\d[\d-]*[A-Za-z-]*\d*\s*$/i,
+    /\s+(Equity|Debt|Hybrid|Liquid|Other)\s?\d+\s*$/i,                   // category column leaked in
+    /\s*\d+\.\d+\.\d+\s*$/,                                              // rate digits glued on
+    /^\s*[&*\-–,.]+\s*/,                                                 // leading punctuation
+];
+const stripSchemeNoise = (name) => {
+    let s = String(name || "").trim(), prev;
+    do {
+        prev = s;
+        for (const re of SCHEME_NOISE) {
+            const t = s.replace(re, "").trim();
+            // Never strip a name down to nothing — a fund whose whole identity is the
+            // matched text keeps it, and the caller's length checks reject it instead.
+            if (t !== s && t.length >= 6) s = t;
+        }
+    } while (s !== prev);
+    return s.replace(/\s{2,}/g, " ").trim();
+};
+
+/**
+ * Words a fund house writes in its Terms & Conditions and never in a fund's name.
+ *
+ * Abakkus' card opens with 39 lines of T&C before the rate table, and lines from it
+ * were landing in the master as schemes — "intermediaries and other guidelines issued
+ * by SEBI / AMFI from time to time for Mutual Fund . AMC reserves Abakkus Small Cap
+ * Fund" at 1.05%, an ICICI private-circulation notice at 0.9%, a Kotak line about
+ * email domains at 1%. One match is enough: no real scheme carries any of these.
+ */
+const DISCLAIMER = new RegExp([
+    "\\bsebi\\b", "\\bamfi\\b", "\\bherein\\b", "\\bcirculat(?:ion|ed)\\b",
+    "\\bprospective\\s+investors?\\b", "\\bexpense\\s+ratio\\b", "\\bcode\\s+of\\s+conduct\\b",
+    "\\bstatutory\\b", "\\blevies\\b", "\\bannualized\\b", "\\bcommission\\b",
+    "\\bdistributors?\\b", "\\bregulat(?:ory|ions?)\\b", "\\bterms\\s+and\\s+conditions\\b",
+    "\\bmarket\\s+risks\\b", "\\bshall\\b", "\\bhereby\\b", "\\bwhatsoever\\b",
+    "\\bplease\\s+(?:read|refer)\\b", "\\breserves?\\s+the\\s+right\\b",
+    "\\bfrom\\s+time\\s+to\\s+time\\b", "\\bagrees?\\s+that\\b", "\\bwith\\s+regards?\\s+to\\b",
+    "\\bemail\\s+address\\b", "\\bopen\\s+aum\\b", "\\bpositioning\\b", "\\bintermediaries\\b",
+    "\\bstrategies\\b", "\\bsourcing\\b", "\\.com\\b",
+    "\\bassets\\s+under\\s+management\\b", "\\binvested\\s+in\\b", "\\bmore\\s+than\\b",
+    "\\bonly\\s+for\\s+select\\b", "\\bmfd\\b",
+].join("|"), "i");
+
+/** A ")" with no "(" is half a name the table split across two lines. */
+const halfBracket = (s) => /\)/.test(String(s || "")) && !/\(/.test(String(s || ""));
+
+/**
+ * Many cards print the SEBI category in the next column, and it arrives glued to the
+ * name — "LIC MF MANUFACTURING FUND SECTORAL/THEMATIC FUND", "ICICI Prudential
+ * Multi-Asset Fund Multi Asset Allocation 1", "Mahindra Manulife Arbitrage Fund
+ * Arbitrage0.42". Two narrow rules, because a broad one would rename real funds:
+ *
+ *  A. text after the last Fund/FOF/ETF that ENDS in a digit or a rate fragment —
+ *     a bare number never ends a fund's name, so this is the table column;
+ *  B. a handful of category labels that are never part of a name.
+ *
+ * "Fund of Funds" is stripped ONLY when the prefix already says FOF, so a genuine
+ * fund-of-fund like "HDFC Gold ETF Fund of Fund" keeps its name.
+ */
+const TRAILING_CATEGORY = [
+    /\b((?:Fund|FOF|ETF|Scheme|Plan)s?)\s+[A-Za-z][A-Za-z&/\- ]*?\d+(?:\.\d+)?\s*$/i,
+    /\b((?:Fund|FOF|ETF|Scheme|Plan)s?)\s*\*?[A-Za-z][A-Za-z&/\- ]*\d+(?:\.\d+)?\s*$/i,
+    /\b((?:Fund|FOF|ETF|Scheme|Plan)s?)\s+sectoral\s*\/\s*thematic\s+fund\s*$/i,
+    /\b((?:Fund|FOF|ETF|Scheme|Plan)s?)\s+(?:sol\s*uti?\s*on|solution)\s+oriented\s+scheme\s*$/i,
+    /\b((?:Fund|FOF|ETF|Scheme|Plan)s?)\s+(?:equity\s+)?focused\s+fund\s*$/i,
+    /(\(?FOF\)?)\s+fund\s+of\s+funds?\s*\d*\s*$/i,
+    /\b((?:Fund|FOF|ETF|Scheme|Plan)s?)\s+[A-Za-z][A-Za-z&/\- ]*?[A-Za-z]{3}-\d{4,6}\s*$/i,  // "… Jul-202630"
+    /\b((?:Fund|FOF|ETF|Scheme|Plan)s?)\s+[A-Z]\s*$/,                                        // stray "FUND S"
+];
+
+/**
+ * Trailing words that merely REPEAT words already in the name are the category
+ * column printed again — "LIC MF CHILDRENS FUND CHILDREN'S FUND", "Mahindra
+ * Manulife Large Cap Fund Large", "ICICI Prudential Focused Equity Fund Focused
+ * Fund". The run must start after a scheme-type word and every word in it must
+ * already appear earlier, so "HDFC Gold ETF Fund of Fund" is untouched: its "of"
+ * appears nowhere before.
+ */
+/**
+ * Cut whatever trails the LAST Fund/FOF/ETF/Scheme/Plan when that trailing text is
+ * table debris rather than part of the name — a benchmark and settlement window
+ * ("SBI LOW DURATION FUND Jul-202630", "… NIFTY 500 TRI01-Jul-202630") or a column
+ * index ("… Fund of Funds 1").
+ *
+ * A name whose last scheme word IS the last word has no tail, so "HDFC Gold ETF Fund
+ * of Fund" and "Kotak Nifty 50 Index Fund" pass through untouched.
+ */
+const cutDebrisTail = (name) => {
+    const s = String(name || "").trim();
+    const re = /\b(funds?|fof|etf|schemes?|plans?)\b/gi;
+    let last = -1, m;
+    while ((m = re.exec(s)) !== null) last = m.index + m[0].length;
+    if (last < 0 || last >= s.length) return s;
+    const tail = s.slice(last).trim();
+    const head = s.slice(0, last).trim();
+    if (!tail || head.length < 8) return s;
+    const isDebris = /[A-Za-z]{3}-\d{4,6}/.test(tail)        // Jul-202630
+        || /\d{1,2}-[A-Za-z]{3}-\d{2,6}/.test(tail)          // 01-Jul-2026
+        || /\d\s*$/.test(tail);                              // a column index
+    return isDebris ? head : s;
+};
+
+const stripRepeatedCategory = (name) => {
+    const tokens = String(name || "").trim().split(/\s+/);
+    const norm = (t) => t.toUpperCase().replace(/[^A-Z0-9]/g, "");
+    const isSchemeWord = (t) => /^(FUNDS?|FOF|ETF|SCHEMES?|PLANS?)$/.test(norm(t));
+    for (let cut = tokens.length - 1; cut >= 3; cut--) {
+        if (!isSchemeWord(tokens[cut - 1])) continue;         // run must begin after "Fund"/"FOF"/…
+        const run = tokens.slice(cut);
+        if (!run.length) continue;
+        const before = new Set(tokens.slice(0, cut).map(norm));
+        if (run.every(t => norm(t) && before.has(norm(t)))) return tokens.slice(0, cut).join(" ");
+    }
+    return name;
+};
+const stripTrailingCategory = (name) => {
+    let s = String(name || ""), prev;
+    do {
+        prev = s;
+        for (const re of TRAILING_CATEGORY) {
+            const t = s.replace(re, "$1").trim();
+            if (t !== s && t.length >= 8) s = t;
+        }
+    } while (s !== prev);
+    return s;
+};
+
 export const cleanSchemeName = (line) => {
-    let s = line;
+    // A criteria row ("AUM >= 50 Lakh") or a sentence out of the T&C is not a scheme.
+    if (DISCLAIMER.test(line) || /[<>]=?\s*\d/.test(line)) return "";
+    // A stray ")" with no "(" is half a name the table split across lines.
+    if (/\)/.test(line) && !/\(/.test(line)) return "";
+    let s = stripSchemeNoise(stripRepeatedCategory(cutDebrisTail(stripTrailingCategory(line))));
     // Common OCR typo in ABSL files.
     s = s.replace(/\bADITY\s+BIRLA\b/gi, "ADITYA BIRLA");
     // Filter out disclaimer/legal text that mentions AMC management
@@ -709,6 +859,75 @@ export function extractBpsRows(rawText, amcName, sourceFile) {
     return rows;
 }
 
+/**
+ * Pair scheme names with rates when the PDF emits them as SEPARATE COLUMNS.
+ *
+ * Helios' card comes out of pdf-parse as every scheme name first, then every rate:
+ *
+ *     Helios Flexi Cap Fund          <- 8 names, with category headers between
+ *     ... 7 more ...
+ *     TrailGSTTotal                  <- "Upto 3 Years" block
+ *     0.76%  ... 8 trail values
+ *     0.14%  ... 8 GST values
+ *     0.90%  ... 8 total values
+ *     TrailGSTTotal                  <- "4th Year onwards" block, same shape
+ *
+ * Nothing on a line ties a name to its rate, so the line-based reader paired the
+ * rates with whatever text sat nearest — it produced 33 rows carrying 2 distinct
+ * names, one of them a sentence from the Terms & Conditions.
+ *
+ * Here the two runs are paired BY POSITION: the first run of numeric-only lines
+ * whose length equals the number of names is the trail column. The first such block
+ * is the headline rate (Helios: "Upto 3 Years"); later blocks are later-year tiers
+ * and are ignored, as is the GST/Total run that follows.
+ *
+ * Deliberately narrow: it needs at least 3 names AND an exact length match, so a
+ * card that already reads correctly line-by-line never reaches this path.
+ */
+export function extractColumnarRows(rawText, amcName, sourceFile) {
+    const lines = (rawText || "").split("\n").map(l => String(l).trim()).filter(Boolean);
+    const isPct = (l) => /^\d{1,3}(?:\.\d+)?\s*%?$/.test(l);
+    const isHeader = (l) => /scheme\s*name\s*$/i.test(l) || /^trail|gst|total$/i.test(l.replace(/\s+/g, ""));
+    const looksLikeScheme = (l) =>
+        l.length >= 8 && l.length <= 70
+        && /fund|scheme|yojana|etf|plan/i.test(l)
+        && !isHeader(l)
+        && !isPct(l)
+        && !/\d\s*%/.test(l)                       // a rate on the line = not this layout
+        && !/^[IVXLC]+\s*[.)]/.test(l)             // roman-numeral T&C clause
+        && !/[.;:]\s/.test(l)                      // prose, not a scheme name
+        && !/\b(shall|will|please|refer|applicable|distributor|investor|commission)\b/i.test(l);
+
+    // Longest run of name-like lines, allowing category headers to sit between them.
+    let best = [], cur = [];
+    for (const l of lines) {
+        if (looksLikeScheme(l)) cur.push(l);
+        else if (isHeader(l) && cur.length) continue;   // "Equity Scheme Name" etc.
+        else { if (cur.length > best.length) best = cur; cur = []; }
+    }
+    if (cur.length > best.length) best = cur;
+    if (best.length < 3) return [];
+
+    // First run of numeric-only lines exactly as long as the name list.
+    const firstIdx = lines.indexOf(best[best.length - 1]) + 1;
+    let run = [];
+    for (let i = firstIdx; i < lines.length; i++) {
+        if (isPct(lines[i])) { run.push(lines[i]); if (run.length === best.length) break; }
+        else if (run.length) { if (run.length === best.length) break; run = []; }
+    }
+    if (run.length !== best.length) return [];
+
+    const rows = [];
+    for (let i = 0; i < best.length; i++) {
+        const rate = parseFloat(String(run[i]).replace("%", ""));
+        if (!(rate >= 0) || rate > 10) continue;       // a trail above 10% is not a trail
+        const scheme = cleanSchemeName(best[i]) || best[i];
+        if (!scheme || scheme.length < 5) continue;
+        rows.push({ amcName, schemeName: scheme, trailRate: rate, category: "Other", sourceFile, rawLine: `${best[i]} | ${run[i]}` });
+    }
+    return rows;
+}
+
 export function extractBrokerageRowsFromText(rawText, amcName, sourceFile) {
     try {
         let lines = (rawText || "").split("\n").map(normalizeSpaces).filter(l => l.length > 0);
@@ -827,6 +1046,13 @@ export function extractBrokerageRowsFromText(rawText, amcName, sourceFile) {
                     }
                     // Strip residual "- No" or "- ET" artifacts left after lock-in cleanup
                     finalSchemeName = finalSchemeName.replace(/\s*-\s*[A-Z][a-z]{0,2}\s*$/, "").trim();
+                    // The name is REASSEMBLED from fragments after cleanSchemeName ran —
+                    // postCleanSchemeName and the "Index" → "Index Fund" repair both append
+                    // to it — so a benchmark and date could come back after being cut.
+                    // Re-apply the cuts to what is actually about to be stored.
+                    finalSchemeName = finalSchemeName && !DISCLAIMER.test(finalSchemeName) && !halfBracket(finalSchemeName)
+                        ? stripSchemeNoise(stripRepeatedCategory(cutDebrisTail(stripTrailingCategory(finalSchemeName))))
+                        : "";
                     if (!finalSchemeName || finalSchemeName.length < 6) continue;
                     rows.push({ amcName, schemeName: finalSchemeName, category: category || currentCategory || "Other", trailRate: finalRate, sourceFile, rawLine: line });
                     pendingFragments = [];
@@ -899,7 +1125,21 @@ export async function extractBrokerageRowsFromPdfBuffer(buffer, amcName, sourceF
         console.error("pdfjs row-extraction failed:", error?.message || error);
     }
 
-    const winner = rowsB.length > rowsA.length ? rowsB : rowsA;
-    console.log(`✅ [Extractor] ${amcName}: pdf-parse=${rowsA.length}, pdfjs-rows=${rowsB.length} → using ${winner === rowsB ? "pdfjs-rows" : "pdf-parse"} (${winner.length} schemes)`);
+    // Source C: positional pairing, for cards that emit names and rates as separate
+    // columns (Helios). Only fires when that shape is unmistakable — see the function.
+    let rowsC = [];
+    try {
+        const data = await pdf(buffer);
+        rowsC = extractColumnarRows(data.text || "", amcName, sourceFile);
+    } catch (_) { /* source A already logged the parse failure */ }
+
+    // Rank by DISTINCT schemes, not row count. Helios' card gave pdf-parse 33 rows
+    // carrying only 2 names — the rates were right but every one had been glued to
+    // the wrong text — and that beat the 8 correct rows the other reader produced.
+    const distinct = (rows) => new Set(rows.map(r => String(r.schemeName || "").toUpperCase().replace(/[^A-Z0-9]/g, ""))).size;
+    const cands = [["pdf-parse", rowsA], ["pdfjs-rows", rowsB], ["columnar", rowsC]];
+    let [label, winner] = cands[0];
+    for (const [l, r] of cands.slice(1)) if (distinct(r) > distinct(winner)) { label = l; winner = r; }
+    console.log(`✅ [Extractor] ${amcName}: pdf-parse=${distinct(rowsA)}, pdfjs-rows=${distinct(rowsB)}, columnar=${distinct(rowsC)} distinct → using ${label} (${distinct(winner)} schemes)`);
     return winner;
 }

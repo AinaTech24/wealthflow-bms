@@ -932,7 +932,20 @@ export const Reports: React.FC<ReportsProps> = ({ currentUser }) => {
     if (!valid) return [];
 
     const clientMap = new Map(clients.map(c => [c.id, c]));
-    const inRange = (d: string, s: string, e: string) => d >= s && d <= e;
+
+    // growthPeriods hands out full dates ("2026-07-01".."2026-07-31") but a row's
+    // period is its brokeragePeriod — "2026-07", seven characters. Compared as
+    // strings, "2026-07" >= "2026-07-01" is FALSE: a prefix sorts before the longer
+    // string. So this test never once returned true, and Avg AUM and Brokerage Share
+    // read ₹0 for every member in every month. (Snapshot AUM escaped it because its
+    // bound is one-sided — "2026-07" <= "2026-07-31" is true — which is exactly why
+    // that one card showed a number while the two beside it sat at zero.)
+    // A brokerage period has no day component, so the honest comparison is by month.
+    const monthOf = (d: string) => String(d || '').slice(0, 7);
+    const inRange = (d: string, s: string, e: string) => {
+      const m = monthOf(d);
+      return m >= monthOf(s) && m <= monthOf(e);
+    };
 
     type Snap = Record<string, { date: string; value: number }>;
     const upsertSnap = (snap: Snap, key: string, date: string, value: number) => {
@@ -962,6 +975,10 @@ export const Reports: React.FC<ReportsProps> = ({ currentUser }) => {
     const rows = brokerScope.filter(b => b.level >= 1 && b.level <= 7).map(broker => {
       let avgAUMCurr = 0, avgAUMPrev = 0, brokerageCurr = 0, brokeragePrev = 0;
       let aumRowsCurr = 0, aumRowsPrev = 0;
+      // Transactions in each window, regardless of whether they carry an AUM. A month
+      // that has none at all is not a month that fell 100% — it is a month that has
+      // not been imported yet, and it must not be drawn as a collapse.
+      let txCurr = 0, txPrev = 0;
       const snapCurr: Snap = {};
       const snapPrev: Snap = {};
 
@@ -971,16 +988,26 @@ export const Reports: React.FC<ReportsProps> = ({ currentUser }) => {
         const txDate = tx.transactionDate;
         const folioKey = `${tx.folio}|${tx.schemeName}`;
 
+        // Bound the snapshot by the BROKERAGE PERIOD, not the transaction date.
+        // CAMS writes the original investment date into transactionDate, so a July
+        // row routinely carries a date from March. Both windows then picked the very
+        // same rows and month-over-month growth came out 0.00% for everyone.
+        // Order within a window by period first, then date, so the latest month wins.
         if (tx.currentValue != null) {
-          if (txDate <= currEnd) upsertSnap(snapCurr, folioKey, txDate, tx.currentValue);
-          if (txDate <= prevEnd) upsertSnap(snapPrev, folioKey, txDate, tx.currentValue);
+          const rank = `${period}|${txDate}`;
+          // Compared by month for the same reason as inRange above — relying on
+          // "2026-07" <= "2026-07-31" happening to be true is luck, not intent.
+          if (monthOf(period) <= monthOf(currEnd)) upsertSnap(snapCurr, folioKey, rank, tx.currentValue);
+          if (monthOf(period) <= monthOf(prevEnd)) upsertSnap(snapPrev, folioKey, rank, tx.currentValue);
         }
 
         if (inRange(period, currStart, currEnd)) {
+          txCurr++;
           if (tx.currentValue != null) { avgAUMCurr += tx.currentValue; aumRowsCurr++; }
           brokerageCurr += calculateUserShare(tx, broker, globalConfig);
         }
         if (inRange(period, prevStart, prevEnd)) {
+          txPrev++;
           if (tx.currentValue != null) { avgAUMPrev += tx.currentValue; aumRowsPrev++; }
           brokeragePrev += calculateUserShare(tx, broker, globalConfig);
         }
@@ -993,13 +1020,22 @@ export const Reports: React.FC<ReportsProps> = ({ currentUser }) => {
         if (p === 0) return c === 0 ? 0 : null;
         return ((c - p) / p) * 100;
       };
+      // A window with no transactions at all cannot be compared — August 2026 showed
+      // "-100%" against July purely because August has not been imported. And a window
+      // whose rows all lack an AUM (June 2026: 40 transactions, none carrying
+      // avg_assets) is a gap in the import, not a portfolio that vanished.
+      const noData = txCurr === 0 || txPrev === 0;
+      const aumGap = !noData && (aumRowsCurr === 0 || aumRowsPrev === 0);
 
       return {
         member: broker,
-        avgAUMCurr, avgAUMPrev, avgAUMGrowth: pct(avgAUMCurr, avgAUMPrev),
+        avgAUMCurr, avgAUMPrev,
+        avgAUMGrowth: (noData || aumGap) ? null : pct(avgAUMCurr, avgAUMPrev),
         aumIncomplete: aumRowsCurr === 0 && aumRowsPrev === 0,
-        snapAUMCurr, snapAUMPrev, snapAUMGrowth: pct(snapAUMCurr, snapAUMPrev),
-        brokerageCurr, brokeragePrev, brokerageGrowth: pct(brokerageCurr, brokeragePrev),
+        noData, aumGap, txCurr, txPrev,
+        snapAUMCurr, snapAUMPrev, snapAUMGrowth: noData ? null : pct(snapAUMCurr, snapAUMPrev),
+        brokerageCurr, brokeragePrev,
+        brokerageGrowth: noData ? null : pct(brokerageCurr, brokeragePrev),
       };
     });
 
@@ -1033,11 +1069,18 @@ export const Reports: React.FC<ReportsProps> = ({ currentUser }) => {
       brokerCurr: a.brokerCurr + r.brokerageCurr, brokerPrev: a.brokerPrev + r.brokeragePrev,
     }), { avgAumCurr: 0, avgAumPrev: 0, snapAumCurr: 0, snapAumPrev: 0, brokerCurr: 0, brokerPrev: 0 });
     const pct = (c: number, p: number): number | null => p === 0 ? (c === 0 ? 0 : null) : ((c - p) / p) * 100;
+    // If NO member has a transaction on one side, the month itself is missing — the
+    // headline cards must say so rather than print a 100% fall.
+    const anyCurr = growthRows.some(r => r.txCurr > 0);
+    const anyPrev = growthRows.some(r => r.txPrev > 0);
+    const noData = growthRows.length > 0 && (!anyCurr || !anyPrev);
+    const aumGap = !noData && growthRows.every(r => r.aumGap);
     return {
       ...t,
-      avgAumGrowth: pct(t.avgAumCurr, t.avgAumPrev),
-      snapAumGrowth: pct(t.snapAumCurr, t.snapAumPrev),
-      brokerGrowth: pct(t.brokerCurr, t.brokerPrev),
+      noData, aumGap,
+      avgAumGrowth: (noData || aumGap) ? null : pct(t.avgAumCurr, t.avgAumPrev),
+      snapAumGrowth: noData ? null : pct(t.snapAumCurr, t.snapAumPrev),
+      brokerGrowth: noData ? null : pct(t.brokerCurr, t.brokerPrev),
     };
   }, [growthRows]);
 
@@ -2110,6 +2153,17 @@ export const Reports: React.FC<ReportsProps> = ({ currentUser }) => {
               <p className="mt-3 text-[10px] font-bold text-amber-600 uppercase tracking-widest">Fill in both date ranges to see results</p>
             )}
           </div>
+
+          {/* Why the cards below read "—" instead of a percentage. Without this the page
+              simply printed -100% and left the reader to guess whether their book had
+              collapsed or the month had never been imported. */}
+          {growthPeriods.valid && (growthTotals.noData || growthTotals.aumGap) && (
+            <div className="rounded-lg border border-amber-200 dark:border-amber-800 bg-amber-50 dark:bg-amber-900/20 px-4 py-2.5 text-[12px] font-semibold text-amber-800 dark:text-amber-300">
+              {growthTotals.noData
+                ? `No brokerage has been imported for ${growthRows.some(r => r.txCurr > 0) ? growthPeriods.prevLabel : growthPeriods.currLabel} yet, so there is nothing to compare — this is not a fall to zero.`
+                : `Those months are imported, but one of them carries no AUM figures, so the Avg AUM comparison is left blank. The brokerage figures beside it are unaffected.`}
+            </div>
+          )}
 
           {/* Summary cards */}
           {growthPeriods.valid && (

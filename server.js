@@ -75,7 +75,26 @@ let periodTotalsCache = null;   // { at, body } — 60s, same idea as summaryCac
 // team_payouts cache: keyed by `${year}:${month}`; payout rules change rarely.
 const TEAM_PAYOUTS_TTL_MS = 60_000;
 let teamPayoutsCache = {};
-const invalidateSummaryCache = () => { summaryCache = null; teamPayoutsCache = {}; };
+const invalidateSummaryCache = () => { summaryCache = null; teamPayoutsCache = {}; memberClientCache = {}; };
+
+// Client ids whose hierarchy names this member at any level — i.e. their own book.
+// Cached because the dashboard and the transactions fetch both ask for it on load.
+let memberClientCache = {};
+const MEMBER_CLIENTS_TTL_MS = 60_000;
+async function clientIdsForMember(memberId) {
+  const hit = memberClientCache[memberId];
+  if (hit && Date.now() - hit.at < MEMBER_CLIENTS_TTL_MS) return hit.ids;
+  const [rows] = await pool.query('SELECT id, data FROM clients');
+  const ids = [];
+  for (const c of rows) {
+    let h;
+    try { h = JSON.parse(c.data || '{}').hierarchy; } catch { continue; }
+    if (!h) continue;
+    for (let l = 1; l <= 7; l++) if (h[`level${l}Id`] === memberId) { ids.push(c.id); break; }
+  }
+  memberClientCache[memberId] = { at: Date.now(), ids };
+  return ids;
+}
 
 // gzip every JSON / static response. For the typical 1-25 MB /api/data?type=*
 // payload this is a 5-10× wire-size reduction. Filter skips tiny bodies and
@@ -1103,28 +1122,43 @@ app.all('/api/data', mutationLimiter, async (req, res) => {
       if (action === 'summary') {
         try {
           const now = Date.now();
-          if (summaryCache && now - summaryCache.at < SUMMARY_TTL_MS) {
+          // Scope to the caller's own book unless they are ADMIN/FINANCE. This used to
+          // be one firm-wide figure handed to everyone, so an RM's dashboard reported
+          // the firm's 1,330 investors and 562,417 transactions as their own, and drew
+          // the firm's revenue curve under the heading "Earnings dashboard for <them>".
+          const scoped = !isWriter(req) && req.user?.id;
+          const cacheKey = scoped ? `u:${req.user.id}` : 'all';
+          if (summaryCache && summaryCache.key === cacheKey && now - summaryCache.at < SUMMARY_TTL_MS) {
             res.set('X-Cache', 'HIT');
             return res.json(summaryCache.body);
+          }
+          let where = '', args = [];
+          if (scoped) {
+            const mine = await clientIdsForMember(req.user.id);
+            if (!mine.length) {
+              return res.json({ totalTx: 0, totalGross: 0, myTotal: 0, clientCount: 0, monthly: [] });
+            }
+            where = ` WHERE mappedClientId IN (${mine.map(() => '?').join(',')})`;
+            args = mine;
           }
           const [[agg]] = await pool.query(`
             SELECT
               COUNT(*)               AS totalTx,
               COALESCE(SUM(grossAmount), 0) AS totalGross,
               COUNT(DISTINCT pan)    AS clientCount
-            FROM transactions
-          `);
+            FROM transactions${where}
+          `, args);
           const [monthlyRows] = await pool.query(`
             SELECT
-              DATE_FORMAT(transactionDate, '%Y-%m') AS month,
+              brokeragePeriod                       AS month,
               SUM(grossAmount)                      AS gross,
               COUNT(*)                              AS cnt
             FROM transactions
-            WHERE transactionDate >= DATE_SUB(CURDATE(), INTERVAL 18 MONTH)
-              AND transactionDate IS NOT NULL
+            WHERE brokeragePeriod >= DATE_FORMAT(DATE_SUB(CURDATE(), INTERVAL 18 MONTH), '%Y-%m')
+              ${scoped ? `AND mappedClientId IN (${args.map(() => '?').join(',')})` : ''}
             GROUP BY month
             ORDER BY month ASC
-          `);
+          `, scoped ? args : []);
           const body = {
             totalTx:     Number(agg.totalTx) || 0,
             totalGross:  Number(agg.totalGross) || 0,
@@ -1132,7 +1166,7 @@ app.all('/api/data', mutationLimiter, async (req, res) => {
             clientCount: Number(agg.clientCount) || 0,
             monthly:     monthlyRows.map(r => ({ month: r.month, gross: Number(r.gross) || 0, cnt: Number(r.cnt) || 0 })),
           };
-          summaryCache = { at: now, body };
+          summaryCache = { at: now, key: cacheKey, body };
           res.set('X-Cache', 'MISS');
           return res.json(body);
         } catch (e) {
@@ -1628,8 +1662,26 @@ app.all('/api/data', mutationLimiter, async (req, res) => {
         const since = (query.since || '').toString().match(/^\d{4}-\d{2}(-\d{2})?$/)
           ? query.since
           : new Date(Date.now() - 730 * 24 * 60 * 60 * 1000).toISOString().slice(0, 10);
-        sql += ' WHERE transactionDate >= ? ORDER BY createdAt DESC, id DESC';
-        params.push(since);
+        // Cut on the BROKERAGE PERIOD, not transactionDate. CAMS writes the original
+        // investment date into transactionDate, so a July 2026 brokerage row routinely
+        // carries a date from 2019 — and a two-year cut on that date silently dropped
+        // 138,207 rows, 23% of every recent month. An RM's dashboard was adding up
+        // roughly three quarters of their own book. brokeragePeriod is set on all
+        // 562,417 rows, so there is nothing to fall back to.
+        sql += ' WHERE brokeragePeriod >= ?';
+        params.push(String(since).slice(0, 7));
+
+        // A member who is not ADMIN/FINANCE only ever needs their OWN book. Sending
+        // all 200,000 rows to an RM was a 155 MB download that never finished — their
+        // dashboard sat at "the most recent 0 of 562,417 transactions" — and it handed
+        // them every other RM's business besides. Shakeel's seven clients are 164 rows.
+        if (!isWriter(req) && req.user?.id) {
+          const mine = await clientIdsForMember(req.user.id);
+          if (!mine.length) { res.set('Cache-Control', 'no-store'); return res.json([]); }
+          sql += ` AND mappedClientId IN (${mine.map(() => '?').join(',')})`;
+          params.push(...mine);
+        }
+        sql += ' ORDER BY createdAt DESC, id DESC';
         const limit = Math.min(200000, Math.max(1, parseInt(query.limit, 10) || 200000));
         sql += ` LIMIT ${limit}`;
       } else if (type === 'payout_ledger') {
@@ -2607,6 +2659,7 @@ app.all('/api/data', mutationLimiter, async (req, res) => {
               await connection.query(`INSERT INTO batches (id, fileName, data) VALUES (?, ?, ?) ON DUPLICATE KEY UPDATE fileName=VALUES(fileName), data=VALUES(data)`, [id, fileName, JSON.stringify(rest)]);
             }
           } else if (collection === 'brokerage_masters') {
+            const staleMasterIds = new Set();
             const values = items.map(item => {
               const {
                 id,
@@ -2626,7 +2679,14 @@ app.all('/api/data', mutationLimiter, async (req, res) => {
               const cleanPeriod = String(period).trim();
 
               const safeTrailRate = Number(trailRate) || 0;
-              const safeId = id || `${cleanAmc}|${cleanScheme}|${cleanPeriod}`.toLowerCase();
+              // The identity is ALWAYS derived from the AMC and the scheme, never taken
+              // from the caller. Adding a scheme that already exists therefore lands on
+              // the same row and overwrites its rate instead of adding a second copy,
+              // and renaming one onto another merges them. A row whose supplied id no
+              // longer matches its name is left behind under the old key, so collect
+              // those and drop them after the upsert.
+              const safeId = masterSchemeId(cleanAmc, cleanScheme);
+              if (id && id !== safeId) staleMasterIds.add(id);
 
               // Clean rest
               ['amcname', 'amcName', 'schemename', 'schemeName', 'category', 'trailrate', 'trailRate', 'period'].forEach(k => delete rest[k]);
@@ -2639,6 +2699,15 @@ app.all('/api/data', mutationLimiter, async (req, res) => {
                ON DUPLICATE KEY UPDATE amcName=VALUES(amcName), schemeName=VALUES(schemeName), category=VALUES(category), trailRate=VALUES(trailRate), period=VALUES(period), data=VALUES(data)`,
               [values]
             );
+            // Drop the rows the rename moved off, but never one this same save just
+            // wrote — a scheme whose derived key happens to equal another row's old id
+            // must survive.
+            const written = new Set(values.map(v => v[0]));
+            const toDrop = [...staleMasterIds].filter(x => !written.has(x));
+            if (toDrop.length) {
+              const [del] = await connection.query('DELETE FROM brokerage_masters WHERE id IN (?)', [toDrop]);
+              console.log(`🧹 [Masters] merged ${del.affectedRows} renamed scheme row(s) into their canonical key`);
+            }
           } else {
             for (const item of items) {
               const { id, ...rest } = item;
@@ -2845,11 +2914,64 @@ const AMC_CANONICAL = {
   'TEMPLETON': 'FRANKLIN',
   'ROBECO': 'CANARA',
   'TRUST MF': 'TRUST',
+  // Two labels for one fund house split 63 schemes away from the other 183 and
+  // showed every one of them twice in the master and the export.
+  'NIPPON INDIA MF': 'NIPPON',
+  'NIPPON INDIA': 'NIPPON',
+  // The card is filed as "Baroda BNP"; the master had built its history under
+  // "BARODA". All 46 schemes on the card already existed under the old label, so
+  // without this the next upload would have started a second, parallel fund house.
+  'BARODA BNP': 'BARODA',
+  'BARODA BNP PARIBAS': 'BARODA',
 };
 function canonicalAmcName(name = '') {
   const up = String(name || '').trim().toUpperCase().replace(/\s+/g, ' ');
   if (!up) return String(name || '').trim();
   return AMC_CANONICAL[up] || up;
+}
+
+/**
+ * Primary key for a master scheme: the SCHEME, not the scheme-in-a-month.
+ *
+ * The period used to be part of this key, so re-uploading a fund house's rate card
+ * in a new month inserted a SECOND row for every scheme it already carried — 3,986
+ * rows standing for 1,849 real schemes. Keying on AMC + scheme alone means a
+ * re-upload overwrites the rate in place, which is what a rate card is.
+ *
+ * Punctuation and case are folded out, matching the export's dedupe key exactly, so
+ * "360 ONE Flexi-Cap" and "360 One Flexi Cap" can never become two schemes.
+ */
+function masterSchemeId(amcName = '', schemeName = '') {
+  return `${normAmcKey(amcName)}|${normSchemeKey(schemeName)}`;
+}
+
+/** AMC part of the key, with the canonical-name aliases folded in. */
+function normAmcKey(amcName = '') {
+  return String(canonicalAmcName(amcName) || '').toUpperCase().replace(/[^A-Z0-9]/g, '');
+}
+
+/**
+ * Scheme part of the key, with the trailing scheme-TYPE words removed.
+ *
+ * Cards disagree about how much of the type to spell out, so the SAME fund arrived
+ * under two names and the master carried both — "Bandhan Gilt" beside "Bandhan Gilt
+ * Fund", "Mirae Asset Gold ETF Fund of Fund" beside "Mirae Asset Gold ETF Fund",
+ * 109 such pairs, several with DIFFERENT rates. Folding the tail makes them one
+ * scheme, so a re-upload overwrites rather than adding a second copy.
+ *
+ * Only a TRAILING run is stripped, and never down to fewer than 5 characters, so a
+ * fund whose whole identity is the type word ("Kotak Gold Fund") keeps its name.
+ */
+function normSchemeKey(schemeName = '') {
+  // "&" and "and" are the same word. Stripping punctuation turned "Banking &
+  // Financial" into BANKINGFINANCIAL and "Banking and Financial" into
+  // BANKINGANDFINANCIAL, so a card that spelled it one way and a card that spelled
+  // it the other left Bank of India carrying both as separate schemes.
+  const raw = String(schemeName || '').toUpperCase().replace(/&/g, ' AND ').replace(/[^A-Z0-9]/g, '');
+  const TAIL = /(FUNDOFFUNDS?|INDEXFUND|ETFFOF|FOF|ETF|FUND|SCHEME|PLAN)+$/;
+  let x = raw, prev;
+  do { prev = x; x = x.replace(TAIL, ''); } while (x !== prev && x.length > 4);
+  return x.length > 4 ? x : raw;
 }
 
 function detectAmcNameFromFilename(filename = '') {
@@ -2990,7 +3112,7 @@ app.post('/api/brokerage/extract', requireAdminOrFinance, mutationLimiter, uploa
         const cleanAmc = String(row.amcName || '').trim();
         const cleanScheme = String(row.schemeName || '').trim();
         const cleanPeriod = 'FINAL';
-        const id = `${cleanAmc}|${cleanScheme}|${cleanPeriod}`.toLowerCase();
+        const id = masterSchemeId(cleanAmc, cleanScheme);
 
         const data = JSON.stringify({
           category: row.category,
@@ -3241,7 +3363,7 @@ app.get('/api/brokerage/list', async (req, res) => {
 
 app.get('/api/brokerage/export.csv', async (req, res) => {
   try {
-    const { amcName, month, year, period } = req.query;
+    const { amcName, month, year, period, latestOnly, search } = req.query;
     let query = 'SELECT * FROM brokerage_masters WHERE 1=1';
     let params = [];
 
@@ -3265,12 +3387,48 @@ app.get('/api/brokerage/export.csv', async (req, res) => {
     }
 
     query += ' ORDER BY amcName ASC, schemeName ASC';
-    const [rows] = await pool.query(query, params);
+    let [rows] = await pool.query(query, params);
 
-    let csv = 'AMC,Category,Scheme Name,Brokerage Rate (%),Source File,Created At\n';
+    // The export used to dump every row in the table while the page itself showed
+    // only the current rate per scheme, so a scheme re-rated across months came out
+    // once per month — 3,986 rows exported against 1,857 real schemes. The screen's
+    // two remaining filters are applied here too, so what you see is what you get.
+    if (search) {
+      const q = String(search).toLowerCase();
+      rows = rows.filter(r => String(r.amcName || '').toLowerCase().includes(q)
+                           || String(r.schemeName || '').toLowerCase().includes(q));
+    }
+    if (latestOnly === '1' || latestOnly === 'true') {
+      // The SAME key the rows are stored under, so the export can never split one
+      // scheme into two lines because two cards spelled its type differently.
+      const newest = new Map();
+      for (const r of rows) {
+        const key = masterSchemeId(r.amcName, r.schemeName);
+        const prev = newest.get(key);
+        // Newest period wins; on a tie keep the fuller name, which is the one that
+        // actually spells the scheme out.
+        const better = !prev
+          || String(r.period || '') > String(prev.period || '')
+          || (String(r.period || '') === String(prev.period || '')
+              && String(r.schemeName || '').length > String(prev.schemeName || '').length);
+        if (better) newest.set(key, r);
+      }
+      rows = Array.from(newest.values()).sort((a, b) =>
+        String(a.amcName || '').localeCompare(String(b.amcName || ''))
+        || String(a.schemeName || '').localeCompare(String(b.schemeName || '')));
+    }
+
+    // A scheme name carrying a comma or a quote used to break the row apart in
+    // Excel, because the value was only wrapped, never escaped.
+    const cell = (v) => `"${String(v ?? '').replace(/"/g, '""')}"`;
+    let csv = 'AMC,Category,Scheme Name,Brokerage Rate (%),Period,Source File,Created At\n';
     rows.forEach(row => {
-      const meta = JSON.parse(row.data || '{}');
-      csv += `"${row.amcName}","${meta.category || ''}","${row.schemeName}",${row.trailRate},"${meta.sourceFile || ''}","${row.createdAt}"\n`;
+      let meta = {};
+      try { meta = JSON.parse(row.data || '{}'); } catch (_) {}
+      csv += [
+        cell(row.amcName), cell(meta.category || ''), cell(row.schemeName),
+        row.trailRate, cell(row.period || ''), cell(meta.sourceFile || ''), cell(row.createdAt),
+      ].join(',') + '\n';
     });
 
     res.setHeader('Content-Type', 'text/csv');

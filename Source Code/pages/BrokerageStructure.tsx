@@ -42,6 +42,26 @@ interface EditValues {
     trailRate: number | string;
 }
 
+// Mirror of server.js masterSchemeId. One fund house can arrive under two labels,
+// and one scheme under two spellings of its type — "Bandhan Gilt" beside "Bandhan
+// Gilt Fund" — so both are folded away before deciding what counts as one scheme.
+// Keep byte-identical in meaning to the server, or the page and the export disagree.
+const AMC_ALIASES: Record<string, string> = {
+    'NIPPONINDIAMF': 'NIPPON', 'NIPPONINDIA': 'NIPPON',
+    'TEMPLETON': 'FRANKLIN', 'ROBECO': 'CANARA', 'TRUSTMF': 'TRUST',
+    'BARODABNP': 'BARODA', 'BARODABNPPARIBAS': 'BARODA',
+};
+const masterSchemeKey = (amcName?: string, schemeName?: string): string => {
+    const amcRaw = String(amcName || '').toUpperCase().replace(/[^A-Z0-9]/g, '');
+    const amc = AMC_ALIASES[amcRaw] || amcRaw;
+    // "&" and "and" are the same word — fold before punctuation is stripped.
+    const raw = String(schemeName || '').toUpperCase().replace(/&/g, ' AND ').replace(/[^A-Z0-9]/g, '');
+    const TAIL = /(FUNDOFFUNDS?|INDEXFUND|ETFFOF|FOF|ETF|FUND|SCHEME|PLAN)+$/;
+    let x = raw, prev: string;
+    do { prev = x; x = x.replace(TAIL, ''); } while (x !== prev && x.length > 4);
+    return `${amc}|${x.length > 4 ? x : raw}`;
+};
+
 export const BrokerageStructure: React.FC<BrokerageStructureProps> = ({ currentUser }) => {
     const [files, setFiles] = useState<File[]>([]);
     const [loading, setLoading] = useState(false);
@@ -309,6 +329,10 @@ export const BrokerageStructure: React.FC<BrokerageStructureProps> = ({ currentU
             if (amcFilter !== 'ALL') params.append('amcName', amcFilter);
             if (monthFilter !== 'ALL') params.append('month', monthFilter);
             if (yearFilter !== 'ALL') params.append('year', yearFilter);
+            // Export what the screen is showing. Without these the file carried every
+            // historical re-rate of every scheme, so one scheme appeared once per month.
+            if (latestOnly) params.append('latestOnly', '1');
+            if (search.trim()) params.append('search', search.trim());
 
             const res = await authFetch(`/api/brokerage/export.csv?${params.toString()}`);
             if (!res.ok) {
@@ -491,9 +515,13 @@ export const BrokerageStructure: React.FC<BrokerageStructureProps> = ({ currentU
         // historical version side by side.
         const newest = new Map<string, typeof matched[number]>();
         for (const item of matched) {
-            const key = `${String(item.amcName || '').toUpperCase().replace(/[^A-Z0-9]/g, '')}|${String(item.schemeName || '').toUpperCase().replace(/[^A-Z0-9]/g, '')}`;
+            const key = masterSchemeKey(item.amcName, item.schemeName);
             const prev = newest.get(key);
-            if (!prev || String(item.period || '') > String(prev.period || '')) newest.set(key, item);
+            const better = !prev
+                || String(item.period || '') > String(prev.period || '')
+                || (String(item.period || '') === String(prev.period || '')
+                    && String(item.schemeName || '').length > String(prev.schemeName || '').length);
+            if (better) newest.set(key, item);
         }
         return Array.from(newest.values());
     }, [data, search, amcFilter, monthFilter, yearFilter, latestOnly]);
@@ -515,11 +543,48 @@ export const BrokerageStructure: React.FC<BrokerageStructureProps> = ({ currentU
         return Math.max(0, matched.length - filteredData.length);
     }, [data, search, amcFilter, monthFilter, yearFilter, latestOnly, filteredData.length]);
 
-    const getEffectiveRate = (grossRate: number) => {
-        if (isAdmin) return grossRate;
-        const netPoolPct = 100 - globalConfig.companyExpensePct;
-        const userLevelPct = (currentUser.customLevels?.[currentUser.level as keyof typeof currentUser.customLevels] ?? globalConfig.levels[currentUser.level as keyof typeof globalConfig.levels]) || 0;
-        return (grossRate * (netPoolPct / 100) * (userLevelPct / 100));
+    // What this member actually receives on a scheme, matching the payout engine.
+    //
+    // Two things were wrong. The engine applies the member's OWN level percentage
+    // straight to the GROSS (calcResidual: p = gross * pct / 100); this also
+    // multiplied by the net pool, so every level under-reported -- an L2 set to 25%
+    // was shown 21.25%. And at the residual level there IS no fixed percentage: that
+    // member receives whatever is left after the company's cut and after the levels
+    // below take theirs, so a fixed lookup found nothing and printed 0%.
+    // A third thing was wrong: the level percentage alone is not what an RM is paid.
+    // accumulatePayoutTotals pays the lead-source add-on to the owner of the level
+    // named by the client (server.js: leadSourcePct > 0 && lsl && lsl < rl), and for
+    // every RM on this system that level IS their own -- 1,544 of 1,561 clients name
+    // an L2 or L3, and all 78 non-residual members realise exactly own + 25%. So an
+    // RM set to 50% takes home 75% of gross, and 50% was the wrong number to print.
+    // "Total Schemes" counted raw ROWS, so the card read 2,084 while the list beside
+    // it said 1,635 and the export produced 1,667 — three numbers for one thing. Count
+    // distinct schemes with the same key the list and the export use; the row count is
+    // still shown, but labelled for what it actually is.
+    const totalSchemes = useMemo(
+        () => new Set(data.map(d => masterSchemeKey(d.amcName, d.schemeName))).size,
+        [data]
+    );
+
+    const residualLevel = Number((globalConfig as any).residualLevel) || 4;
+    const leadSourcePct = Number((globalConfig as any).leadSourcePct) || 0;
+    const getEffectiveRate = (grossRate: number): { rate: number; isResidual: boolean; sharePct: number; ownPct: number } => {
+        if (isAdmin) return { rate: grossRate, isResidual: false, sharePct: 100, ownPct: 100 };
+        const lvl = Number(currentUser.level);
+        if (lvl < residualLevel) {
+            const own = Number(
+                currentUser.customLevels?.[lvl as keyof typeof currentUser.customLevels]
+                ?? globalConfig.levels[lvl as keyof typeof globalConfig.levels]
+            ) || 0;
+            const share = own + leadSourcePct;
+            return { rate: grossRate * share / 100, isResidual: false, sharePct: share, ownPct: own };
+        }
+        let lowerSum = 0;
+        for (let l = 1; l < residualLevel; l++) {
+            lowerSum += Number(globalConfig.levels[l as keyof typeof globalConfig.levels]) || 0;
+        }
+        const surplus = Math.max(0, 100 - (Number(globalConfig.companyExpensePct) || 0) - lowerSum);
+        return { rate: grossRate * surplus / 100, isResidual: true, sharePct: surplus, ownPct: surplus };
     };
 
     // if (!isAdmin) return <div className="p-10 text-center text-slate-500 font-bold uppercase tracking-widest">Unauthorized Access</div>;
@@ -531,7 +596,14 @@ export const BrokerageStructure: React.FC<BrokerageStructureProps> = ({ currentU
                 <div>
                     <h1 className="text-2xl font-bold text-slate-900 tracking-tight uppercase">Brokerage Structure</h1>
                     <p className="text-slate-500 text-sm mt-1 font-medium">
-                        {isAdmin ? "Master control for AMC brokerage rates and PDF extraction." : `My individual sharing rates for ${currentUser.name}.`}
+                        {isAdmin
+                            ? "Master control for AMC brokerage rates and PDF extraction."
+                            : (() => {
+                                const e = getEffectiveRate(100);
+                                return e.isResidual
+                                    ? `My individual sharing rates for ${currentUser.name} — I am paid the residual, typically ${parseFloat(e.sharePct.toFixed(2))}% of gross.`
+                                    : `My individual sharing rates for ${currentUser.name} — ${parseFloat(e.ownPct.toFixed(2))}% my share + ${parseFloat(leadSourcePct.toFixed(2))}% lead source = ${parseFloat(e.sharePct.toFixed(2))}% of gross.`;
+                            })()}
                     </p>
                 </div>
                 <div className="flex gap-2">
@@ -622,7 +694,11 @@ export const BrokerageStructure: React.FC<BrokerageStructureProps> = ({ currentU
                         <div className="space-y-4">
                             <div className="flex justify-between items-center p-3 bg-slate-50 rounded-lg">
                                 <span className="text-[10px] font-black text-slate-500 uppercase">Total Schemes</span>
-                                <span className="text-lg font-black text-slate-900">{data.length}</span>
+                                <span className="text-lg font-black text-slate-900">{totalSchemes}</span>
+                            </div>
+                            <div className="flex justify-between items-center p-3 bg-slate-50 rounded-lg" title="Every stored row, including the earlier months a scheme has been re-rated in.">
+                                <span className="text-[10px] font-black text-slate-500 uppercase">Rate Versions</span>
+                                <span className="text-lg font-black text-slate-400">{data.length}</span>
                             </div>
                             <div className="flex justify-between items-center p-3 bg-slate-50 rounded-lg">
                                 <span className="text-[10px] font-black text-slate-500 uppercase">Tracked AMCs</span>
@@ -717,9 +793,12 @@ export const BrokerageStructure: React.FC<BrokerageStructureProps> = ({ currentU
                     )}
 
                     <div className="bg-white dark:bg-slate-800 rounded-xl border border-slate-200 dark:border-slate-700 shadow-sm overflow-hidden min-h-[500px] flex flex-col">
-                        <div className="p-4 border-b border-slate-200 flex flex-wrap justify-between items-center gap-4 bg-slate-50">
-                            <div className="flex items-center gap-4 flex-1">
-                                <div className="relative flex-1 max-w-xs">
+                        {/* Two rows: the search and its dropdowns get the full width, and the
+                            view options sit under them. On one row the search was squeezed to
+                            max-w-xs by the checkbox and the count sharing its line. */}
+                        <div className="p-4 border-b border-slate-200 bg-slate-50 space-y-3">
+                            <div className="flex flex-wrap items-center gap-3">
+                                <div className="relative flex-1 min-w-[240px]">
                                     <Search className="absolute left-3 top-2.5 text-slate-400 w-4 h-4" />
                                     <input type="text" placeholder="Search Master List..." value={search} onChange={(e) => { setSearch(e.target.value); setCurrentPage(1); }} className="w-full pl-10 pr-4 py-2 border border-slate-200 rounded-lg text-[11px] font-bold focus:ring-2 focus:ring-blue-500 bg-white" />
                                 </div>
@@ -739,6 +818,10 @@ export const BrokerageStructure: React.FC<BrokerageStructureProps> = ({ currentU
                                         {yearsList.map(y => <option key={y} value={y}>{y}</option>)}
                                     </select>
                                 </div>
+                            </div>
+
+                            {/* Second row: view options on the left, the resulting count on the right. */}
+                            <div className="flex flex-wrap items-center justify-between gap-3">
                                 {/* One row per scheme (its current rate) vs the full rate history. */}
                                 <div className="flex items-center gap-2">
                                     <label className="flex items-center gap-1.5 cursor-pointer select-none" title="AMCs revise their structures. Off = show every historical version of each scheme.">
@@ -754,9 +837,9 @@ export const BrokerageStructure: React.FC<BrokerageStructureProps> = ({ currentU
                                         <span className="text-[10px] font-bold text-slate-400 whitespace-nowrap">({supersededCount} older version{supersededCount === 1 ? '' : 's'} hidden)</span>
                                     )}
                                 </div>
-                            </div>
-                            <div className="text-[10px] text-slate-400 font-black uppercase tracking-widest">
-                                {filteredData.length} Master Schemes
+                                <div className="text-[10px] text-slate-400 font-black uppercase tracking-widest">
+                                    {filteredData.length} Master Schemes
+                                </div>
                             </div>
                         </div>
 
@@ -800,9 +883,28 @@ export const BrokerageStructure: React.FC<BrokerageStructureProps> = ({ currentU
                                                 {editingId === row.id ? (
                                                     <input type="number" step="0.001" value={editValues.trailRate} onChange={e => setEditValues({ ...editValues, trailRate: e.target.value })} className="w-20 border-blue-500 border rounded px-2 py-1 text-xs font-bold text-center" />
                                                 ) : (
-                                                    <span className={`font-black ${isAdmin ? 'text-slate-900' : 'text-emerald-700'} text-base`}>
-                                                        {parseFloat(getEffectiveRate(Number(row.trailRate) || 0).toFixed(4))}%
-                                                    </span>
+                                                    (() => {
+                                                        const e = getEffectiveRate(Number(row.trailRate) || 0);
+                                                        return (
+                                                            <>
+                                                                <span className={`font-black ${isAdmin ? 'text-slate-900' : 'text-emerald-700'} text-base`}>
+                                                                    {parseFloat(e.rate.toFixed(4))}%
+                                                                    {e.isResidual && (
+                                                                        <span title="You are paid the residual: whatever is left after the company share and after your RMs take their levels. The exact figure moves with each client's hierarchy, so this is the typical rate." className="ml-1 text-[10px] font-black text-amber-600 align-super">~</span>
+                                                                    )}
+                                                                </span>
+                                                                {/* An RM reading a bare 0.6% cannot tell it apart from the AMC's own
+                                                                    rate, so spell out the share it came from: own level + lead source. */}
+                                                                {!isAdmin && (
+                                                                    <div className="text-[10px] font-bold text-slate-400 mt-0.5 whitespace-nowrap">
+                                                                        {e.isResidual
+                                                                            ? `${parseFloat(e.sharePct.toFixed(2))}% of ${parseFloat((Number(row.trailRate) || 0).toFixed(4))}%`
+                                                                            : `${parseFloat(e.ownPct.toFixed(2))}% + ${parseFloat(leadSourcePct.toFixed(2))}% = ${parseFloat(e.sharePct.toFixed(2))}%`}
+                                                                    </div>
+                                                                )}
+                                                            </>
+                                                        );
+                                                    })()
                                                 )}
                                             </td>
                                             {isAdmin && (

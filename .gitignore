@@ -109,3 +109,6 @@ invoice_preview.html
 
 # Claude Code local settings (machine-specific)
 .claude/settings.local.json
+
+# Scratch analysis dumps (e.g. Source Code/_dupes.json)
+_*.json
