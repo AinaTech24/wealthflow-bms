@@ -100,7 +100,7 @@ export const ClientsAndHierarchy: React.FC<ClientsAndHierarchyProps> = ({ curren
   // the transactions now, through the one shared rule in utils/clientAum — shared
   // precisely because this page and the Reports client-summary tab each had their
   // own copy of it and drifted apart.
-  const liveAum = useClientAum(transactions);
+  const { aum: liveAum, clientsWithTx } = useClientAum(transactions);
 
   // One place decides a client's AUM, so the table, the sort and the export can
   // never disagree. The stored folio-master figure is the last fallback.
@@ -1009,7 +1009,24 @@ export const ClientsAndHierarchy: React.FC<ClientsAndHierarchyProps> = ({ curren
                       <td className="px-6 py-4 text-right">
                         {(() => {
                           const a = aumOf(client);
-                          if (!(a.total > 0)) return <span className="text-slate-300 dark:text-slate-600 text-xs">—</span>;
+                          if (!(a.total > 0)) {
+                            // A bare dash left an RM unable to tell a system problem
+                            // from a missing import. Mohammad Sadik's folio
+                            // 43908946/35 appears in no file we have ever loaded —
+                            // nine clients firm-wide are in that position — so say so
+                            // rather than showing nothing and letting it read as a bug.
+                            const known = clientsWithTx ? clientsWithTx.has(client.id) : null;
+                            return (
+                              <>
+                                <span className="text-slate-300 dark:text-slate-600 text-xs">—</span>
+                                {known === false && (
+                                  <div className="text-[9px] text-amber-600 dark:text-amber-400 font-bold uppercase tracking-widest mt-0.5">
+                                    Not in any import
+                                  </div>
+                                )}
+                              </>
+                            );
+                          }
                           const label = a.source === 'LIVE' ? 'Latest' : a.source === 'WBR9' ? 'Snapshot' : 'Estimated';
                           return (
                             <>

@@ -1186,7 +1186,19 @@ app.all('/api/data', mutationLimiter, async (req, res) => {
           `, args);
           const aum = {};
           for (const r of rows) aum[r.cid] = { total: Number(r.total) || 0, asOf: r.asOf || '' };
-          const body = { generatedAt: new Date().toISOString(), aum };
+          // Which clients appear in ANY imported row, with or without an AUM. Without
+          // this the table cannot tell "this folio has never been in an import" from
+          // "the import carried no AUM" — both render as a bare dash, and an RM has no
+          // way to know which one needs chasing. Nine clients firm-wide list folios
+          // that no file has ever mentioned (Mohammad Sadik's 43908946/35 among them).
+          const [seen] = await pool.query(
+            `SELECT DISTINCT mappedClientId cid FROM transactions
+             WHERE mappedClientId IS NOT NULL AND mappedClientId <> ''${scopeSql}`, args);
+          const body = {
+            generatedAt: new Date().toISOString(),
+            aum,
+            clientsWithTx: seen.map(r => r.cid),
+          };
           clientAumCache = { at: now, key: cacheKey, body };
           res.set('X-Cache', 'MISS');
           return res.json(body);

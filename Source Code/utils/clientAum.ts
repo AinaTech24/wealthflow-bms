@@ -8,6 +8,16 @@ import { authFetch } from '../contexts/DataContext';
 
 export interface AumEntry { total: number; asOf: string }
 
+export interface ClientAum {
+  aum: Map<string, AumEntry>;
+  /**
+   * Clients that appear in at least one imported row, with or without an AUM.
+   * `null` until the server answers — the browser holds too few transactions to
+   * decide this locally, and guessing would label a real client as missing.
+   */
+  clientsWithTx: Set<string> | null;
+}
+
 /**
  * Derive AUM per client from whatever transactions the browser is holding.
  *
@@ -66,9 +76,10 @@ export function deriveClientAum(transactions: any[]): Map<string, AumEntry> {
  * rule in SQL across every row, so every screen and every role agree. The local
  * figure is what we show while that request is in flight.
  */
-export function useClientAum(transactions: any[]): Map<string, AumEntry> {
+export function useClientAum(transactions: any[]): ClientAum {
   const local = useMemo(() => deriveClientAum(transactions), [transactions]);
   const [server, setServer] = useState<Map<string, AumEntry> | null>(null);
+  const [withTx, setWithTx] = useState<Set<string> | null>(null);
 
   useEffect(() => {
     let cancelled = false;
@@ -79,15 +90,18 @@ export function useClientAum(transactions: any[]): Map<string, AumEntry> {
         const j = await r.json();
         if (cancelled || !j?.aum) return;
         setServer(new Map(Object.entries(j.aum as Record<string, AumEntry>)));
+        if (Array.isArray(j.clientsWithTx)) setWithTx(new Set(j.clientsWithTx as string[]));
       } catch {
-        /* leave `server` null and fall back to the local derivation */
+        /* leave both null and fall back to the local derivation */
       }
     })();
     return () => { cancelled = true; };
   }, []);
 
-  // Returned as a Map rather than a lookup function so its identity is stable —
-  // callers memoise sorted client lists on it, and a fresh closure every render
-  // would re-sort the whole book each time.
-  return server ?? local;
+  // Memoised so the object's identity is stable — callers memoise sorted client
+  // lists on it, and a fresh object every render would re-sort the whole book.
+  return useMemo(
+    () => ({ aum: server ?? local, clientsWithTx: withTx }),
+    [server, local, withTx],
+  );
 }

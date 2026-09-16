@@ -259,7 +259,7 @@ export const Reports: React.FC<ReportsProps> = ({ currentUser }) => {
   // The rule itself lives in utils/clientAum, shared with the clients page: this tab
   // used to carry its own copy, and the two drifted until the same investor read
   // ₹10,986 on one screen and ₹12,266 on the other.
-  const liveAumByClient = useClientAum(transactions);
+  const { aum: liveAumByClient } = useClientAum(transactions);
 
   const clientWiseSummary = useMemo(() => {
     const summary: Record<string, { id: string, name: string, pan: string, count: number, gross: number, myShare: number, aum: number, aumAsOf: string }> = {};
