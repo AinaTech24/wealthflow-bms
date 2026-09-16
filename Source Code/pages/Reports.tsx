@@ -7,6 +7,7 @@ import { useData, authFetch } from '../contexts/DataContext';
 import { calculateUserShare } from '../services/calculationService';
 import { Pagination } from '../components/Pagination';
 import { useToast } from '../components/Toast';
+import { formatCompactINR } from '../utils/formatINR';
 
 // Recharts is ~150KB gzipped; load only when a chart-using tab is rendered.
 const ReportsCharts = lazy(() => import('../components/ReportsCharts'));
@@ -252,21 +253,50 @@ export const Reports: React.FC<ReportsProps> = ({ currentUser }) => {
     };
   }, [serverMyPayouts, filters.year, filters.month]);
 
+  // Same rule as the Linked Portfolios / Clients page (ClientsAndHierarchy.tsx):
+  // AUM is the latest currentValue per folio+scheme, summed per client — derived
+  // from ALL transactions (not the period-filtered slice), because AUM is a
+  // current snapshot, not something that resets when you filter to a past month.
+  // Computing it separately here (as this tab used to, by simply not showing it)
+  // is exactly how the two screens drifted apart.
+  const liveAumByClient = useMemo(() => {
+    const perClient = new Map<string, Map<string, { period: string; value: number }>>();
+    for (const tx of transactions) {
+      const cid = (tx as any).mappedClientId;
+      const value = Number((tx as any).currentValue);
+      if (!cid || !(value > 0)) continue;
+      const period = String(tx.brokeragePeriod || tx.transactionDate || '');
+      const key = `${(tx as any).folio}|${tx.schemeName}`;
+      let folios = perClient.get(cid);
+      if (!folios) { folios = new Map(); perClient.set(cid, folios); }
+      const prev = folios.get(key);
+      if (!prev || period > prev.period) folios.set(key, { period, value });
+    }
+    const out = new Map<string, { total: number; asOf: string }>();
+    for (const [cid, folios] of perClient) {
+      let total = 0, asOf = '';
+      for (const v of folios.values()) { total += v.value; if (v.period > asOf) asOf = v.period; }
+      if (total > 0) out.set(cid, { total, asOf });
+    }
+    return out;
+  }, [transactions]);
+
   const clientWiseSummary = useMemo(() => {
-    const summary: Record<string, { id: string, name: string, pan: string, count: number, gross: number, myShare: number }> = {};
+    const summary: Record<string, { id: string, name: string, pan: string, count: number, gross: number, myShare: number, aum: number, aumAsOf: string }> = {};
     visibleTransactions.forEach(tx => {
       const clientId = tx.mappedClientId || 'Unmapped';
       const clientName = tx.investorName || 'Unknown';
       const pan = tx.pan || 'N/A';
       if (!summary[clientId]) {
-        summary[clientId] = { id: clientId, name: clientName, pan, count: 0, gross: 0, myShare: 0 };
+        const live = liveAumByClient.get(clientId);
+        summary[clientId] = { id: clientId, name: clientName, pan, count: 0, gross: 0, myShare: 0, aum: live?.total || 0, aumAsOf: live?.asOf || '' };
       }
       summary[clientId].count += 1;
       summary[clientId].gross += tx.grossAmount;
       summary[clientId].myShare += calculateUserShare(tx, currentUser, globalConfig);
     });
     return Object.values(summary).sort((a, b) => b.myShare - a.myShare);
-  }, [visibleTransactions, currentUser, globalConfig]);
+  }, [visibleTransactions, currentUser, globalConfig, liveAumByClient]);
 
   const filteredClientWiseSummary = useMemo(() => {
     return clientWiseSummary.filter(c =>
@@ -1727,6 +1757,8 @@ export const Reports: React.FC<ReportsProps> = ({ currentUser }) => {
                     Transactions: c.count,
                     ...(isAdmin ? { 'Gross Amount (Rs.)': c.gross.toFixed(2) } : {}),
                     'My Share (Rs.)': c.myShare.toFixed(2),
+                    'AUM (Rs.)': c.aum ? Math.round(c.aum) : '',
+                    'AUM As Of': c.aumAsOf,
                   }));
                   exportToExcel(rows, `WealthflowClients_${new Date().toISOString().slice(0,7)}`, 'Client Summary');
                 }}
@@ -1743,6 +1775,7 @@ export const Reports: React.FC<ReportsProps> = ({ currentUser }) => {
                 <th className="px-6 py-4">PAN</th>
                 <th className="px-6 py-4 text-center">Txs</th>
                 {isAdmin && <th className="px-6 py-4 text-right">Gross (₹)</th>}
+                <th className="px-6 py-4 text-right">AUM</th>
                 <th className="px-6 py-4 text-right">My Share (₹)</th>
               </tr>
             </thead>
@@ -1753,6 +1786,14 @@ export const Reports: React.FC<ReportsProps> = ({ currentUser }) => {
                   <td className="px-6 py-4 font-mono text-[10px] text-slate-400">{c.pan}</td>
                   <td className="px-6 py-4 text-center text-slate-500 font-bold">{c.count}</td>
                   {isAdmin && <td className="px-6 py-4 text-right font-medium text-slate-900">₹{c.gross.toLocaleString()}</td>}
+                  <td className="px-6 py-4 text-right">
+                    {c.aum > 0 ? (
+                      <>
+                        <div className="font-black text-emerald-600">{formatCompactINR(c.aum)}</div>
+                        <div className="text-[9px] text-slate-400 font-bold uppercase tracking-widest mt-0.5">{c.aumAsOf}</div>
+                      </>
+                    ) : <span className="text-slate-300 text-xs">—</span>}
+                  </td>
                   <td className="px-6 py-4 text-right font-black text-emerald-600 text-base">₹{c.myShare.toLocaleString(undefined, { minimumFractionDigits: 2 })}</td>
                 </tr>
               ))}
