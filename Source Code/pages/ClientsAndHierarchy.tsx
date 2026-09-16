@@ -1,5 +1,5 @@
 
-import React, { useState, useMemo, useEffect } from 'react';
+import React, { useState, useMemo } from 'react';
 import { Users, Search, Plus, Edit2, X, UserCheck, Shield, ChevronRight, Tags, Database, Save, Key, Copy, Check, Mail, Trash2, UserPlus, GitMerge, Phone, AlertCircle, Download } from 'lucide-react';
 import { Client, TeamMember, Role } from '../types';
 import { useData, authFetch } from '../contexts/DataContext';
@@ -7,6 +7,7 @@ import { Pagination } from '../components/Pagination';
 import { useToast } from '../components/Toast';
 import { formatCompactINR } from '../utils/formatINR';
 import { exportToExcel } from '../utils/excelExport';
+import { useClientAum } from '../utils/clientAum';
 
 interface ClientsAndHierarchyProps {
   currentUser: TeamMember;
@@ -92,87 +93,18 @@ export const ClientsAndHierarchy: React.FC<ClientsAndHierarchyProps> = ({ curren
 
   const isFinance = currentUser.role === Role.FINANCE;
 
-  // AUM here used to be read straight off `client.totalAum`, a value written ONLY
-  // when a WBR9 / MFSD211 folio master is imported. The most recent one loaded was
-  // May's, and it covered a single investor of this RM's seven — so six rows showed
-  // "—" and the seventh showed a two-month-old ₹1,000 against a real ₹11,252.
-  //
-  // Derive it from the transactions instead: the latest currentValue per folio +
-  // scheme, which is the same snapshot rule the Growth tab uses, and which refreshes
-  // with every brokerage import rather than waiting on a folio master.
-  //
-  // Anchor on the LATEST MONTH THE FOLIO REPORTED, then add up that month's
-  // schemes. Keying per folio+scheme instead let dead scheme spellings pile up:
-  // folio 38383558/63 is one holding that three imports named three different
-  // ways — "HDFC Diversified Equity All Cap Active FOF - Regular Plan - Growth
-  // Plan", "…FOF Regular Growth", and the bare code "HARGR" — so the latest value
-  // of each was summed and ₹10,245 read as ₹12,285.
-  //
-  // Within that month take the LARGEST slice, not the first one seen. CAMS writes
-  // about twelve sub-period rows per folio+scheme; first-seen makes the answer
-  // depend on the order rows happen to arrive in, which is how the same client
-  // could read differently on two screens.
-  const liveAum = useMemo(() => {
-    const perClient = new Map<string, Map<string, { period: string; schemes: Map<string, number> }>>();
-    for (const tx of transactions) {
-      const cid = (tx as any).mappedClientId;
-      const value = Number((tx as any).currentValue);
-      if (!cid || !(value > 0)) continue;
-      // transactionDate is the original investment date, never the brokerage
-      // month, so it cannot stand in for a missing period.
-      const period = String(tx.brokeragePeriod || '');
-      if (!period) continue;
-      const folio = String((tx as any).folio ?? '');
-      const scheme = String(tx.schemeName ?? '');
-      let folios = perClient.get(cid);
-      if (!folios) { folios = new Map(); perClient.set(cid, folios); }
-      let f = folios.get(folio);
-      if (!f || period > f.period) { f = { period, schemes: new Map() }; folios.set(folio, f); }
-      if (period < f.period) continue;
-      const prev = f.schemes.get(scheme);
-      if (prev === undefined || value > prev) f.schemes.set(scheme, value);
-    }
-    const out = new Map<string, { total: number; asOf: string }>();
-    for (const [cid, folios] of perClient) {
-      let total = 0, asOf = '';
-      for (const f of folios.values()) {
-        for (const v of f.schemes.values()) total += v;
-        if (f.period > asOf) asOf = f.period;
-      }
-      if (total > 0) out.set(cid, { total, asOf });
-    }
-    return out;
-  }, [transactions]);
-
-  // The browser only ever holds 200k of ~450k transactions, so the derivation
-  // above is right only for whoever's slice happens to be complete — an admin
-  // saw a truncated book and an RM saw all of theirs, and the same client read
-  // ₹10,986 on one screen and ₹12,266 on the other. Ask the server, which runs
-  // the identical rule in SQL across every row, and keep the local figure only
-  // as something to show while that is in flight.
-  const [serverAum, setServerAum] = useState<Map<string, { total: number; asOf: string }> | null>(null);
-  useEffect(() => {
-    let cancelled = false;
-    (async () => {
-      try {
-        const r = await authFetch(`/api/data?action=client_aum&_=${Date.now()}`, { cache: 'no-store' });
-        if (!r.ok) return;
-        const j = await r.json();
-        if (cancelled || !j?.aum) return;
-        setServerAum(new Map(Object.entries(j.aum as Record<string, { total: number; asOf: string }>)));
-      } catch {
-        /* leave serverAum null and fall back to the local derivation */
-      }
-    })();
-    return () => { cancelled = true; };
-  }, []);
+  // AUM used to be read straight off `client.totalAum`, a value written ONLY when a
+  // WBR9 / MFSD211 folio master is imported. The most recent one loaded was May's,
+  // and it covered a single investor of this RM's seven — so six rows showed "—" and
+  // the seventh showed a two-month-old ₹1,000 against a real ₹11,252. It comes from
+  // the transactions now, through the one shared rule in utils/clientAum — shared
+  // precisely because this page and the Reports client-summary tab each had their
+  // own copy of it and drifted apart.
+  const liveAum = useClientAum(transactions);
 
   // One place decides a client's AUM, so the table, the sort and the export can
-  // never disagree. Server first, then the local derivation, then the stored
-  // folio-master figure.
+  // never disagree. The stored folio-master figure is the last fallback.
   const aumOf = (c: Client): { total: number; asOf: string; source: string } => {
-    const srv = serverAum?.get(c.id);
-    if (srv) return { total: srv.total, asOf: srv.asOf, source: 'LIVE' };
     const live = liveAum.get(c.id);
     if (live) return { total: live.total, asOf: live.asOf, source: 'LIVE' };
     return { total: Number(c.totalAum) || 0, asOf: c.aumAsOf || '', source: c.aumSource || '' };
@@ -209,7 +141,7 @@ export const ClientsAndHierarchy: React.FC<ClientsAndHierarchyProps> = ({ curren
       })
       // Sort by AUM desc by default — biggest clients first
       .sort((a, b) => aumOf(b).total - aumOf(a).total);
-  }, [clients, searchTerm, currentUser, isAdmin, gapFilter, liveAum, serverAum]);
+  }, [clients, searchTerm, currentUser, isAdmin, gapFilter, liveAum]);
 
   const openTeamModal = (member?: TeamMember) => {
     if (!isAdmin) return;

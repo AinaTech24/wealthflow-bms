@@ -8,6 +8,7 @@ import { calculateUserShare } from '../services/calculationService';
 import { Pagination } from '../components/Pagination';
 import { useToast } from '../components/Toast';
 import { formatCompactINR } from '../utils/formatINR';
+import { useClientAum } from '../utils/clientAum';
 
 // Recharts is ~150KB gzipped; load only when a chart-using tab is rendered.
 const ReportsCharts = lazy(() => import('../components/ReportsCharts'));
@@ -253,33 +254,12 @@ export const Reports: React.FC<ReportsProps> = ({ currentUser }) => {
     };
   }, [serverMyPayouts, filters.year, filters.month]);
 
-  // Same rule as the Linked Portfolios / Clients page (ClientsAndHierarchy.tsx):
-  // AUM is the latest currentValue per folio+scheme, summed per client — derived
-  // from ALL transactions (not the period-filtered slice), because AUM is a
-  // current snapshot, not something that resets when you filter to a past month.
-  // Computing it separately here (as this tab used to, by simply not showing it)
-  // is exactly how the two screens drifted apart.
-  const liveAumByClient = useMemo(() => {
-    const perClient = new Map<string, Map<string, { period: string; value: number }>>();
-    for (const tx of transactions) {
-      const cid = (tx as any).mappedClientId;
-      const value = Number((tx as any).currentValue);
-      if (!cid || !(value > 0)) continue;
-      const period = String(tx.brokeragePeriod || tx.transactionDate || '');
-      const key = `${(tx as any).folio}|${tx.schemeName}`;
-      let folios = perClient.get(cid);
-      if (!folios) { folios = new Map(); perClient.set(cid, folios); }
-      const prev = folios.get(key);
-      if (!prev || period > prev.period) folios.set(key, { period, value });
-    }
-    const out = new Map<string, { total: number; asOf: string }>();
-    for (const [cid, folios] of perClient) {
-      let total = 0, asOf = '';
-      for (const v of folios.values()) { total += v.value; if (v.period > asOf) asOf = v.period; }
-      if (total > 0) out.set(cid, { total, asOf });
-    }
-    return out;
-  }, [transactions]);
+  // AUM is a current snapshot, so it is derived from ALL transactions rather than
+  // the period-filtered slice — it must not reset when you filter to a past month.
+  // The rule itself lives in utils/clientAum, shared with the clients page: this tab
+  // used to carry its own copy, and the two drifted until the same investor read
+  // ₹10,986 on one screen and ₹12,266 on the other.
+  const liveAumByClient = useClientAum(transactions);
 
   const clientWiseSummary = useMemo(() => {
     const summary: Record<string, { id: string, name: string, pan: string, count: number, gross: number, myShare: number, aum: number, aumAsOf: string }> = {};
