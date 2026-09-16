@@ -75,7 +75,13 @@ let periodTotalsCache = null;   // { at, body } — 60s, same idea as summaryCac
 // team_payouts cache: keyed by `${year}:${month}`; payout rules change rarely.
 const TEAM_PAYOUTS_TTL_MS = 60_000;
 let teamPayoutsCache = {};
-const invalidateSummaryCache = () => { summaryCache = null; teamPayoutsCache = {}; memberClientCache = {}; };
+// client_aum scans every AUM-carrying row and parses JSON on each one, which costs
+// ~15s firm-wide. It only ever changes when transactions are written, and that path
+// calls invalidateSummaryCache() below — so hold it far longer than the 30s the
+// dashboard counters use rather than paying for the scan again every half minute.
+const CLIENT_AUM_TTL_MS = 10 * 60_000;
+let clientAumCache = null;      // { at, key, body } — see action=client_aum
+const invalidateSummaryCache = () => { summaryCache = null; teamPayoutsCache = {}; memberClientCache = {}; clientAumCache = null; };
 
 // Client ids whose hierarchy names this member at any level — i.e. their own book.
 // Cached because the dashboard and the transactions fetch both ask for it on load.
@@ -1116,6 +1122,77 @@ app.all('/api/data', mutationLimiter, async (req, res) => {
         } catch (e) {
           console.error('[period_totals]', e);
           return res.status(500).json({ error: 'Failed to build period totals' });
+        }
+      }
+
+      // ── Per-client AUM, computed in SQL over EVERY row ──────────────────────
+      //    The clients table used to derive this in the browser from the
+      //    `transactions` array, which is CAPPED at 200k of ~450k rows. Admin got
+      //    a truncated slice and an RM got their whole (scoped) book, so the SAME
+      //    client read ₹10,986 under Enterprise Management and ₹12,266 under
+      //    Linked Portfolios. Same bug as my_payouts; same cure — compute it here.
+      //
+      //    The rule, and why each part of it is there:
+      //      • latest period PER FOLIO, not per folio+scheme. One holding gets
+      //        written under whatever name the month's file used — folio
+      //        38383558/63 carries "HDFC Diversified Equity All Cap Active FOF -
+      //        Regular Plan - Growth Plan", "…FOF Regular Growth" AND the bare
+      //        scheme code "HARGR". Keyed per scheme, those are three keys whose
+      //        latest values STACK, and one ₹10,245 holding reads ₹12,285.
+      //        Anchoring on the folio's own latest month drops the dead spellings.
+      //      • MAX within that month, not first-seen. CAMS writes ~12 sub-period
+      //        slices per folio+scheme; picking whichever arrived first makes the
+      //        answer depend on row order, which is exactly why two screens
+      //        disagreed. MAX is order-independent.
+      //      • folio alone as the key, NOT amc+folio. amcName is spelled
+      //        inconsistently across imports, so pairing it with the folio splits
+      //        one folio in two and double-counts it (₹41.37 Cr → ₹75.97 Cr).
+      if (action === 'client_aum') {
+        try {
+          const now = Date.now();
+          const scoped = !isWriter(req) && req.user?.id;
+          const cacheKey = scoped ? `u:${req.user.id}` : 'all';
+          if (clientAumCache && clientAumCache.key === cacheKey && now - clientAumCache.at < CLIENT_AUM_TTL_MS) {
+            res.set('X-Cache', 'HIT');
+            return res.json(clientAumCache.body);
+          }
+          let scopeSql = '', args = [];
+          if (scoped) {
+            const mine = await clientIdsForMember(req.user.id);
+            if (!mine.length) return res.json({ generatedAt: new Date().toISOString(), aum: {} });
+            scopeSql = ` AND mappedClientId IN (${mine.map(() => '?').join(',')})`;
+            args = mine;
+          }
+          const [rows] = await pool.query(`
+            WITH r AS (
+              SELECT mappedClientId cid,
+                     JSON_UNQUOTE(JSON_EXTRACT(data,'$.folio')) folio,
+                     schemeName scheme,
+                     brokeragePeriod p,
+                     CAST(JSON_EXTRACT(data,'$.currentValue') AS DECIMAL(20,2)) cv
+              FROM transactions
+              WHERE mappedClientId IS NOT NULL
+                AND brokeragePeriod IS NOT NULL AND brokeragePeriod <> ''
+                AND CAST(JSON_EXTRACT(data,'$.currentValue') AS DECIMAL(20,2)) > 0
+                ${scopeSql}
+            ),
+            l AS (SELECT cid, folio, MAX(p) mp FROM r GROUP BY cid, folio),
+            s AS (SELECT r.cid, r.folio, r.scheme, MAX(r.cv) v
+                  FROM r JOIN l ON l.cid = r.cid AND l.folio = r.folio AND r.p = l.mp
+                  GROUP BY r.cid, r.folio, r.scheme)
+            SELECT s.cid, ROUND(SUM(s.v), 2) total, MAX(l.mp) asOf
+            FROM s JOIN l ON l.cid = s.cid AND l.folio = s.folio
+            GROUP BY s.cid
+          `, args);
+          const aum = {};
+          for (const r of rows) aum[r.cid] = { total: Number(r.total) || 0, asOf: r.asOf || '' };
+          const body = { generatedAt: new Date().toISOString(), aum };
+          clientAumCache = { at: now, key: cacheKey, body };
+          res.set('X-Cache', 'MISS');
+          return res.json(body);
+        } catch (e) {
+          console.error('[client_aum]', e);
+          return res.status(500).json({ error: 'Failed to build client AUM' });
         }
       }
 

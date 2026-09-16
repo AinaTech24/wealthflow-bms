@@ -1,5 +1,5 @@
 
-import React, { useState, useMemo } from 'react';
+import React, { useState, useMemo, useEffect } from 'react';
 import { Users, Search, Plus, Edit2, X, UserCheck, Shield, ChevronRight, Tags, Database, Save, Key, Copy, Check, Mail, Trash2, UserPlus, GitMerge, Phone, AlertCircle, Download } from 'lucide-react';
 import { Client, TeamMember, Role } from '../types';
 import { useData, authFetch } from '../contexts/DataContext';
@@ -100,31 +100,79 @@ export const ClientsAndHierarchy: React.FC<ClientsAndHierarchyProps> = ({ curren
   // Derive it from the transactions instead: the latest currentValue per folio +
   // scheme, which is the same snapshot rule the Growth tab uses, and which refreshes
   // with every brokerage import rather than waiting on a folio master.
+  //
+  // Anchor on the LATEST MONTH THE FOLIO REPORTED, then add up that month's
+  // schemes. Keying per folio+scheme instead let dead scheme spellings pile up:
+  // folio 38383558/63 is one holding that three imports named three different
+  // ways — "HDFC Diversified Equity All Cap Active FOF - Regular Plan - Growth
+  // Plan", "…FOF Regular Growth", and the bare code "HARGR" — so the latest value
+  // of each was summed and ₹10,245 read as ₹12,285.
+  //
+  // Within that month take the LARGEST slice, not the first one seen. CAMS writes
+  // about twelve sub-period rows per folio+scheme; first-seen makes the answer
+  // depend on the order rows happen to arrive in, which is how the same client
+  // could read differently on two screens.
   const liveAum = useMemo(() => {
-    const perClient = new Map<string, Map<string, { period: string; value: number }>>();
+    const perClient = new Map<string, Map<string, { period: string; schemes: Map<string, number> }>>();
     for (const tx of transactions) {
       const cid = (tx as any).mappedClientId;
       const value = Number((tx as any).currentValue);
       if (!cid || !(value > 0)) continue;
-      const period = String(tx.brokeragePeriod || tx.transactionDate || '');
-      const key = `${(tx as any).folio}|${tx.schemeName}`;
+      // transactionDate is the original investment date, never the brokerage
+      // month, so it cannot stand in for a missing period.
+      const period = String(tx.brokeragePeriod || '');
+      if (!period) continue;
+      const folio = String((tx as any).folio ?? '');
+      const scheme = String(tx.schemeName ?? '');
       let folios = perClient.get(cid);
       if (!folios) { folios = new Map(); perClient.set(cid, folios); }
-      const prev = folios.get(key);
-      if (!prev || period > prev.period) folios.set(key, { period, value });
+      let f = folios.get(folio);
+      if (!f || period > f.period) { f = { period, schemes: new Map() }; folios.set(folio, f); }
+      if (period < f.period) continue;
+      const prev = f.schemes.get(scheme);
+      if (prev === undefined || value > prev) f.schemes.set(scheme, value);
     }
     const out = new Map<string, { total: number; asOf: string }>();
     for (const [cid, folios] of perClient) {
       let total = 0, asOf = '';
-      for (const v of folios.values()) { total += v.value; if (v.period > asOf) asOf = v.period; }
+      for (const f of folios.values()) {
+        for (const v of f.schemes.values()) total += v;
+        if (f.period > asOf) asOf = f.period;
+      }
       if (total > 0) out.set(cid, { total, asOf });
     }
     return out;
   }, [transactions]);
 
+  // The browser only ever holds 200k of ~450k transactions, so the derivation
+  // above is right only for whoever's slice happens to be complete — an admin
+  // saw a truncated book and an RM saw all of theirs, and the same client read
+  // ₹10,986 on one screen and ₹12,266 on the other. Ask the server, which runs
+  // the identical rule in SQL across every row, and keep the local figure only
+  // as something to show while that is in flight.
+  const [serverAum, setServerAum] = useState<Map<string, { total: number; asOf: string }> | null>(null);
+  useEffect(() => {
+    let cancelled = false;
+    (async () => {
+      try {
+        const r = await authFetch(`/api/data?action=client_aum&_=${Date.now()}`, { cache: 'no-store' });
+        if (!r.ok) return;
+        const j = await r.json();
+        if (cancelled || !j?.aum) return;
+        setServerAum(new Map(Object.entries(j.aum as Record<string, { total: number; asOf: string }>)));
+      } catch {
+        /* leave serverAum null and fall back to the local derivation */
+      }
+    })();
+    return () => { cancelled = true; };
+  }, []);
+
   // One place decides a client's AUM, so the table, the sort and the export can
-  // never disagree. Live wins; the stored folio-master figure is the fallback.
+  // never disagree. Server first, then the local derivation, then the stored
+  // folio-master figure.
   const aumOf = (c: Client): { total: number; asOf: string; source: string } => {
+    const srv = serverAum?.get(c.id);
+    if (srv) return { total: srv.total, asOf: srv.asOf, source: 'LIVE' };
     const live = liveAum.get(c.id);
     if (live) return { total: live.total, asOf: live.asOf, source: 'LIVE' };
     return { total: Number(c.totalAum) || 0, asOf: c.aumAsOf || '', source: c.aumSource || '' };
@@ -161,7 +209,7 @@ export const ClientsAndHierarchy: React.FC<ClientsAndHierarchyProps> = ({ curren
       })
       // Sort by AUM desc by default — biggest clients first
       .sort((a, b) => aumOf(b).total - aumOf(a).total);
-  }, [clients, searchTerm, currentUser, isAdmin, gapFilter, liveAum]);
+  }, [clients, searchTerm, currentUser, isAdmin, gapFilter, liveAum, serverAum]);
 
   const openTeamModal = (member?: TeamMember) => {
     if (!isAdmin) return;
