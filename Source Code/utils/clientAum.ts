@@ -28,12 +28,19 @@ export interface ClientAum {
  * "…FOF Regular Growth", and the bare scheme code "HARGR"), so the latest value of
  * each was summed and ₹10,245 read as ₹12,285.
  *
- * Within that month the rows are SUMMED. A brokerage file writes one row per LOT —
- * per SIP instalment — not per sub-period slice. Folio 44004359/43 runs a ₹1,000
- * monthly SIP from 10-04-2026 and carries 1 row in April, 2 in May, 3 in June: the
- * row count IS the instalment count, and June's rows total ₹3,011.86 against the
- * AMC's own ₹3,000 cost basis. An earlier version of this took MAX and returned a
- * single instalment, understating every folio by its lot count.
+ * Within that month the DISTINCT row values are summed.
+ *
+ * Since around March 2026 a brokerage file writes one row per LOT — per SIP
+ * instalment — each with its own value. Folio 44004359/43 runs a ₹1,000 monthly SIP
+ * from 10-04-2026 and carries 1 row in April, 2 in May, 3 in June: the row count IS
+ * the instalment count, and June's rows total ₹3,011.86 against the AMC's own
+ * ₹3,000 cost basis.
+ *
+ * Before that the format repeated the folio+scheme TOTAL on every row — folio
+ * 11654668/34 has 132 rows in Jan-26, each a separate transaction with its own
+ * gross, every one stamped ₹394,795. Summing those would multiply the holding by
+ * 132. Summing DISTINCT values reads both formats correctly, and is what makes the
+ * implied annual trail land at 0.55–0.96% on every file in the system.
  *
  * Rows flagged `aumUnreliable` are skipped. July's CAMS half came from an
  * AdvisorKhoj portfolio export, which repeats ONE total on every row instead of
@@ -46,7 +53,7 @@ export interface ClientAum {
  * imports, and pairing them splits one folio in two (₹41.37 Cr → ₹75.97 Cr).
  */
 export function deriveClientAum(transactions: any[]): Map<string, AumEntry> {
-  const perClient = new Map<string, Map<string, { period: string; schemes: Map<string, number> }>>();
+  const perClient = new Map<string, Map<string, { period: string; schemes: Map<string, Set<number>> }>>();
   for (const tx of transactions) {
     const cid = tx?.mappedClientId;
     const value = Number(tx?.currentValue);
@@ -62,13 +69,15 @@ export function deriveClientAum(transactions: any[]): Map<string, AumEntry> {
     let f = folios.get(folio);
     if (!f || period > f.period) { f = { period, schemes: new Map() }; folios.set(folio, f); }
     if (period < f.period) continue;
-    f.schemes.set(scheme, (f.schemes.get(scheme) ?? 0) + value);
+    let vals = f.schemes.get(scheme);
+    if (!vals) { vals = new Set(); f.schemes.set(scheme, vals); }
+    vals.add(value);
   }
   const out = new Map<string, AumEntry>();
   for (const [cid, folios] of perClient) {
     let total = 0, asOf = '';
     for (const f of folios.values()) {
-      for (const v of f.schemes.values()) total += v;
+      for (const vals of f.schemes.values()) for (const v of vals) total += v;
       if (f.period > asOf) asOf = f.period;
     }
     if (total > 0) out.set(cid, { total, asOf });

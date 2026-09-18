@@ -1195,9 +1195,18 @@ app.all('/api/data', mutationLimiter, async (req, res) => {
                 ${scopeSql}
             ),
             l AS (SELECT cid, folio, MAX(p) mp FROM r GROUP BY cid, folio),
-            s AS (SELECT r.cid, r.folio, r.scheme, SUM(r.cv) v
-                  FROM r JOIN l ON l.cid = r.cid AND l.folio = r.folio AND r.p = l.mp
-                  GROUP BY r.cid, r.folio, r.scheme)
+            -- DISTINCT, because the file format changed around March 2026. Before
+            -- that a brokerage file wrote the folio+scheme TOTAL on every one of its
+            -- rows — folio 11654668/34 has 132 rows in Jan-26, each a separate
+            -- transaction with its own gross, every one stamped Rs 394,795. Since
+            -- March each row carries its own lot value instead. Summing distinct
+            -- values is right for both: it collapses the repeated total and adds up
+            -- genuine per-lot rows. It is also what makes the implied annual trail
+            -- land at 0.55-0.96% on every file we hold, old and new alike.
+            d AS (SELECT DISTINCT cid, folio, scheme, p, cv FROM r),
+            s AS (SELECT d.cid, d.folio, d.scheme, SUM(d.cv) v
+                  FROM d JOIN l ON l.cid = d.cid AND l.folio = d.folio AND d.p = l.mp
+                  GROUP BY d.cid, d.folio, d.scheme)
             SELECT s.cid, ROUND(SUM(s.v), 2) total, MAX(l.mp) asOf
             FROM s JOIN l ON l.cid = s.cid AND l.folio = s.folio
             GROUP BY s.cid
