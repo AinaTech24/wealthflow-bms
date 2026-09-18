@@ -28,9 +28,19 @@ export interface ClientAum {
  * "…FOF Regular Growth", and the bare scheme code "HARGR"), so the latest value of
  * each was summed and ₹10,245 read as ₹12,285.
  *
- * Within that month the LARGEST slice wins, not the first one seen. CAMS writes
- * about twelve sub-period rows per folio+scheme, so first-seen makes the answer
- * depend on the order rows arrive in — which is how two screens disagreed.
+ * Within that month the rows are SUMMED. A brokerage file writes one row per LOT —
+ * per SIP instalment — not per sub-period slice. Folio 44004359/43 runs a ₹1,000
+ * monthly SIP from 10-04-2026 and carries 1 row in April, 2 in May, 3 in June: the
+ * row count IS the instalment count, and June's rows total ₹3,011.86 against the
+ * AMC's own ₹3,000 cost basis. An earlier version of this took MAX and returned a
+ * single instalment, understating every folio by its lot count.
+ *
+ * Rows flagged `aumUnreliable` are skipped. July's CAMS half came from an
+ * AdvisorKhoj portfolio export, which repeats ONE total on every row instead of
+ * writing per-lot values, and that total is the value at the export date rather
+ * than at July — summed, it reads ₹20,448 where the folio held about ₹4,000. Those
+ * rows stay in the system as the brokerage record; they just cannot state an AUM,
+ * so the folio falls back to its last clean month.
  *
  * Keyed on folio alone, never amc+folio: amcName is spelled inconsistently across
  * imports, and pairing them splits one folio in two (₹41.37 Cr → ₹75.97 Cr).
@@ -40,7 +50,7 @@ export function deriveClientAum(transactions: any[]): Map<string, AumEntry> {
   for (const tx of transactions) {
     const cid = tx?.mappedClientId;
     const value = Number(tx?.currentValue);
-    if (!cid || !(value > 0)) continue;
+    if (!cid || !(value > 0) || tx?.aumUnreliable === true) continue;
     // transactionDate is the original investment date, never the brokerage month,
     // so it cannot stand in for a missing period.
     const period = String(tx.brokeragePeriod || '');
@@ -52,8 +62,7 @@ export function deriveClientAum(transactions: any[]): Map<string, AumEntry> {
     let f = folios.get(folio);
     if (!f || period > f.period) { f = { period, schemes: new Map() }; folios.set(folio, f); }
     if (period < f.period) continue;
-    const prev = f.schemes.get(scheme);
-    if (prev === undefined || value > prev) f.schemes.set(scheme, value);
+    f.schemes.set(scheme, (f.schemes.get(scheme) ?? 0) + value);
   }
   const out = new Map<string, AumEntry>();
   for (const [cid, folios] of perClient) {

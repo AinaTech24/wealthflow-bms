@@ -1140,10 +1140,24 @@ app.all('/api/data', mutationLimiter, async (req, res) => {
       //        scheme code "HARGR". Keyed per scheme, those are three keys whose
       //        latest values STACK, and one ₹10,245 holding reads ₹12,285.
       //        Anchoring on the folio's own latest month drops the dead spellings.
-      //      • MAX within that month, not first-seen. CAMS writes ~12 sub-period
-      //        slices per folio+scheme; picking whichever arrived first makes the
-      //        answer depend on row order, which is exactly why two screens
-      //        disagreed. MAX is order-independent.
+      //      • SUM within that month. A brokerage file writes one row per LOT — per
+      //        SIP instalment — not per sub-period slice, so the rows add up. Folio
+      //        44004359/43 runs a Rs 1,000 monthly SIP from 10-04-2026 and carries 1
+      //        row in April, 2 in May, 3 in June: the row count IS the instalment
+      //        count, and June's rows total Rs 3,011.86 against the AMC's own
+      //        Rs 3,000 cost basis. An earlier version of this query took MAX and
+      //        returned one instalment, understating every folio by its lot count.
+      //        The implied annual trail confirms it — with SUM, CAMS reads
+      //        0.54 / 0.55 / 0.55% across Apr/May/Jun and Kfin 0.65 / 0.62 / 0.67%;
+      //        MAX gave 1.2-2.0%, above what regular plans actually pay.
+      //      • rows flagged `aumUnreliable` are skipped. July's CAMS half came from
+      //        an AdvisorKhoj portfolio export, which repeats ONE total on every row
+      //        rather than writing per-lot values (66.5% of July's folio+scheme
+      //        groups are all-identical against 0.1-0.3% in April, May and June),
+      //        and that total is the value at the EXPORT date, not at July. Summing
+      //        it gives Rs 20,448 where the folio held about Rs 4,000. The rows stay
+      //        in the table — they are still the brokerage record — but they cannot
+      //        state an AUM, so those folios fall back to their last clean month.
       //      • folio alone as the key, NOT amc+folio. amcName is spelled
       //        inconsistently across imports, so pairing it with the folio splits
       //        one folio in two and double-counts it (₹41.37 Cr → ₹75.97 Cr).
@@ -1174,10 +1188,14 @@ app.all('/api/data', mutationLimiter, async (req, res) => {
               WHERE mappedClientId IS NOT NULL
                 AND brokeragePeriod IS NOT NULL AND brokeragePeriod <> ''
                 AND CAST(JSON_EXTRACT(data,'$.currentValue') AS DECIMAL(20,2)) > 0
+                -- NOT "COALESCE(JSON_EXTRACT(...), FALSE) <> TRUE": MariaDB's JSON
+                -- functions return the STRING 'true', which casts to 0 against the
+                -- numeric TRUE, so that test silently keeps every flagged row.
+                AND NOT (JSON_UNQUOTE(JSON_EXTRACT(data,'$.aumUnreliable')) <=> 'true')
                 ${scopeSql}
             ),
             l AS (SELECT cid, folio, MAX(p) mp FROM r GROUP BY cid, folio),
-            s AS (SELECT r.cid, r.folio, r.scheme, MAX(r.cv) v
+            s AS (SELECT r.cid, r.folio, r.scheme, SUM(r.cv) v
                   FROM r JOIN l ON l.cid = r.cid AND l.folio = r.folio AND r.p = l.mp
                   GROUP BY r.cid, r.folio, r.scheme)
             SELECT s.cid, ROUND(SUM(s.v), 2) total, MAX(l.mp) asOf
