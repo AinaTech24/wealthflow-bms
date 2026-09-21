@@ -117,7 +117,7 @@ export interface SharingConfig {
    * carries no RM dimension at all — every row is one branch — so this cannot be
    * derived from the level ladder above. It is set deliberately per partner.
    */
-  partnerSharing?: Record<string, number>;
+  partnerSharing?: Record<string, number | Record<string, number>>;
   levels: {
     1: number;
     2: number;

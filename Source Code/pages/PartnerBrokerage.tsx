@@ -86,7 +86,7 @@ interface CodeRow {
 }
 
 export const PartnerBrokerage: React.FC<Props> = ({ currentUser }) => {
-  const { clients, globalConfig } = useData();
+  const { clients, globalConfig, updateConfig } = useData();
   const { showToast } = useToast();
   const isAdmin = currentUser.role === Role.ADMIN;
   const isFinance = currentUser.role === Role.FINANCE;
@@ -102,17 +102,30 @@ export const PartnerBrokerage: React.FC<Props> = ({ currentUser }) => {
   const fileRef = useRef<HTMLInputElement>(null);
 
   const partner = 'MOFSL';
-  const sharePct = Number(globalConfig?.partnerSharing?.[partner] ?? 0);
+  // Stored either as a bare number (all of it to the RM level) or per level.
+  const rawShare = globalConfig?.partnerSharing?.[partner];
+  const levelPct: Record<string, number> = typeof rawShare === 'number'
+    ? { 3: rawShare }
+    : Object.fromEntries(Object.entries(rawShare || {}).map(([k, v]) => [k, Number(v) || 0]));
+  const sharePct = Object.values(levelPct).reduce((a, b) => a + b, 0);
+
+  const [ledger, setLedger] = useState<any>(null);
+  const [pctDraft, setPctDraft] = useState<Record<string, string>>({});
+  const [payFor, setPayFor] = useState<{ userId: string; name: string; period: string; suggested: number } | null>(null);
+  const [payAmount, setPayAmount] = useState('');
+  const [payRef, setPayRef] = useState('');
 
   const load = async () => {
     setBusy(true);
     try {
-      const [s, r] = await Promise.all([
+      const [s, r, l] = await Promise.all([
         authFetch(`/api/data?action=partner_summary&_=${Date.now()}`, { cache: 'no-store' }),
         authFetch(`/api/data?action=partner_rows&_=${Date.now()}`, { cache: 'no-store' }),
+        authFetch(`/api/data?action=partner_ledger&partner=${partner}&_=${Date.now()}`, { cache: 'no-store' }),
       ]);
       if (s.ok) setSummary(await s.json());
       if (r.ok) setRows(await r.json());
+      if (l.ok) setLedger(await l.json());
       if (canWrite) {
         const c = await authFetch(`/api/data?action=partner_codes&_=${Date.now()}`, { cache: 'no-store' });
         if (c.ok) setCodes(await c.json());
@@ -289,18 +302,67 @@ export const PartnerBrokerage: React.FC<Props> = ({ currentUser }) => {
         <Tile label="Rows" value={totals?.rows_} raw hint={`${totals?.codes ?? 0} client code${(totals?.codes ?? 0) !== 1 ? 's' : ''}`} />
       </div>
 
-      {canWrite && sharePct === 0 && (
-        <div className="rounded-xl border-2 border-amber-300 dark:border-amber-700 bg-amber-50 dark:bg-amber-900/20 p-4 flex items-start gap-3">
-          <AlertTriangle className="w-5 h-5 text-amber-600 flex-shrink-0 mt-0.5" />
-          <div>
-            <p className="text-sm font-bold text-amber-800 dark:text-amber-300">
-              No sharing % is set for {partner}, so no RM sees a payout from this yet.
-            </p>
-            <p className="text-[11px] text-amber-700/90 dark:text-amber-400/90 mt-1 max-w-3xl">
-              The statement says what the firm earns, but not what reaches an RM — broking carries no level ladder of
-              its own. Set that percentage in Admin Console → Sharing, and every mapped client's rows start
-              reporting a payout.
-            </p>
+      {canWrite && (
+        <div className={`rounded-xl border-2 p-4 ${sharePct === 0
+          ? 'border-amber-300 dark:border-amber-700 bg-amber-50 dark:bg-amber-900/20'
+          : 'border-slate-200 dark:border-slate-700 bg-white dark:bg-slate-800'}`}>
+          <div className="flex items-start gap-3">
+            {sharePct === 0 && <AlertTriangle className="w-5 h-5 text-amber-600 flex-shrink-0 mt-0.5" />}
+            <div className="flex-1">
+              <p className={`text-sm font-bold ${sharePct === 0 ? 'text-amber-800 dark:text-amber-300' : 'text-slate-900 dark:text-slate-100'}`}>
+                {sharePct === 0
+                  ? `No sharing % is set for ${partner}, so nobody is owed anything yet.`
+                  : `Sharing for ${partner}`}
+              </p>
+              <p className={`text-[11px] mt-1 max-w-3xl ${sharePct === 0 ? 'text-amber-700/90 dark:text-amber-400/90' : 'text-slate-500 dark:text-slate-400'}`}>
+                The statement says what the firm earns; it says nothing about what reaches a person, because broking
+                carries no level ladder of its own. Set a percentage against the hierarchy level that should be paid —
+                most clients here sit at level 3 (RM) with their manager at level 4.
+              </p>
+              <div className="flex items-end gap-3 mt-3 flex-wrap">
+                {[1, 2, 3, 4, 5, 6, 7].map(lv => (
+                  <div key={lv}>
+                    <label htmlFor={`pct-${lv}`} className="block text-[9px] font-black uppercase tracking-widest text-slate-400 mb-1">
+                      Level {lv}
+                    </label>
+                    <div className="relative">
+                      <input
+                        id={`pct-${lv}`}
+                        type="number" min="0" max="100" step="0.5"
+                        value={pctDraft[lv] ?? String(levelPct[lv] ?? '')}
+                        onChange={e => setPctDraft(d => ({ ...d, [lv]: e.target.value }))}
+                        className="w-20 pl-2 pr-5 py-1.5 text-sm rounded-lg border border-slate-200 dark:border-slate-600 dark:bg-slate-900 dark:text-slate-100 tabular-nums"
+                        placeholder="0"
+                      />
+                      <span className="absolute right-2 top-1/2 -translate-y-1/2 text-[10px] text-slate-400">%</span>
+                    </div>
+                  </div>
+                ))}
+                <button
+                  onClick={async () => {
+                    const next: Record<string, number> = {};
+                    for (const lv of [1, 2, 3, 4, 5, 6, 7]) {
+                      const v = Number(pctDraft[lv] ?? levelPct[lv] ?? 0);
+                      if (v > 0) next[lv] = v;
+                    }
+                    updateConfig({
+                      ...globalConfig,
+                      partnerSharing: { ...(globalConfig.partnerSharing || {}), [partner]: next },
+                    });
+                    setPctDraft({});
+                    showToast(
+                      Object.keys(next).length
+                        ? `Saved — ${Object.entries(next).map(([l, v]) => `level ${l}: ${v}%`).join(', ')}.`
+                        : 'Cleared — nobody is owed anything from this partner now.',
+                      'success');
+                    setTimeout(load, 400);
+                  }}
+                  className="px-4 py-2 rounded-lg bg-blue-600 text-white text-xs font-bold hover:bg-blue-700 transition"
+                >
+                  Save sharing
+                </button>
+              </div>
+            </div>
           </div>
         </div>
       )}
@@ -372,6 +434,157 @@ export const PartnerBrokerage: React.FC<Props> = ({ currentUser }) => {
             </table>
           </div>
         </Panel>
+      )}
+
+      {canWrite && ledger?.unattributed?.total > 0 && (
+        <div className="rounded-xl border-2 border-amber-300 dark:border-amber-700 bg-amber-50 dark:bg-amber-900/20 p-4 flex items-start gap-3">
+          <AlertTriangle className="w-5 h-5 text-amber-600 flex-shrink-0 mt-0.5" />
+          <div>
+            <p className="text-sm font-bold text-amber-800 dark:text-amber-300">
+              ₹{ledger.unattributed.total.toLocaleString('en-IN', { maximumFractionDigits: 2 })} reaches nobody,
+              across {ledger.unattributed.clients} client{ledger.unattributed.clients !== 1 ? 's' : ''}.
+            </p>
+            <p className="text-[11px] text-amber-700/90 dark:text-amber-400/90 mt-1 max-w-3xl leading-relaxed">
+              Those clients have no one sitting at a level you set a percentage against — hierarchies here are not
+              uniform, so a client's RM can be at level 2 where another's is at level 3. The money stays with the
+              firm rather than being owed to anyone. Either set a percentage for the levels those clients use, or
+              fix the hierarchy on the clients page.
+            </p>
+          </div>
+        </div>
+      )}
+
+      {/* ── Payout ledger ─────────────────────────────────────────────────── */}
+      <Panel title={canWrite ? 'Payout ledger' : 'Your payout ledger'}>
+        {!ledger?.people?.length
+          ? (
+            <Empty>
+              {!ledger?.configured
+                ? 'Set a sharing % above and the ledger fills in.'
+                : canWrite
+                  ? 'Nothing owed yet — attach client codes to clients and the earnings appear here.'
+                  : 'Nothing owed to you from this partner yet.'}
+            </Empty>
+          )
+          : (
+            <>
+              <p className="text-[11px] text-slate-500 dark:text-slate-400 mb-3 max-w-3xl">
+                <b>Carried</b> is what is still owed once that month closes — an unpaid balance from July is still
+                owed in August, so each month opens with the one before it built in. Pay a month in parts and the
+                ledger adds the parts up.
+              </p>
+              <div className="overflow-x-auto">
+                <table className="w-full text-sm">
+                  <Head cols={canWrite
+                    ? ['Person', 'Month', 'Earned', 'Paid', 'Carried', '']
+                    : ['Month', 'Earned', 'Paid', 'Carried']} />
+                  <tbody>
+                    {ledger.people.map((p: any) => (
+                      <React.Fragment key={p.userId}>
+                        {p.months.map((m: any, i: number) => (
+                          <tr key={`${p.userId}-${m.period}`} className="border-b border-slate-100 dark:border-slate-700/50">
+                            {canWrite && (
+                              <Td bold={i === 0}>
+                                {i === 0
+                                  ? <>{p.name}{p.level != null && <span className="text-slate-400 font-normal"> · L{p.level}</span>}</>
+                                  : ''}
+                              </Td>
+                            )}
+                            <Td mono>{m.period}</Td>
+                            <Td mono right>₹{m.earned.toLocaleString('en-IN', { maximumFractionDigits: 2 })}</Td>
+                            <Td mono right>₹{m.paid.toLocaleString('en-IN', { maximumFractionDigits: 2 })}</Td>
+                            <Td mono right bold>
+                              <span className={m.carried > 0 ? 'text-red-600 dark:text-red-400' : 'text-emerald-600 dark:text-emerald-400'}>
+                                ₹{m.carried.toLocaleString('en-IN', { maximumFractionDigits: 2 })}
+                              </span>
+                            </Td>
+                            {canWrite && (
+                              <td className="py-2 pr-4 text-right">
+                                <button
+                                  onClick={() => {
+                                    setPayFor({ userId: p.userId, name: p.name, period: m.period, suggested: m.carried });
+                                    setPayAmount(m.carried > 0 ? String(Math.round(m.carried * 100) / 100) : '');
+                                    setPayRef('');
+                                  }}
+                                  className="px-2.5 py-1 rounded-lg border border-slate-200 dark:border-slate-600 text-[10px] font-black uppercase tracking-widest text-slate-600 dark:text-slate-300 hover:border-emerald-400 hover:text-emerald-600 transition"
+                                >
+                                  Record payment
+                                </button>
+                              </td>
+                            )}
+                          </tr>
+                        ))}
+                        {canWrite && (
+                          <tr className="border-b-2 border-slate-200 dark:border-slate-700 bg-slate-50 dark:bg-slate-900/40">
+                            <Td bold>{p.name} — total</Td>
+                            <Td />
+                            <Td mono right bold>₹{p.totalEarned.toLocaleString('en-IN', { maximumFractionDigits: 2 })}</Td>
+                            <Td mono right bold>₹{p.totalPaid.toLocaleString('en-IN', { maximumFractionDigits: 2 })}</Td>
+                            <Td mono right bold>
+                              <span className={p.outstanding > 0 ? 'text-red-600 dark:text-red-400' : 'text-emerald-600 dark:text-emerald-400'}>
+                                ₹{p.outstanding.toLocaleString('en-IN', { maximumFractionDigits: 2 })}
+                              </span>
+                            </Td>
+                            <Td />
+                          </tr>
+                        )}
+                      </React.Fragment>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+            </>
+          )}
+      </Panel>
+
+      {/* Record-a-payment dialog */}
+      {payFor && (
+        <div className="fixed inset-0 z-50 bg-slate-900/50 flex items-center justify-center p-4" onClick={() => setPayFor(null)}>
+          <div className="bg-white dark:bg-slate-800 rounded-2xl border border-slate-200 dark:border-slate-700 p-5 w-full max-w-sm" onClick={e => e.stopPropagation()}>
+            <h3 className="font-bold text-slate-900 dark:text-slate-100">Record a payment</h3>
+            <p className="text-xs text-slate-500 dark:text-slate-400 mt-0.5">
+              {payFor.name} · {payFor.period} · outstanding ₹{payFor.suggested.toLocaleString('en-IN', { maximumFractionDigits: 2 })}
+            </p>
+            <label htmlFor="pay-amount" className="block text-[10px] font-black uppercase tracking-widest text-slate-400 mt-4 mb-1">Amount paid</label>
+            <input
+              id="pay-amount" type="number" step="0.01" value={payAmount}
+              onChange={e => setPayAmount(e.target.value)}
+              className="w-full px-3 py-2 rounded-lg border border-slate-200 dark:border-slate-600 dark:bg-slate-900 dark:text-slate-100 tabular-nums"
+              placeholder="0.00"
+            />
+            <label htmlFor="pay-ref" className="block text-[10px] font-black uppercase tracking-widest text-slate-400 mt-3 mb-1">Reference <span className="font-normal normal-case tracking-normal">(optional)</span></label>
+            <input
+              id="pay-ref" value={payRef} onChange={e => setPayRef(e.target.value)}
+              className="w-full px-3 py-2 rounded-lg border border-slate-200 dark:border-slate-600 dark:bg-slate-900 dark:text-slate-100"
+              placeholder="UTR / cheque no."
+            />
+            <div className="flex gap-2 mt-5">
+              <button onClick={() => setPayFor(null)} className="flex-1 px-4 py-2 rounded-lg border border-slate-200 dark:border-slate-600 text-slate-600 dark:text-slate-300 text-sm font-bold">Cancel</button>
+              <button
+                onClick={async () => {
+                  const amt = Number(payAmount);
+                  if (!Number.isFinite(amt) || amt === 0) { showToast('Enter an amount.', 'warning'); return; }
+                  const res = await authFetch('/api/data', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({
+                      action: 'partner_pay',
+                      payload: { partner, period: payFor.period, userId: payFor.userId, amount: amt, reference: payRef || null },
+                    }),
+                  });
+                  const j = await res.json();
+                  if (!res.ok) { showToast(j?.error || 'Could not record the payment.', 'error'); return; }
+                  showToast(`₹${amt.toLocaleString('en-IN')} recorded for ${payFor.name} · ${payFor.period}.`, 'success');
+                  setPayFor(null);
+                  await load();
+                }}
+                className="flex-1 px-4 py-2 rounded-lg bg-emerald-600 text-white text-sm font-bold hover:bg-emerald-700 transition"
+              >
+                Record
+              </button>
+            </div>
+          </div>
+        </div>
       )}
 
       {/* ── Mapping ───────────────────────────────────────────────────────── */}
@@ -515,7 +728,7 @@ const Head: React.FC<{ cols: string[] }> = ({ cols }) => (
   </thead>
 );
 
-const Td: React.FC<{ children: React.ReactNode; mono?: boolean; right?: boolean; bold?: boolean }> =
+const Td: React.FC<{ children?: React.ReactNode; mono?: boolean; right?: boolean; bold?: boolean }> =
 ({ children, mono, right, bold }) => (
   <td className={`py-2 pr-4 ${mono ? 'font-mono text-xs tabular-nums' : ''} ${right ? 'text-right' : ''} ${bold ? 'font-bold text-slate-900 dark:text-slate-100' : 'text-slate-600 dark:text-slate-300'}`}>
     {children}
