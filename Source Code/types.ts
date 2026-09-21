@@ -109,6 +109,15 @@ export interface SharingConfig {
   id: string;
   name: string;
   companyExpensePct: number; // e.g. 15 for 15%
+  /**
+   * Flat % of the firm's partner-brokerage share that reaches the mapped client's
+   * RM, keyed by partner code (e.g. { MOFSL: 30 }).
+   *
+   * Broking is a different business from mutual fund trail and its statement
+   * carries no RM dimension at all — every row is one branch — so this cannot be
+   * derived from the level ladder above. It is set deliberately per partner.
+   */
+  partnerSharing?: Record<string, number>;
   levels: {
     1: number;
     2: number;

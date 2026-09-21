@@ -15,6 +15,7 @@ const Settings = lazy(() => import('./pages/Settings').then(m => ({ default: m.S
 const ClientsAndHierarchy = lazy(() => import('./pages/ClientsAndHierarchy').then(m => ({ default: m.ClientsAndHierarchy })));
 const Reports = lazy(() => import('./pages/Reports').then(m => ({ default: m.Reports })));
 const BrokerageStructure = lazy(() => import('./pages/BrokerageStructure').then(m => ({ default: m.BrokerageStructure })));
+const PartnerBrokerage = lazy(() => import('./pages/PartnerBrokerage').then(m => ({ default: m.PartnerBrokerage })));
 const AuditLog = lazy(() => import('./pages/AuditLog').then(m => ({ default: m.AuditLog })));
 const Login = lazy(() => import('./pages/Login').then(m => ({ default: m.Login })));
 
@@ -108,6 +109,8 @@ const AppContent: React.FC = () => {
         return <Reports currentUser={currentUser} />;
       case 'brokerage':
         return <BrokerageStructure currentUser={currentUser} />;
+      case 'partner':
+        return <PartnerBrokerage currentUser={currentUser} />;
       case 'audit':
         return <AuditLog currentUser={currentUser} />;
       case 'settings':

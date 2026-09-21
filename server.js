@@ -243,6 +243,20 @@ const requireAdminOrFinance = (req, res, next) => {
 // Only ADMIN/FINANCE may WRITE core data — without this, any authenticated user
 // could POST to /api/data and rewrite payout config or their own customLevels /
 // hierarchy and inflate their own payout.
+// Deterministic 53-bit content hash (cyrb53). Partner brokerage rows derive their
+// id from their own content, so re-importing a corrected statement updates rows in
+// place instead of doubling the month.
+const hash53 = (str, seed = 0) => {
+  let h1 = 0xdeadbeef ^ seed, h2 = 0x41c6ce57 ^ seed;
+  for (let i = 0, ch; i < str.length; i++) {
+    ch = str.charCodeAt(i);
+    h1 = Math.imul(h1 ^ ch, 2654435761);
+    h2 = Math.imul(h2 ^ ch, 1597334677);
+  }
+  h1 = Math.imul(h1 ^ (h1 >>> 16), 2246822507) ^ Math.imul(h2 ^ (h2 >>> 13), 3266489909);
+  h2 = Math.imul(h2 ^ (h2 >>> 16), 2246822507) ^ Math.imul(h1 ^ (h1 >>> 13), 3266489909);
+  return (4294967296 * (2097151 & h2) + (h1 >>> 0)).toString(36);
+};
 const isWriter = (req) => !!req.user && (req.user.role === 'ADMIN' || req.user.role === 'FINANCE');
 
 // --- Generic mutation rate limiter (per-IP) ---
@@ -469,6 +483,21 @@ async function initDB() {
     "CREATE TABLE IF NOT EXISTS activity_log (id INT AUTO_INCREMENT PRIMARY KEY, userId VARCHAR(100), userName VARCHAR(255), action VARCHAR(255), description TEXT, createdAt DATETIME DEFAULT CURRENT_TIMESTAMP, INDEX idx_user (userId))",
     "CREATE TABLE IF NOT EXISTS payout_ledger (transactionId VARCHAR(100), userId VARCHAR(100), amount DECIMAL(15,4), level INT, UNIQUE KEY unq_tx_user (transactionId, userId), INDEX idx_user (userId))",
     "CREATE TABLE IF NOT EXISTS brokerage_masters (id VARCHAR(100) PRIMARY KEY, amcName VARCHAR(255), schemeName VARCHAR(255), category VARCHAR(100), trailRate DECIMAL(10,4), period VARCHAR(50), data LONGTEXT, updatedAt DATETIME DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP, createdAt DATETIME DEFAULT CURRENT_TIMESTAMP, INDEX idx_amc (amcName))",
+    // ── Partner brokerage: revenue that is NOT mutual fund trail ───────────────
+    //    Motilal Oswal's Brokerage Sharing statement, and the others like it, is a
+    //    different business: equity and F&O broking. It shares nothing with the
+    //    `transactions` table — a client CODE rather than a folio, a daily trade
+    //    date rather than a settled month, no AUM at all, and a share that the file
+    //    states outright ("Flat 65 PERCNT") instead of one the hierarchy derives.
+    //    Putting it in `transactions` would corrupt every AUM and payout figure, so
+    //    it gets its own table. It is not small: July 2026 paid Rs 5.53L here
+    //    against Rs 2.60L of mutual fund brokerage in the same month.
+    "CREATE TABLE IF NOT EXISTS partner_brokerage (id VARCHAR(100) PRIMARY KEY, partner VARCHAR(40) NOT NULL, batchId VARCHAR(100), tradeDate DATE, period VARCHAR(20), clientCode VARCHAR(60), segment VARCHAR(30), tradeCategory VARCHAR(30), totalBrokerage DECIMAL(18,4), ourShare DECIMAL(18,4), partnerShare DECIMAL(18,4), mappedClientId VARCHAR(120), data LONGTEXT, updatedAt DATETIME DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP, createdAt DATETIME DEFAULT CURRENT_TIMESTAMP, INDEX idx_pb_period (partner, period), INDEX idx_pb_client (mappedClientId), INDEX idx_pb_code (partner, clientCode), INDEX idx_pb_batch (batchId))",
+    //    Client CODE -> our client record. The statement carries no RM dimension at
+    //    all (every row is branch RFINOWISEL), so without this an RM cannot be shown
+    //    "their" rows. Same shape as the folio -> client mapping on the fund side:
+    //    map once, and every later import of that code attaches itself.
+    "CREATE TABLE IF NOT EXISTS partner_client_map (partner VARCHAR(40) NOT NULL, clientCode VARCHAR(60) NOT NULL, clientId VARCHAR(120), label VARCHAR(255), updatedAt DATETIME DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP, PRIMARY KEY (partner, clientCode), INDEX idx_pcm_client (clientId))",
     // Records which schema migrations have been applied (versioning, not ad-hoc).
     "CREATE TABLE IF NOT EXISTS schema_migrations (name VARCHAR(150) PRIMARY KEY, appliedAt DATETIME DEFAULT CURRENT_TIMESTAMP)"
   ];
@@ -1235,6 +1264,94 @@ app.all('/api/data', mutationLimiter, async (req, res) => {
         }
       }
 
+      // ── Partner brokerage (non-mutual-fund revenue) ───────────────────────
+      //    Read-side for the Motilal Oswal style Brokerage Sharing statements.
+      //    Scoping mirrors the fund side: ADMIN/FINANCE see the firm, everyone
+      //    else sees only rows whose client code has been mapped to one of THEIR
+      //    clients. Unmapped rows belong to nobody yet, so they stay admin-only —
+      //    an RM must never be shown the firm's whole broking book by default.
+      if (action === 'partner_rows' || action === 'partner_summary') {
+        try {
+          if (!req.user) return res.status(401).json({ error: 'Not authenticated' });
+          let where = ' WHERE 1=1', args = [];
+          if (query.partner) { where += ' AND partner = ?'; args.push(String(query.partner)); }
+          if (query.period)  { where += ' AND period = ?';  args.push(String(query.period)); }
+          if (!isWriter(req)) {
+            const mine = await clientIdsForMember(req.user.id);
+            if (!mine.length) {
+              res.set('Cache-Control', 'no-store');
+              return res.json(action === 'partner_rows' ? [] : { periods: [], segments: [], totals: null });
+            }
+            where += ` AND mappedClientId IN (${mine.map(() => '?').join(',')})`;
+            args.push(...mine);
+          }
+
+          if (action === 'partner_rows') {
+            const [rows] = await pool.query(
+              `SELECT id, partner, tradeDate, period, clientCode, segment, tradeCategory,
+                      totalBrokerage, ourShare, partnerShare, mappedClientId, data
+               FROM partner_brokerage${where}
+               ORDER BY tradeDate DESC, id LIMIT 20000`, args);
+            res.set('Cache-Control', 'no-store');
+            return res.json(rows.map(r => {
+              const { data, ...rest } = r;
+              let extra = {}; try { extra = JSON.parse(data || '{}'); } catch {}
+              return { ...rest, ...extra };
+            }));
+          }
+
+          const [periods] = await pool.query(
+            `SELECT partner, period, COUNT(*) rows_, COUNT(DISTINCT clientCode) codes,
+                    ROUND(SUM(totalBrokerage),2) totalBrokerage,
+                    ROUND(SUM(ourShare),2) ourShare,
+                    ROUND(SUM(partnerShare),2) partnerShare,
+                    SUM(mappedClientId IS NULL OR mappedClientId = '') unmappedRows
+             FROM partner_brokerage${where}
+             GROUP BY partner, period ORDER BY period DESC, partner`, args);
+          const [segments] = await pool.query(
+            `SELECT partner, segment, COUNT(*) rows_,
+                    ROUND(SUM(totalBrokerage),2) totalBrokerage,
+                    ROUND(SUM(ourShare),2) ourShare
+             FROM partner_brokerage${where}
+             GROUP BY partner, segment ORDER BY ourShare DESC`, args);
+          const [[totals]] = await pool.query(
+            `SELECT COUNT(*) rows_, COUNT(DISTINCT clientCode) codes, COUNT(DISTINCT partner) partners,
+                    ROUND(SUM(totalBrokerage),2) totalBrokerage,
+                    ROUND(SUM(ourShare),2) ourShare,
+                    ROUND(SUM(partnerShare),2) partnerShare
+             FROM partner_brokerage${where}`, args);
+          res.set('Cache-Control', 'no-store');
+          return res.json({ periods, segments, totals });
+        } catch (e) {
+          console.error('[partner_rows]', e);
+          return res.status(500).json({ error: 'Failed to read partner brokerage' });
+        }
+      }
+
+      // Client codes seen in imports, with whatever they are mapped to. This is the
+      // worklist for the mapping screen — ADMIN/FINANCE only, since it exposes every
+      // code in the book.
+      if (action === 'partner_codes') {
+        try {
+          if (!isWriter(req)) return res.status(403).json({ error: 'Forbidden' });
+          const [rows] = await pool.query(
+            `SELECT b.partner, b.clientCode,
+                    COUNT(*) rows_, MIN(b.period) firstPeriod, MAX(b.period) lastPeriod,
+                    ROUND(SUM(b.ourShare),2) ourShare,
+                    MAX(b.mappedClientId) mappedClientId,
+                    MAX(m.label) label
+             FROM partner_brokerage b
+             LEFT JOIN partner_client_map m ON m.partner = b.partner AND m.clientCode = b.clientCode
+             GROUP BY b.partner, b.clientCode
+             ORDER BY ourShare DESC`);
+          res.set('Cache-Control', 'no-store');
+          return res.json(rows);
+        } catch (e) {
+          console.error('[partner_codes]', e);
+          return res.status(500).json({ error: 'Failed to read partner client codes' });
+        }
+      }
+
       if (action === 'summary') {
         try {
           const now = Date.now();
@@ -1683,6 +1800,124 @@ app.all('/api/data', mutationLimiter, async (req, res) => {
         } catch (e) {
           console.error('[exceptions_report]', e);
           return res.status(500).json({ error: 'Failed to build exceptions report' });
+        }
+      }
+
+      // ── Partner brokerage import ──────────────────────────────────────────
+      //    Rows arrive already parsed and column-mapped by the Partner Brokerage
+      //    page, the same division of labour the fund importer uses. The id is a
+      //    content hash, so re-importing the same statement updates rows in place
+      //    instead of doubling the month — a statement that gets re-sent with a
+      //    correction must not be able to double anyone's revenue.
+      if (action === 'partner_import') {
+        if (!isWriter(req)) return res.status(403).json({ error: 'Admin or Finance privileges required' });
+        try {
+          const partner = String(payload?.partner || '').trim().toUpperCase();
+          const fileName = String(payload?.fileName || '').trim();
+          const rows = Array.isArray(payload?.rows) ? payload.rows : [];
+          if (!partner) return res.status(400).json({ error: 'partner is required' });
+          if (!rows.length) return res.status(400).json({ error: 'No rows to import' });
+
+          const batchId = `PB_${partner}_${Date.now()}`;
+          await pool.query(
+            `INSERT INTO batches (id, fileName, data) VALUES (?, ?, ?)
+             ON DUPLICATE KEY UPDATE fileName = VALUES(fileName), data = VALUES(data)`,
+            [batchId, fileName || `${partner} import`, JSON.stringify({ partner, kind: 'partner_brokerage', rowCount: rows.length })]);
+
+          // Codes already mapped attach themselves on the way in, so a second
+          // month's file lands pre-attributed and the mapping screen only ever
+          // shows what is genuinely new.
+          const [mapRows] = await pool.query(
+            `SELECT clientCode, clientId FROM partner_client_map WHERE partner = ?`, [partner]);
+          const codeToClient = new Map(mapRows.map(r => [String(r.clientCode), r.clientId]));
+
+          // Two genuinely separate trades can be identical in every column — same
+          // client, same day, same segment, same brokerage. On a pure content hash
+          // they collapse into one row and that second trade's money disappears
+          // silently. Counting occurrences keeps them apart while a re-import of
+          // the same statement still lands on the same ids.
+          const seen = new Map();
+          let written = 0;
+          for (let i = 0; i < rows.length; i += 400) {
+            const chunk = rows.slice(i, i + 400);
+            const values = [];
+            const params = [];
+            for (const r of chunk) {
+              const clientCode = String(r.clientCode || '').trim();
+              const tradeDate = r.tradeDate || null;
+              const period = String(r.period || '').slice(0, 7);
+              const key = `${partner}|${tradeDate}|${clientCode}|${r.segment || ''}|${r.tradeCategory || ''}|` +
+                          `${r.totalBrokerage || 0}|${r.ourShare || 0}|${r.partnerShare || 0}|${r.product || ''}|${r.parentProfile || ''}`;
+              const nth = (seen.get(key) || 0) + 1;
+              seen.set(key, nth);
+              const id = `${partner}_${period}_${hash53(nth > 1 ? `${key}#${nth}` : key)}`;
+              values.push('(?,?,?,?,?,?,?,?,?,?,?,?,?)');
+              params.push(
+                id, partner, batchId, tradeDate, period, clientCode,
+                r.segment || null, r.tradeCategory || null,
+                Number(r.totalBrokerage) || 0, Number(r.ourShare) || 0, Number(r.partnerShare) || 0,
+                codeToClient.get(clientCode) || null,
+                JSON.stringify(r.extra || {}));
+            }
+            const [res2] = await pool.query(
+              `INSERT INTO partner_brokerage
+                 (id, partner, batchId, tradeDate, period, clientCode, segment, tradeCategory,
+                  totalBrokerage, ourShare, partnerShare, mappedClientId, data)
+               VALUES ${values.join(',')}
+               ON DUPLICATE KEY UPDATE
+                 batchId = VALUES(batchId), tradeDate = VALUES(tradeDate), period = VALUES(period),
+                 segment = VALUES(segment), tradeCategory = VALUES(tradeCategory),
+                 totalBrokerage = VALUES(totalBrokerage), ourShare = VALUES(ourShare),
+                 partnerShare = VALUES(partnerShare), data = VALUES(data)`, params);
+            written += chunk.length;
+          }
+          const [[after]] = await pool.query(
+            `SELECT COUNT(*) rows_, COUNT(DISTINCT clientCode) codes,
+                    ROUND(SUM(ourShare),2) ourShare,
+                    SUM(mappedClientId IS NULL) unmapped
+             FROM partner_brokerage WHERE batchId = ?`, [batchId]);
+          await pool.query('INSERT INTO activity_log (userId, userName, action, description, createdAt) VALUES (?,?,?,?,NOW())',
+            [req.user?.id || '', req.user?.name || '', 'partner_import',
+             `${partner}: ${written} row(s) from ${fileName || 'upload'} — our share Rs ${after.ourShare}`]);
+          return res.json({ success: true, batchId, written, ...after });
+        } catch (e) {
+          console.error('[partner_import]', e);
+          return res.status(500).json({ error: e.message });
+        }
+      }
+
+      // Attach a partner client code to one of our clients. Stored in the map so
+      // future imports self-attribute, and backfilled onto rows already loaded.
+      // Passing clientId as null unmaps the code again.
+      if (action === 'partner_map') {
+        if (!isWriter(req)) return res.status(403).json({ error: 'Admin or Finance privileges required' });
+        try {
+          const partner = String(payload?.partner || '').trim().toUpperCase();
+          const pairs = Array.isArray(payload?.pairs) ? payload.pairs : [];
+          if (!partner || !pairs.length) return res.status(400).json({ error: 'partner and pairs are required' });
+          let mapped = 0, rowsTouched = 0;
+          for (const p of pairs) {
+            const code = String(p.clientCode || '').trim();
+            if (!code) continue;
+            const clientId = p.clientId ? String(p.clientId) : null;
+            await pool.query(
+              `INSERT INTO partner_client_map (partner, clientCode, clientId, label)
+               VALUES (?,?,?,?)
+               ON DUPLICATE KEY UPDATE clientId = VALUES(clientId), label = VALUES(label)`,
+              [partner, code, clientId, p.label ? String(p.label).slice(0, 255) : null]);
+            const [r] = await pool.query(
+              `UPDATE partner_brokerage SET mappedClientId = ? WHERE partner = ? AND clientCode = ?`,
+              [clientId, partner, code]);
+            mapped++; rowsTouched += r.affectedRows || 0;
+          }
+          invalidateSummaryCache();
+          await pool.query('INSERT INTO activity_log (userId, userName, action, description, createdAt) VALUES (?,?,?,?,NOW())',
+            [req.user?.id || '', req.user?.name || '', 'partner_map',
+             `${partner}: ${mapped} client code(s) mapped, ${rowsTouched} row(s) re-attributed`]);
+          return res.json({ success: true, mapped, rowsTouched });
+        } catch (e) {
+          console.error('[partner_map]', e);
+          return res.status(500).json({ error: e.message });
         }
       }
 
