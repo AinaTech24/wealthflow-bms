@@ -364,12 +364,25 @@ export const DataProvider: React.FC<{ children: React.ReactNode }> = ({ children
   };
 
   const addTransactions = async (newTxs: BrokerageTransaction[]): Promise<boolean> => {
-    setTransactions(prev => [...prev, ...newTxs]);
+    // Drop any copy already held under an incoming id before appending. Transaction
+    // ids are content hashes and the server upserts on them, so re-importing a
+    // statement leaves ONE row in the database — but appending regardless showed
+    // the month twice on screen until the next refresh, which is exactly the shape
+    // of "my brokerage doubled" that nobody should have to talk themselves out of.
+    // Keyed on a Set so this stays cheap against a 200k-row array.
+    const incoming = new Set(newTxs.map(t => t.id));
+    setTransactions(prev => [...prev.filter(t => !incoming.has(t.id)), ...newTxs]);
     return saveToDb('transactions', newTxs);
   };
 
   const addBatch = async (batch: ImportBatch): Promise<boolean> => {
-    setBatches(prev => [batch, ...prev]);
+    // Replace any batch already held under this id rather than prepending blindly.
+    // The server upserts on the primary key, so recording the same batch twice —
+    // Finalize pressed again on a preview that is still open, or a retry after a
+    // partial save — leaves ONE row there. Prepending regardless put two identical
+    // lines in Batch History, which reads as duplicated data and sent an operator
+    // looking for a double import that had never happened.
+    setBatches(prev => [batch, ...prev.filter(b => b.id !== batch.id)]);
     return saveToDb('batches', batch);
   };
 
