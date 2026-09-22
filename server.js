@@ -81,7 +81,8 @@ let teamPayoutsCache = {};
 // dashboard counters use rather than paying for the scan again every half minute.
 const CLIENT_AUM_TTL_MS = 10 * 60_000;
 let clientAumCache = null;      // { at, key, body } — see action=client_aum
-const invalidateSummaryCache = () => { summaryCache = null; teamPayoutsCache = {}; memberClientCache = {}; clientAumCache = null; };
+let payoutOverviewCache = null; // { at, body } — see action=payout_overview
+const invalidateSummaryCache = () => { summaryCache = null; teamPayoutsCache = {}; memberClientCache = {}; clientAumCache = null; payoutOverviewCache = null; };
 
 // Client ids whose hierarchy names this member at any level — i.e. their own book.
 // Cached because the dashboard and the transactions fetch both ask for it on load.
@@ -257,7 +258,28 @@ const hash53 = (str, seed = 0) => {
   h2 = Math.imul(h2 ^ (h2 >>> 16), 2246822507) ^ Math.imul(h1 ^ (h1 >>> 13), 3266489909);
   return (4294967296 * (2097151 & h2) + (h1 >>> 0)).toString(36);
 };
+// Can this user see the WHOLE firm? Finance must, to cross-check payments.
+// This is a visibility test only — it says nothing about what may be changed.
 const isWriter = (req) => !!req.user && (req.user.role === 'ADMIN' || req.user.role === 'FINANCE');
+
+// ── What Finance may CHANGE ──────────────────────────────────────────────────
+// Finance used to share ADMIN's write powers wholesale, which meant an accounts
+// role could edit client hierarchies, sharing rates and transactions — the three
+// things that decide what every person earns. Their job is to record what was
+// paid, not to change what is owed.
+//
+// So: Finance may settle money and move an invoice's status, and nothing else.
+// Imports, client and hierarchy edits, rate and config changes, recalculation and
+// every delete stay with ADMIN.
+const FINANCE_ACTIONS = new Set(['settle', 'settle_delete', 'partner_pay', 'partner_pay_delete']);
+const canMutate = (req, action, collection) => {
+  if (!req.user) return false;
+  if (req.user.role === 'ADMIN') return true;
+  if (req.user.role !== 'FINANCE') return false;
+  if (action) return FINANCE_ACTIONS.has(action);
+  // A plain persist: only the invoices collection, where Finance marks a payout paid.
+  return collection === 'invoices';
+};
 
 // --- Generic mutation rate limiter (per-IP) ---
 const mutationLimiter = rateLimit({
@@ -498,12 +520,14 @@ async function initDB() {
     //    "their" rows. Same shape as the folio -> client mapping on the fund side:
     //    map once, and every later import of that code attaches itself.
     "CREATE TABLE IF NOT EXISTS partner_client_map (partner VARCHAR(40) NOT NULL, clientCode VARCHAR(60) NOT NULL, clientId VARCHAR(120), label VARCHAR(255), updatedAt DATETIME DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP, PRIMARY KEY (partner, clientCode), INDEX idx_pcm_client (clientId))",
-    //    What has actually been PAID OUT to a person against a partner month. The
-    //    brokerage table says what was earned; this says what left the bank. The gap
-    //    between them is what the finance team chases, and it carries forward: an
-    //    unpaid balance from July is still owed in August rather than forgotten.
-    //    One row per payment, never overwritten, so a month can be settled in parts.
-    "CREATE TABLE IF NOT EXISTS partner_payouts (id VARCHAR(100) PRIMARY KEY, partner VARCHAR(40) NOT NULL, period VARCHAR(20) NOT NULL, userId VARCHAR(120) NOT NULL, amount DECIMAL(18,4) NOT NULL, paidOn DATE, method VARCHAR(40), reference VARCHAR(120), note VARCHAR(500), createdBy VARCHAR(120), createdAt DATETIME DEFAULT CURRENT_TIMESTAMP, INDEX idx_pp_user (userId), INDEX idx_pp_period (partner, period))",
+    // ── What has actually been PAID to a person, for any revenue source ───────
+    //    `payout_ledger` says what each person EARNED; nothing said what left the
+    //    bank. Finance tracked that outside the system, so "how much is still
+    //    owed" could not be answered here at all. One row per payment, never
+    //    overwritten, so a month settled in instalments is several rows that add
+    //    up — and an unpaid balance carries into the next month rather than being
+    //    forgotten. `source` is 'MF' for mutual fund trail or a partner code.
+    "CREATE TABLE IF NOT EXISTS payout_settlements (id VARCHAR(100) PRIMARY KEY, source VARCHAR(40) NOT NULL, period VARCHAR(20) NOT NULL, userId VARCHAR(120) NOT NULL, amount DECIMAL(18,4) NOT NULL, paidOn DATE, method VARCHAR(40), reference VARCHAR(120), note VARCHAR(500), createdBy VARCHAR(120), createdAt DATETIME DEFAULT CURRENT_TIMESTAMP, INDEX idx_ps_user (userId), INDEX idx_ps_period (period), INDEX idx_ps_src (source, period))",
     // Records which schema migrations have been applied (versioning, not ad-hoc).
     "CREATE TABLE IF NOT EXISTS schema_migrations (name VARCHAR(150) PRIMARY KEY, appliedAt DATETIME DEFAULT CURRENT_TIMESTAMP)"
   ];
@@ -1444,8 +1468,8 @@ app.all('/api/data', mutationLimiter, async (req, res) => {
           }
 
           const [payRows] = await pool.query(
-            `SELECT userId, period, ROUND(SUM(amount),4) paid FROM partner_payouts
-             WHERE partner = ? GROUP BY userId, period`, [partner]);
+            `SELECT userId, period, ROUND(SUM(amount),4) paid FROM payout_settlements
+             WHERE source = ? GROUP BY userId, period`, [partner]);
           const paid = new Map();
           for (const p of payRows) {
             if (!paid.has(p.userId)) paid.set(p.userId, new Map());
@@ -1505,6 +1529,131 @@ app.all('/api/data', mutationLimiter, async (req, res) => {
         } catch (e) {
           console.error('[partner_ledger]', e);
           return res.status(500).json({ error: 'Failed to build partner payout ledger' });
+        }
+      }
+
+      // ── The accounts desk: everyone, one month, what is owed ──────────────
+      //    `payout_ledger` already knows what each person EARNED per month; this
+      //    joins it to what has actually been PAID and carries the difference
+      //    forward. An unpaid balance from July is still owed in August — which is
+      //    the whole point, and the one thing the system could not answer before.
+      //
+      //    Partner brokerage is folded in through the same flat per-level
+      //    percentages the Partner Brokerage page sets, so a person's row is what
+      //    they are owed in total, not per revenue stream.
+      if (action === 'payout_overview') {
+        try {
+          if (!isWriter(req)) return res.status(403).json({ error: 'Forbidden' });
+          const now = Date.now();
+          if (payoutOverviewCache && now - payoutOverviewCache.at < SUMMARY_TTL_MS) {
+            res.set('X-Cache', 'HIT');
+            return res.json(payoutOverviewCache.body);
+          }
+
+          // 1. Mutual fund earnings, per person per month.
+          const [mfRows] = await pool.query(`
+            SELECT t.brokeragePeriod period, l.userId, ROUND(SUM(l.amount),2) earned
+            FROM payout_ledger l JOIN transactions t ON t.id = l.transactionId
+            WHERE t.brokeragePeriod IS NOT NULL AND t.brokeragePeriod <> ''
+            GROUP BY t.brokeragePeriod, l.userId`);
+
+          // 2. Partner earnings, split by the configured per-level percentages.
+          const [[cfgRow]] = await pool.query(`SELECT data FROM config WHERE id = 'global' LIMIT 1`);
+          let cfg = {}; try { cfg = JSON.parse(cfgRow?.data || '{}'); } catch {}
+          const [pbRows] = await pool.query(
+            `SELECT partner, period, mappedClientId cid, ROUND(SUM(ourShare),4) ours
+             FROM partner_brokerage WHERE mappedClientId IS NOT NULL AND mappedClientId <> ''
+             GROUP BY partner, period, mappedClientId`);
+          let hier = new Map();
+          if (pbRows.length) {
+            const [clientRows] = await pool.query(`SELECT id, data FROM clients`);
+            for (const c of clientRows) {
+              let d = {}; try { d = JSON.parse(c.data || '{}'); } catch {}
+              hier.set(c.id, d.hierarchy || {});
+            }
+          }
+
+          // earned[userId][period] = { mf, partner }
+          const earned = new Map();
+          const bump = (uid, period, key, amt) => {
+            if (!earned.has(uid)) earned.set(uid, new Map());
+            const byP = earned.get(uid);
+            const e = byP.get(period) || { mf: 0, partner: 0 };
+            e[key] += amt;
+            byP.set(period, e);
+          };
+          for (const r of mfRows) bump(r.userId, r.period, 'mf', Number(r.earned) || 0);
+          for (const r of pbRows) {
+            const raw = cfg?.partnerSharing?.[r.partner];
+            const pct = (typeof raw === 'number') ? { 3: raw } : (raw || {});
+            const h = hier.get(r.cid); if (!h) continue;
+            for (let lvl = 1; lvl <= 7; lvl++) {
+              const p = Number(pct[lvl]) || 0; if (!p) continue;
+              const uid = h[`level${lvl}Id`]; if (!uid) continue;
+              bump(uid, r.period, 'partner', Number(r.ours) * p / 100);
+            }
+          }
+
+          // 3. What has actually been paid.
+          const [paidRows] = await pool.query(
+            `SELECT userId, period, ROUND(SUM(amount),2) paid FROM payout_settlements GROUP BY userId, period`);
+          const paid = new Map();
+          for (const r of paidRows) {
+            if (!paid.has(r.userId)) paid.set(r.userId, new Map());
+            paid.get(r.userId).set(r.period, Number(r.paid) || 0);
+          }
+
+          const [teamRows] = await pool.query(`SELECT id, name, code, role, level FROM team`);
+          const team = new Map(teamRows.map(t => [t.id, t]));
+
+          const allPeriods = new Set();
+          for (const m of earned.values()) for (const p of m.keys()) allPeriods.add(p);
+          for (const m of paid.values()) for (const p of m.keys()) allPeriods.add(p);
+          const periods = [...allPeriods].sort();
+
+          // 4. Per person, walk the months in order so the balance carries.
+          const people = [];
+          for (const uid of new Set([...earned.keys(), ...paid.keys()])) {
+            const t = team.get(uid);
+            let running = 0;
+            const months = periods.map(p => {
+              const e = earned.get(uid)?.get(p) || { mf: 0, partner: 0 };
+              const tot = e.mf + e.partner;
+              const pd = paid.get(uid)?.get(p) || 0;
+              const carriedIn = running;
+              running += tot - pd;
+              return {
+                period: p,
+                mf: Math.round(e.mf * 100) / 100,
+                partner: Math.round(e.partner * 100) / 100,
+                earned: Math.round(tot * 100) / 100,
+                paid: Math.round(pd * 100) / 100,
+                carriedIn: Math.round(carriedIn * 100) / 100,
+                outstanding: Math.round(running * 100) / 100,
+              };
+            }).filter(m => m.earned !== 0 || m.paid !== 0 || m.carriedIn !== 0);
+            if (!months.length) continue;
+            people.push({
+              userId: uid,
+              name: t?.name || uid,
+              code: t?.code || '',
+              role: t?.role || '',
+              level: t?.level ?? null,
+              months,
+              totalEarned: Math.round(months.reduce((a, m) => a + m.earned, 0) * 100) / 100,
+              totalPaid: Math.round(months.reduce((a, m) => a + m.paid, 0) * 100) / 100,
+              outstanding: months[months.length - 1].outstanding,
+            });
+          }
+          people.sort((a, b) => b.outstanding - a.outstanding || b.totalEarned - a.totalEarned);
+
+          const body = { generatedAt: new Date().toISOString(), periods, people };
+          payoutOverviewCache = { at: now, body };
+          res.set('X-Cache', 'MISS');
+          return res.json(body);
+        } catch (e) {
+          console.error('[payout_overview]', e);
+          return res.status(500).json({ error: 'Failed to build the payout overview' });
         }
       }
 
@@ -1966,7 +2115,7 @@ app.all('/api/data', mutationLimiter, async (req, res) => {
       //    instead of doubling the month — a statement that gets re-sent with a
       //    correction must not be able to double anyone's revenue.
       if (action === 'partner_import') {
-        if (!isWriter(req)) return res.status(403).json({ error: 'Admin or Finance privileges required' });
+        if (!canMutate(req, action)) return res.status(403).json({ error: 'Admin privileges required' });
         try {
           const partner = String(payload?.partner || '').trim().toUpperCase();
           const fileName = String(payload?.fileName || '').trim();
@@ -2046,7 +2195,7 @@ app.all('/api/data', mutationLimiter, async (req, res) => {
       // future imports self-attribute, and backfilled onto rows already loaded.
       // Passing clientId as null unmaps the code again.
       if (action === 'partner_map') {
-        if (!isWriter(req)) return res.status(403).json({ error: 'Admin or Finance privileges required' });
+        if (!canMutate(req, action)) return res.status(403).json({ error: 'Admin privileges required' });
         try {
           const partner = String(payload?.partner || '').trim().toUpperCase();
           const pairs = Array.isArray(payload?.pairs) ? payload.pairs : [];
@@ -2067,6 +2216,7 @@ app.all('/api/data', mutationLimiter, async (req, res) => {
             mapped++; rowsTouched += r.affectedRows || 0;
           }
           invalidateSummaryCache();
+          payoutOverviewCache = null;
           await pool.query('INSERT INTO activity_log (userId, userName, action, description, createdAt) VALUES (?,?,?,?,NOW())',
             [req.user?.id || '', req.user?.name || '', 'partner_map',
              `${partner}: ${mapped} client code(s) mapped, ${rowsTouched} row(s) re-attributed`]);
@@ -2082,7 +2232,7 @@ app.all('/api/data', mutationLimiter, async (req, res) => {
       // ledger adds them up. Deleting one is a deliberate act with its own action,
       // so a payment can never quietly change after it has been reported.
       if (action === 'partner_pay') {
-        if (!isWriter(req)) return res.status(403).json({ error: 'Admin or Finance privileges required' });
+        if (!canMutate(req, action)) return res.status(403).json({ error: 'Admin or Finance privileges required' });
         try {
           const partner = String(payload?.partner || '').trim().toUpperCase();
           const period = String(payload?.period || '').slice(0, 7);
@@ -2092,9 +2242,11 @@ app.all('/api/data', mutationLimiter, async (req, res) => {
           if (!Number.isFinite(amount) || amount === 0) return res.status(400).json({ error: 'amount must be a non-zero number' });
           const [[who]] = await pool.query(`SELECT name FROM team WHERE id = ?`, [userId]);
           if (!who) return res.status(400).json({ error: 'No such team member' });
-          const id = `PP_${partner}_${period}_${userId}_${Date.now()}`;
+          const id = `PS_${partner}_${period}_${userId}_${Date.now()}`;
           await pool.query(
-            `INSERT INTO partner_payouts (id, partner, period, userId, amount, paidOn, method, reference, note, createdBy)
+            // One settlements table for every revenue source, so the Payouts page
+            // and this one can never disagree about what has been paid.
+            `INSERT INTO payout_settlements (id, source, period, userId, amount, paidOn, method, reference, note, createdBy)
              VALUES (?,?,?,?,?,?,?,?,?,?)`,
             [id, partner, period, userId, amount,
              payload?.paidOn || new Date().toISOString().slice(0, 10),
@@ -2113,19 +2265,74 @@ app.all('/api/data', mutationLimiter, async (req, res) => {
       }
 
       if (action === 'partner_pay_delete') {
-        if (!isWriter(req)) return res.status(403).json({ error: 'Admin or Finance privileges required' });
+        if (!canMutate(req, action)) return res.status(403).json({ error: 'Admin or Finance privileges required' });
         try {
           const id = String(payload?.id || '').trim();
           if (!id) return res.status(400).json({ error: 'id is required' });
-          const [[row]] = await pool.query(`SELECT partner, period, userId, amount FROM partner_payouts WHERE id = ?`, [id]);
+          const [[row]] = await pool.query(`SELECT source AS partner, period, userId, amount FROM payout_settlements WHERE id = ?`, [id]);
           if (!row) return res.status(404).json({ error: 'No such payment' });
-          await pool.query(`DELETE FROM partner_payouts WHERE id = ?`, [id]);
+          await pool.query(`DELETE FROM payout_settlements WHERE id = ?`, [id]);
           await pool.query('INSERT INTO activity_log (userId, userName, action, description, createdAt) VALUES (?,?,?,?,NOW())',
             [req.user?.id || '', req.user?.name || '', 'partner_pay_delete',
              `${row.partner} ${row.period}: removed Rs ${row.amount} payment to ${row.userId}`]);
           return res.json({ success: true });
         } catch (e) {
           console.error('[partner_pay_delete]', e);
+          return res.status(500).json({ error: e.message });
+        }
+      }
+
+      // Record money actually paid to a person for a month. Append-only: a month
+      // settled in instalments is several rows that the ledger adds up, so a
+      // figure already reported to someone can never quietly change underneath
+      // them. Removing one is its own action, and both are logged.
+      if (action === 'settle') {
+        if (!canMutate(req, action)) return res.status(403).json({ error: 'Admin or Finance privileges required' });
+        try {
+          const period = String(payload?.period || '').slice(0, 7);
+          const userId = String(payload?.userId || '').trim();
+          const amount = Number(payload?.amount);
+          const source = String(payload?.source || 'MF').trim().toUpperCase();
+          if (!period || !userId) return res.status(400).json({ error: 'period and userId are required' });
+          if (!Number.isFinite(amount) || amount === 0) return res.status(400).json({ error: 'amount must be a non-zero number' });
+          const [[who]] = await pool.query(`SELECT name FROM team WHERE id = ?`, [userId]);
+          if (!who) return res.status(400).json({ error: 'No such team member' });
+          const id = `PS_${source}_${period}_${userId}_${Date.now()}`;
+          await pool.query(
+            `INSERT INTO payout_settlements (id, source, period, userId, amount, paidOn, method, reference, note, createdBy)
+             VALUES (?,?,?,?,?,?,?,?,?,?)`,
+            [id, source, period, userId, amount,
+             payload?.paidOn || new Date().toISOString().slice(0, 10),
+             payload?.method ? String(payload.method).slice(0, 40) : null,
+             payload?.reference ? String(payload.reference).slice(0, 120) : null,
+             payload?.note ? String(payload.note).slice(0, 500) : null,
+             req.user?.id || '']);
+          payoutOverviewCache = null;
+          await pool.query('INSERT INTO activity_log (userId, userName, action, description, createdAt) VALUES (?,?,?,?,NOW())',
+            [req.user?.id || '', req.user?.name || '', 'settle',
+             `${source} ${period}: Rs ${amount} paid to ${who.name}`]);
+          return res.json({ success: true, id });
+        } catch (e) {
+          console.error('[settle]', e);
+          return res.status(500).json({ error: e.message });
+        }
+      }
+
+      if (action === 'settle_delete') {
+        if (!canMutate(req, action)) return res.status(403).json({ error: 'Admin or Finance privileges required' });
+        try {
+          const id = String(payload?.id || '').trim();
+          if (!id) return res.status(400).json({ error: 'id is required' });
+          const [[row]] = await pool.query(`SELECT source, period, userId, amount FROM payout_settlements WHERE id = ?`, [id]);
+          if (!row) return res.status(404).json({ error: 'No such payment' });
+          await pool.query(`DELETE FROM payout_settlements WHERE id = ?`, [id]);
+          payoutOverviewCache = null;
+          await pool.query('INSERT INTO activity_log (userId, userName, action, description, createdAt) VALUES (?,?,?,?,NOW())',
+            [req.user?.id || '', req.user?.name || '', 'settle_delete',
+             `${row.source} ${row.period}: removed Rs ${row.amount} payment to ${row.userId}`]);
+          return res.json({ success: true });
+        } catch (e) {
+          console.error('[settle_delete]', e);
           return res.status(500).json({ error: e.message });
         }
       }
@@ -2317,7 +2524,7 @@ app.all('/api/data', mutationLimiter, async (req, res) => {
       const ownProfile = !writeExempt && !action && !isWriter(req)
         && collection === 'team'
         && await isOwnProfileUpdate(req, payload);
-      if (!writeExempt && !ownInvoice && !ownProfile && !isWriter(req)) {
+      if (!writeExempt && !ownInvoice && !ownProfile && !canMutate(req, action, collection)) {
         console.warn(`🛑 [WRITE] 403 POST action=${action || '(persist)'} coll=${collection || '-'} blocked user=${req.user?.id || 'none'} role=${req.user?.role || 'none'}`);
         return res.status(403).json({ error: 'Admin or Finance privileges required to modify data' });
       }
@@ -3374,9 +3581,11 @@ app.all('/api/data', mutationLimiter, async (req, res) => {
 
       // All deletes (batches, clients, team, transactions, …) are ADMIN/FINANCE
       // operations. purge_batch enforces the stricter ADMIN-only check below.
-      if (!isWriter(req)) {
+      // Deletes remove data that everyone's earnings are computed from, so they
+      // stay with ADMIN even though Finance can see all of it.
+      if (!canMutate(req, action)) {
         console.warn(`🛑 [DELETE] 403 action=${action || type || '?'} blocked user=${req.user?.id || 'none'} role=${req.user?.role || 'none'}`);
-        return res.status(403).json({ error: 'Admin or Finance privileges required' });
+        return res.status(403).json({ error: 'Admin privileges required' });
       }
 
       // Soft-delete a batch — mark deletedAt in JSON, keep all data for 30-day undo window.

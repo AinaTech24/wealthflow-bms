@@ -1,6 +1,6 @@
 
 import React, { useState, useEffect, useRef } from 'react';
-import { LayoutDashboard, Upload, Users, Settings, FileText, Menu, X, Bell, LogOut, Cloud, CloudOff, RefreshCw, Landmark, User, Clock, CheckCheck, Sun, Moon, Search, ShieldCheck, Briefcase } from 'lucide-react';
+import { LayoutDashboard, Upload, Users, Settings, FileText, Menu, X, Bell, LogOut, Cloud, CloudOff, RefreshCw, Landmark, User, Clock, CheckCheck, Sun, Moon, Search, ShieldCheck, Briefcase, Wallet } from 'lucide-react';
 import { Logo } from './Logo';
 import { TeamMember, Role } from '../types';
 import { useData } from '../contexts/DataContext';
@@ -219,6 +219,7 @@ export const Layout: React.FC<LayoutProps> = ({ children, activePage, onNavigate
           <SidebarItem icon={FileText} label="Reports & Payouts" active={activePage === 'reports'} onClick={() => handleNavigate('reports')} />
           <SidebarItem icon={Landmark} label="Brokerage Rates" active={activePage === 'brokerage'} onClick={() => handleNavigate('brokerage')} />
           <SidebarItem icon={Briefcase} label="Partner Brokerage" active={activePage === 'partner'} onClick={() => handleNavigate('partner')} />
+          {(isAdmin || isFinance) && <SidebarItem icon={Wallet} label="Payouts" active={activePage === 'payouts'} onClick={() => handleNavigate('payouts')} />}
           {(isAdmin || isFinance) && <SidebarItem icon={ShieldCheck} label="Audit Log" active={activePage === 'audit'} onClick={() => handleNavigate('audit')} />}
           <SidebarItem icon={isAdmin ? Settings : User} label={isAdmin ? 'Admin Console' : 'My Profile'} active={activePage === 'settings'} onClick={() => handleNavigate('settings')} />
         </nav>
