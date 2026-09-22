@@ -2318,6 +2318,73 @@ app.all('/api/data', mutationLimiter, async (req, res) => {
         }
       }
 
+      // Record many payments at once from a filled-in sheet. Finance settles ~121
+      // people a month; doing that one dialog at a time is not a workflow.
+      // People are matched on employee code first and name only as a fallback —
+      // names repeat, codes do not — and anything unmatched is reported back
+      // rather than quietly skipped, because a payment that silently lands
+      // nowhere is worse than one that fails loudly.
+      if (action === 'settle_bulk') {
+        if (!canMutate(req, 'settle')) return res.status(403).json({ error: 'Admin or Finance privileges required' });
+        try {
+          const period = String(payload?.period || '').slice(0, 7);
+          const source = String(payload?.source || 'MF').trim().toUpperCase();
+          const rows = Array.isArray(payload?.rows) ? payload.rows : [];
+          if (!period) return res.status(400).json({ error: 'period is required' });
+          if (!rows.length) return res.status(400).json({ error: 'No rows to record' });
+
+          const [teamRows] = await pool.query(`SELECT id, name, code FROM team`);
+          const byId = new Map(teamRows.map(t => [t.id, t]));
+          const byCode = new Map();
+          const byName = new Map();
+          for (const t of teamRows) {
+            const c = String(t.code || '').trim().toUpperCase();
+            if (c && !byCode.has(c)) byCode.set(c, t);
+            const n = String(t.name || '').trim().toUpperCase();
+            // Only index a name when it is unambiguous; duplicates stay unmatched.
+            if (n) byName.set(n, byName.has(n) ? null : t);
+          }
+
+          const stamp = Date.now();
+          const accepted = [], skipped = [];
+          const values = [], params = [];
+          let i = 0;
+          for (const r of rows) {
+            const amount = Number(r.amount);
+            const label = String(r.code || r.name || r.userId || '').trim();
+            if (!Number.isFinite(amount) || amount === 0) { skipped.push({ label, why: 'no amount' }); continue; }
+            const who = (r.userId && byId.get(String(r.userId)))
+              || (r.code && byCode.get(String(r.code).trim().toUpperCase()))
+              || (r.name && byName.get(String(r.name).trim().toUpperCase()))
+              || null;
+            if (!who) { skipped.push({ label, why: 'no matching team member' }); continue; }
+            values.push('(?,?,?,?,?,?,?,?,?,?)');
+            params.push(`PS_${source}_${period}_${who.id}_${stamp}_${i++}`, source, period, who.id, amount,
+              payload?.paidOn || new Date().toISOString().slice(0, 10),
+              'bulk-import',
+              r.reference ? String(r.reference).slice(0, 120) : null,
+              payload?.note ? String(payload.note).slice(0, 500) : null,
+              req.user?.id || '');
+            accepted.push({ name: who.name, amount });
+          }
+          if (values.length) {
+            await pool.query(
+              `INSERT INTO payout_settlements (id, source, period, userId, amount, paidOn, method, reference, note, createdBy)
+               VALUES ${values.join(',')}`, params);
+          }
+          payoutOverviewCache = null;
+          const total = accepted.reduce((a, x) => a + x.amount, 0);
+          await pool.query('INSERT INTO activity_log (userId, userName, action, description, createdAt) VALUES (?,?,?,?,NOW())',
+            [req.user?.id || '', req.user?.name || '', 'settle_bulk',
+             `${source} ${period}: ${accepted.length} payment(s) totalling Rs ${total.toFixed(2)} recorded from a sheet` +
+             (skipped.length ? `, ${skipped.length} row(s) skipped` : '')]);
+          return res.json({ success: true, recorded: accepted.length, total: Math.round(total * 100) / 100, skipped });
+        } catch (e) {
+          console.error('[settle_bulk]', e);
+          return res.status(500).json({ error: e.message });
+        }
+      }
+
       if (action === 'settle_delete') {
         if (!canMutate(req, action)) return res.status(403).json({ error: 'Admin or Finance privileges required' });
         try {
