@@ -101,6 +101,13 @@ const AppContent: React.FC = () => {
     if (!isAdmin && !isFinance && activePage === 'audit') {
       return <Dashboard currentUser={currentUser} />;
     }
+    // Finance is an accounts desk. Hiding the sidebar links is not a control on
+    // its own — anything still reachable by typing or a stale tab would show the
+    // screens that shape what people earn, which the server already refuses to
+    // let Finance change. Keep the two in step.
+    if (isFinance && ['clients', 'reports', 'brokerage', 'partner'].includes(activePage)) {
+      return <Dashboard currentUser={currentUser} />;
+    }
 
     switch (activePage) {
       case 'dashboard':

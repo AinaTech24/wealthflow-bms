@@ -215,10 +215,14 @@ export const Layout: React.FC<LayoutProps> = ({ children, activePage, onNavigate
         <nav className="mt-4 space-y-0.5 flex-1 overflow-y-auto">
           <SidebarItem icon={LayoutDashboard} label="Dashboard" active={activePage === 'dashboard'} onClick={() => handleNavigate('dashboard')} />
           {isAdmin && <SidebarItem icon={Upload} label="Imports & Data" active={activePage === 'imports'} onClick={() => handleNavigate('imports')} />}
-          <SidebarItem icon={Users} label={(isAdmin || isFinance) ? 'Clients & Map' : 'My Clients'} active={activePage === 'clients'} onClick={() => handleNavigate('clients')} />
-          <SidebarItem icon={FileText} label="Reports & Payouts" active={activePage === 'reports'} onClick={() => handleNavigate('reports')} />
-          <SidebarItem icon={Landmark} label="Brokerage Rates" active={activePage === 'brokerage'} onClick={() => handleNavigate('brokerage')} />
-          <SidebarItem icon={Briefcase} label="Partner Brokerage" active={activePage === 'partner'} onClick={() => handleNavigate('partner')} />
+          {/* Finance is an accounts desk, not a second admin: Dashboard, Payouts,
+              Audit Log and their own Profile. The screens that shape what people
+              EARN — clients and hierarchies, rate cards, partner statements — are
+              deliberately out of reach, matching the write rules on the server. */}
+          {!isFinance && <SidebarItem icon={Users} label={isAdmin ? 'Clients & Map' : 'My Clients'} active={activePage === 'clients'} onClick={() => handleNavigate('clients')} />}
+          {!isFinance && <SidebarItem icon={FileText} label="Reports & Payouts" active={activePage === 'reports'} onClick={() => handleNavigate('reports')} />}
+          {!isFinance && <SidebarItem icon={Landmark} label="Brokerage Rates" active={activePage === 'brokerage'} onClick={() => handleNavigate('brokerage')} />}
+          {!isFinance && <SidebarItem icon={Briefcase} label="Partner Brokerage" active={activePage === 'partner'} onClick={() => handleNavigate('partner')} />}
           {(isAdmin || isFinance) && <SidebarItem icon={Wallet} label="Payouts" active={activePage === 'payouts'} onClick={() => handleNavigate('payouts')} />}
           {(isAdmin || isFinance) && <SidebarItem icon={ShieldCheck} label="Audit Log" active={activePage === 'audit'} onClick={() => handleNavigate('audit')} />}
           <SidebarItem icon={isAdmin ? Settings : User} label={isAdmin ? 'Admin Console' : 'My Profile'} active={activePage === 'settings'} onClick={() => handleNavigate('settings')} />
