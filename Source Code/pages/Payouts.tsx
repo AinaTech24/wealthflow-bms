@@ -11,6 +11,9 @@ interface Props { currentUser: TeamMember }
 interface MonthRow {
   period: string; mf: number; partner: number;
   earned: number; paid: number; carriedIn: number; outstanding: number;
+  /** GST the RM bills on top, TDS deducted, and the resulting cheque. Taken
+   *  from their raised invoice where one exists, estimated otherwise. */
+  gst: number; tds: number; payable: number; invoiced: boolean; invoiceStatus?: string;
 }
 interface Person {
   userId: string; name: string; code: string; role: string; level: number | null;
@@ -80,7 +83,9 @@ export const Payouts: React.FC<Props> = ({ currentUser }) => {
     paid: a.paid + x.m.paid,
     carriedIn: a.carriedIn + x.m.carriedIn,
     outstanding: a.outstanding + x.m.outstanding,
-  }), { earned: 0, paid: 0, carriedIn: 0, outstanding: 0 }), [rows]);
+    gst: a.gst + x.m.gst,
+    payable: a.payable + x.m.payable,
+  }), { earned: 0, paid: 0, carriedIn: 0, outstanding: 0, gst: 0, payable: 0 }), [rows]);
 
   const anyPartner = rows.some(x => x.m.partner !== 0);
 
@@ -207,6 +212,8 @@ export const Payouts: React.FC<Props> = ({ currentUser }) => {
                 'Brought forward': m.carriedIn,
                 'Mutual fund': m.mf, 'Partner': m.partner,
                 'Earned this month': m.earned,
+                GST: m.gst, TDS: m.tds, 'Payable': m.payable,
+                'Invoice raised': m.invoiced ? (m.invoiceStatus || 'YES') : 'no',
                 'Already paid': m.paid,
                 'Still owed': m.outstanding,
                 'Pay now': '',
@@ -238,7 +245,8 @@ export const Payouts: React.FC<Props> = ({ currentUser }) => {
       <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-4">
         <Tile label="Brought forward" value={totals.carriedIn} hint="unpaid from earlier months" />
         <Tile label="Earned this month" value={totals.earned} hint={`${rows.length} people`} />
-        <Tile label="Paid" value={totals.paid} accent="emerald" />
+        <Tile label="GST on top" value={totals.gst} hint="only RMs with a GSTIN bill it" />
+        <Tile label="Payable (after GST &amp; TDS)" value={totals.payable} accent="emerald" hint="what the cheques come to" />
         <Tile label="Still owed" value={totals.outstanding} accent={totals.outstanding > 0 ? 'red' : 'emerald'} hint="carries into next month" />
       </div>
 
@@ -278,6 +286,9 @@ export const Payouts: React.FC<Props> = ({ currentUser }) => {
                     {anyPartner && <th className="pb-2 pr-4 text-right">Mutual fund</th>}
                     {anyPartner && <th className="pb-2 pr-4 text-right">Partner</th>}
                     <th className="pb-2 pr-4 text-right">Earned</th>
+                    <th className="pb-2 pr-4 text-right">GST</th>
+                    <th className="pb-2 pr-4 text-right">TDS</th>
+                    <th className="pb-2 pr-4 text-right">Payable</th>
                     <th className="pb-2 pr-4 text-right">Paid</th>
                     <th className="pb-2 pr-4 text-right">Still owed</th>
                     <th className="pb-2 pr-4 text-right"></th>
@@ -296,6 +307,12 @@ export const Payouts: React.FC<Props> = ({ currentUser }) => {
                       {anyPartner && <Num v={m.mf} muted />}
                       {anyPartner && <Num v={m.partner} muted />}
                       <Num v={m.earned} bold />
+                      <Num v={m.gst} muted />
+                      <Num v={m.tds} muted />
+                      <td className="py-2 pr-4 text-right font-mono text-xs tabular-nums font-bold text-slate-900 dark:text-slate-100 whitespace-nowrap">
+                        {inr(m.payable)}
+                        {!m.invoiced && <span className="ml-1 text-[9px] font-black uppercase tracking-widest text-amber-600" title="No invoice raised for this month — estimated from the configured GST and TDS rates">est</span>}
+                      </td>
                       <Num v={m.paid} tone="emerald" />
                       <Num v={m.outstanding} bold tone={m.outstanding > 0.005 ? 'red' : 'emerald'} />
                       <td className="py-2 pr-4 text-right">
@@ -313,6 +330,10 @@ export const Payouts: React.FC<Props> = ({ currentUser }) => {
               <p className="text-[11px] text-slate-500 dark:text-slate-400 mt-3 max-w-3xl">
                 <b>Brought forward</b> is what was still owed when this month opened, and <b>Still owed</b> is what
                 carries into the next one. A month can be paid in parts — each payment is its own record and they add up.
+                <br />
+                <b>Payable</b> is the cheque: earned + GST &minus; TDS, rounded. Where the RM has raised an invoice those are
+                its own figures; <span className="text-amber-600 font-black">est</span> marks a month with no invoice yet, priced at the configured rates.
+                Only RMs with a GSTIN bill GST, and an intra-state bill splits it as CGST + SGST.
               </p>
             </div>
           )}
@@ -340,15 +361,31 @@ export const Payouts: React.FC<Props> = ({ currentUser }) => {
             <dl className="mt-3 text-xs space-y-1">
               <Line k="Brought forward" v={payFor.m.carriedIn} />
               <Line k="Earned this month" v={payFor.m.earned} />
+              {payFor.m.gst > 0 && <Line k="GST" v={payFor.m.gst} />}
+              {payFor.m.tds > 0 && <Line k="Less TDS" v={-payFor.m.tds} />}
+              <Line k={payFor.m.invoiced ? "Payable (invoice)" : "Payable (estimated)"} v={payFor.m.payable} />
               <Line k="Already paid" v={payFor.m.paid} />
               <Line k="Still owed" v={payFor.m.outstanding} strong />
             </dl>
-            <label htmlFor="pay-amt" className="block text-[10px] font-black uppercase tracking-widest text-slate-400 mt-4 mb-1">Amount paid</label>
+            {/* The ledger runs on earnings, not on the cheque. GST is collected on
+                the RM's behalf and TDS is withheld, so entering the payable here
+                would over-credit the balance and push it negative. Say so, and
+                warn the moment the typed figure looks like the cheque. */}
+            <label htmlFor="pay-amt" className="block text-[10px] font-black uppercase tracking-widest text-slate-400 mt-4 mb-1">
+              Amount paid <span className="font-normal normal-case tracking-normal text-slate-400">— against earnings, before GST and TDS</span>
+            </label>
             <input
               id="pay-amt" type="number" step="0.01" value={amount} onChange={e => setAmount(e.target.value)}
               className="w-full px-3 py-2 rounded-lg border border-slate-200 dark:border-slate-600 dark:bg-slate-900 dark:text-slate-100 tabular-nums"
               placeholder="0.00"
             />
+            {Number(amount) > payFor.m.outstanding + 0.5 && (
+              <p className="text-[11px] text-amber-700 dark:text-amber-400 mt-1.5 leading-relaxed">
+                That is more than the {inr(payFor.m.outstanding)} outstanding
+                {Math.abs(Number(amount) - payFor.m.payable) < 1 && <> — it looks like the payable {inr(payFor.m.payable)}, which includes GST</>}.
+                Recording it leaves a credit that carries into next month.
+              </p>
+            )}
             <label htmlFor="pay-ref" className="block text-[10px] font-black uppercase tracking-widest text-slate-400 mt-3 mb-1">
               Reference <span className="font-normal normal-case tracking-normal">(optional)</span>
             </label>

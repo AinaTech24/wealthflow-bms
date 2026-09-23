@@ -1603,8 +1603,60 @@ app.all('/api/data', mutationLimiter, async (req, res) => {
             paid.get(r.userId).set(r.period, Number(r.paid) || 0);
           }
 
-          const [teamRows] = await pool.query(`SELECT id, name, code, role, level FROM team`);
+          const [teamRows] = await pool.query(`SELECT id, name, code, role, level, data FROM team`);
           const team = new Map(teamRows.map(t => [t.id, t]));
+
+          // ── GST and TDS ──────────────────────────────────────────────────
+          //    What a person EARNS is not what is written on the cheque. An RM
+          //    with a GSTIN bills GST on top and TDS comes off, so the payable can
+          //    sit a thousand rupees away from the earned figure — and finance
+          //    pays the cheque, not the earning.
+          //
+          //    Where the RM has actually raised an invoice, ITS numbers are the
+          //    truth: that is the document that was agreed, and a figure computed
+          //    here that disagreed with it by a paisa would be worse than useless.
+          //    Only months with no invoice get an estimate, flagged as one.
+          const [invRows] = await pool.query(`SELECT userId, month, data FROM invoices`);
+          const invoiceOf = new Map();
+          for (const r of invRows) {
+            let d = {}; try { d = JSON.parse(r.data || '{}'); } catch {}
+            invoiceOf.set(`${r.userId}|${r.month}`, d);
+          }
+          const gstRate = Number(cfg.defaultGstRate) || 18;
+          const tdsRate = Number(cfg.defaultTdsRate) || 2;
+          const firmState = String(cfg.firmState || '').trim().toLowerCase();
+          const taxOf = new Map();
+          for (const t of teamRows) {
+            let d = {}; try { d = JSON.parse(t.data || '{}'); } catch {}
+            taxOf.set(t.id, {
+              hasGst: !!String(d.gstNumber || '').trim(),
+              state: String(d.address?.state || '').trim().toLowerCase(),
+            });
+          }
+          const taxFor = (uid, period, base) => {
+            const inv = invoiceOf.get(`${uid}|${period}`);
+            if (inv && inv.netPayable != null) {
+              return {
+                gst: Number(inv.gstAmount) || 0,
+                tds: Number(inv.tdsAmount) || 0,
+                payable: Number(inv.netPayable) || 0,
+                invoiced: true,
+                invoiceStatus: inv.status || '',
+              };
+            }
+            const t = taxOf.get(uid) || { hasGst: false, state: '' };
+            const gst = t.hasGst ? Math.round(base * gstRate) / 100 : 0;
+            const tds = Math.round(base * tdsRate) / 100;
+            return {
+              gst: Math.round(gst * 100) / 100,
+              tds: Math.round(tds * 100) / 100,
+              payable: Math.round(base + gst - tds),
+              invoiced: false,
+              invoiceStatus: '',
+              // Intra-state bills split as CGST+SGST; this is the combined figure.
+              intraState: !!firmState && !!t.state && firmState === t.state,
+            };
+          };
 
           const allPeriods = new Set();
           for (const m of earned.values()) for (const p of m.keys()) allPeriods.add(p);
@@ -1622,6 +1674,7 @@ app.all('/api/data', mutationLimiter, async (req, res) => {
               const pd = paid.get(uid)?.get(p) || 0;
               const carriedIn = running;
               running += tot - pd;
+              const tax = taxFor(uid, p, Math.round(tot * 100) / 100);
               return {
                 period: p,
                 mf: Math.round(e.mf * 100) / 100,
@@ -1630,6 +1683,7 @@ app.all('/api/data', mutationLimiter, async (req, res) => {
                 paid: Math.round(pd * 100) / 100,
                 carriedIn: Math.round(carriedIn * 100) / 100,
                 outstanding: Math.round(running * 100) / 100,
+                ...tax,
               };
             }).filter(m => m.earned !== 0 || m.paid !== 0 || m.carriedIn !== 0);
             if (!months.length) continue;
