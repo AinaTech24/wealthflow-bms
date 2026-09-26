@@ -1711,6 +1711,143 @@ app.all('/api/data', mutationLimiter, async (req, res) => {
         }
       }
 
+      // ── Attribution health ────────────────────────────────────────────────
+      //    Three data faults decide whether a month's brokerage reaches the right
+      //    person, and all three RE-APPEAR with every import — they are not
+      //    one-time repairs. Reconciling against AdvisorKhoj found them by hand
+      //    each month; this finds them without it, which matters because the firm
+      //    is moving off AdvisorKhoj entirely.
+      //
+      //      1. A client with no RM. Its brokerage reaches nobody.
+      //      2. One folio listed on two client records. The importer attaches it
+      //         to whichever it matches first, and that is not stable month to
+      //         month — it silently swaps two people's pay.
+      //      3. One client record holding several investors ("catch-all"). It pays
+      //         its own RM for everyone inside it. Splitting the transactions is
+      //         not enough: unless the borrowed FOLIOS come off the record, the
+      //         next import re-attaches them and the whole problem returns.
+      if (action === 'attribution_health') {
+        try {
+          if (!isWriter(req)) return res.status(403).json({ error: 'Forbidden' });
+          const period = String(query.period || '').slice(0, 7);
+          if (!/^\d{4}-\d{2}$/.test(period)) return res.status(400).json({ error: 'period (YYYY-MM) is required' });
+
+          const [teamRows] = await pool.query(`SELECT id, name FROM team`);
+          const T = new Map(teamRows.map(t => [t.id, t.name]));
+          const [clientRows] = await pool.query(`SELECT id, name, data FROM clients`);
+          const info = new Map();
+          for (const c of clientRows) {
+            let d = {}; try { d = JSON.parse(c.data || '{}'); } catch {}
+            const h = d.hierarchy || {};
+            info.set(c.id, {
+              name: c.name,
+              rm: h.level3Id || h.level2Id || h.level1Id || '',
+              folios: (Array.isArray(d.folios) ? d.folios : []).map(f => String(f).trim()).filter(Boolean),
+            });
+          }
+          const [agg] = await pool.query(
+            `SELECT mappedClientId cid, ROUND(SUM(grossAmount),2) gross, COUNT(*) rows_,
+                    COUNT(DISTINCT investorName) investors, MAX(investorName) inv
+             FROM transactions WHERE brokeragePeriod = ? AND mappedClientId IS NOT NULL
+             GROUP BY mappedClientId`, [period]);
+
+          // 1 — no RM
+          const noRm = [];
+          for (const r of agg) {
+            const e = info.get(r.cid); if (!e || e.rm) continue;
+            noRm.push({ clientId: r.cid, name: e.name, investor: r.inv, gross: Number(r.gross) || 0 });
+          }
+          noRm.sort((a, b) => b.gross - a.gross);
+
+          // 2 — a folio on more than one client, where the claimants sit under
+          //     DIFFERENT RMs. Same-RM duplicates are untidy but move no money.
+          const claim = new Map();
+          for (const [cid, e] of info) for (const f of e.folios) {
+            if (!claim.has(f)) claim.set(f, []); claim.get(f).push(cid);
+          }
+          const contested = [...claim.entries()]
+            .filter(([, v]) => v.length > 1 && new Set(v.map(c => info.get(c).rm)).size > 1);
+          const contestedFolios = contested.map(([f]) => f);
+          const shared = [];
+          for (let i = 0; i < contestedFolios.length; i += 300) {
+            const ch = contestedFolios.slice(i, i + 300);
+            const [r] = await pool.query(
+              `SELECT JSON_UNQUOTE(JSON_EXTRACT(data,'$.folio')) folio, mappedClientId cid,
+                      ROUND(SUM(grossAmount),2) gross
+               FROM transactions WHERE brokeragePeriod = ?
+                 AND JSON_UNQUOTE(JSON_EXTRACT(data,'$.folio')) IN (${ch.map(() => '?').join(',')})
+               GROUP BY folio, cid`, [period, ...ch]);
+            for (const x of r) {
+              const holder = info.get(x.cid);
+              shared.push({
+                folio: x.folio,
+                gross: Number(x.gross) || 0,
+                holder: holder?.name || x.cid,
+                holderRm: T.get(holder?.rm) || '—',
+                others: (claim.get(x.folio) || []).filter(c => c !== x.cid && info.get(c)?.rm !== holder?.rm)
+                  .slice(0, 4).map(c => `${info.get(c).name} · ${T.get(info.get(c).rm) || '—'}`),
+              });
+            }
+          }
+          shared.sort((a, b) => b.gross - a.gross);
+
+          // 3 — one record holding people who are not the same family.
+          //
+          //     Counting distinct investor NAMES is far too loud: it flags "J
+          //     THILAK (HUF)" against "J THILAK HUF", and every record where a
+          //     parent and child invest together — 28 rows and Rs 5,393 of pure
+          //     noise for August, which is the kind of check people learn to
+          //     ignore. What actually marks a catch-all is investors with no name
+          //     in common at all (the Amit Menghani record held Thilak, Poosari,
+          //     Desai, Singh and Keswani). That rule takes August from 28 to 1.
+          const STOP = new Set(['KUMAR', 'HUF', 'REP', 'BY', 'MR', 'MRS', 'SHRI', 'SMT', 'DEVI', 'LATE']);
+          const nameTokens = s => new Set(String(s || '').toUpperCase()
+            .replace(/\bREP(RESENTED)?\s+BY\b.*$/, '')
+            .replace(/[^A-Z\s]/g, ' ')
+            .split(/\s+/).filter(t => t.length > 2 && !STOP.has(t)));
+          const [investorRows] = await pool.query(
+            `SELECT mappedClientId cid, investorName, ROUND(SUM(grossAmount),2) gross
+             FROM transactions WHERE brokeragePeriod = ? AND mappedClientId IS NOT NULL
+             GROUP BY mappedClientId, investorName`, [period]);
+          const perClient = new Map();
+          for (const x of investorRows) {
+            const o = perClient.get(x.cid) || { people: [], gross: 0 };
+            o.people.push(String(x.investorName || '').trim());
+            o.gross += Number(x.gross) || 0;
+            perClient.set(x.cid, o);
+          }
+          const multi = [];
+          for (const [cid, o] of perClient) {
+            if (o.people.length < 2) continue;
+            const sets = o.people.map(nameTokens);
+            let unrelated = false;
+            for (let i = 0; i < sets.length && !unrelated; i++)
+              for (let j = i + 1; j < sets.length; j++)
+                if (![...sets[i]].some(t => sets[j].has(t))) { unrelated = true; break; }
+            if (!unrelated) continue;
+            const e = info.get(cid);
+            multi.push({
+              clientId: cid, name: e?.name || cid, rm: T.get(e?.rm) || '—',
+              investors: o.people.length, people: o.people.slice(0, 6),
+              gross: Math.round(o.gross * 100) / 100, folios: e?.folios.length || 0,
+            });
+          }
+          multi.sort((a, b) => b.gross - a.gross);
+
+          const sum = a => Math.round(a.reduce((s, x) => s + x.gross, 0) * 100) / 100;
+          res.set('Cache-Control', 'no-store');
+          return res.json({
+            period,
+            noRm:         { count: noRm.length,  gross: sum(noRm),  rows: noRm.slice(0, 50) },
+            sharedFolios: { count: shared.length, gross: sum(shared), rows: shared.slice(0, 50) },
+            multiInvestor:{ count: multi.length,  gross: sum(multi),  rows: multi.slice(0, 50) },
+          });
+        } catch (e) {
+          console.error('[attribution_health]', e);
+          return res.status(500).json({ error: 'Failed to build the attribution health check' });
+        }
+      }
+
       if (action === 'summary') {
         try {
           const now = Date.now();

@@ -1,5 +1,5 @@
 import React, { useState, useEffect, useMemo, useRef } from 'react';
-import { Wallet, Search, RefreshCw, AlertTriangle, Download, Upload } from 'lucide-react';
+import { Wallet, Search, RefreshCw, AlertTriangle, Download, Upload, ShieldAlert, ChevronDown } from 'lucide-react';
 import { TeamMember, Role } from '../types';
 import { authFetch } from '../contexts/DataContext';
 import { useToast } from '../components/Toast';
@@ -50,6 +50,8 @@ export const Payouts: React.FC<Props> = ({ currentUser }) => {
   const [amount, setAmount] = useState('');
   const [reference, setReference] = useState('');
   const importRef = useRef<HTMLInputElement>(null);
+  const [health, setHealth] = useState<any>(null);
+  const [openCheck, setOpenCheck] = useState<string | null>(null);
 
   const load = async () => {
     setBusy(true);
@@ -65,6 +67,20 @@ export const Payouts: React.FC<Props> = ({ currentUser }) => {
   };
 
   useEffect(() => { load(); /* eslint-disable-next-line */ }, []);
+
+  // Attribution health is per MONTH, so it reloads when the month changes.
+  useEffect(() => {
+    if (!period) return;
+    let cancelled = false;
+    (async () => {
+      try {
+        const r = await authFetch(`/api/data?action=attribution_health&period=${period}&_=${Date.now()}`, { cache: 'no-store' });
+        if (!r.ok || cancelled) return;
+        setHealth(await r.json());
+      } catch { /* the page is still useful without it */ }
+    })();
+    return () => { cancelled = true; };
+  }, [period]);
 
   // One row per person FOR THE CHOSEN MONTH, carrying their prior balance in.
   const rows = useMemo(() => {
@@ -249,6 +265,8 @@ export const Payouts: React.FC<Props> = ({ currentUser }) => {
         <Tile label="Payable (after GST &amp; TDS)" value={totals.payable} accent="emerald" hint="what the cheques come to" />
         <Tile label="Still owed" value={totals.outstanding} accent={totals.outstanding > 0 ? 'red' : 'emerald'} hint="carries into next month" />
       </div>
+
+      {health && <AttributionHealth h={health} open={openCheck} setOpen={setOpenCheck} />}
 
       <div className="bg-white dark:bg-slate-800 rounded-xl border border-slate-200 dark:border-slate-700 overflow-hidden">
         <div className="px-4 py-3 border-b border-slate-200 dark:border-slate-700 flex items-center justify-between gap-3 flex-wrap">
@@ -435,3 +453,105 @@ const Line: React.FC<{ k: string; v: number; strong?: boolean }> = ({ k, v, stro
     <dd className={`font-mono tabular-nums ${strong ? 'font-bold text-slate-900 dark:text-slate-100' : 'text-slate-600 dark:text-slate-300'}`}>{inr(v)}</dd>
   </div>
 );
+
+/**
+ * Three data faults decide whether a month's brokerage reaches the right person,
+ * and each one comes BACK with every import — they are not one-time repairs.
+ * Reconciling against AdvisorKhoj used to find them by hand; this finds them
+ * without it, which is the point now that the firm is leaving AdvisorKhoj.
+ */
+const AttributionHealth: React.FC<{ h: any; open: string | null; setOpen: (k: string | null) => void }> =
+({ h, open, setOpen }) => {
+  const checks = [
+    {
+      key: 'noRm',
+      title: 'Clients with no RM',
+      why: 'Their brokerage reaches nobody. Assign each one on Clients & Map.',
+      data: h.noRm,
+      render: (r: any) => <><b>{r.name}</b>{r.investor && r.investor !== r.name && <span className="text-slate-400"> · {r.investor}</span>}</>,
+    },
+    {
+      key: 'shared',
+      title: 'Folios on two clients',
+      why: 'The import attaches each to whichever it matches first, and that can change month to month — it silently swaps two people’s pay. Remove the folio from whichever record should not hold it.',
+      data: h.sharedFolios,
+      render: (r: any) => (
+        <>
+          <span className="font-mono">{r.folio}</span> → <b>{r.holder}</b> <span className="text-slate-400">· {r.holderRm}</span>
+          {r.others?.length > 0 && <div className="text-slate-400 text-[11px] pl-2">also claimed by {r.others.join(' · ')}</div>}
+        </>
+      ),
+    },
+    {
+      key: 'multi',
+      title: 'One record, unrelated investors',
+      why: 'A catch-all record pays its own RM for everyone inside it. Moving the transactions is not enough — take the borrowed FOLIOS off the record too, or the next import puts them straight back.',
+      data: h.multiInvestor,
+      render: (r: any) => (
+        <>
+          <b>{r.name}</b> <span className="text-slate-400">· {r.rm} · {r.investors} investors</span>
+          {r.people && <div className="text-slate-400 text-[11px] pl-2">{r.people.join(' | ')}</div>}
+        </>
+      ),
+    },
+  ];
+  const clean = checks.every(c => (c.data?.count || 0) === 0);
+
+  return (
+    <div className={`rounded-xl border-2 overflow-hidden ${clean
+      ? 'border-emerald-200 dark:border-emerald-800 bg-emerald-50 dark:bg-emerald-900/10'
+      : 'border-amber-300 dark:border-amber-700 bg-amber-50 dark:bg-amber-900/10'}`}>
+      <div className="px-4 py-3 flex items-center gap-2">
+        <ShieldAlert className={`w-4 h-4 ${clean ? 'text-emerald-600' : 'text-amber-600'}`} />
+        <h3 className="font-bold text-sm text-slate-900 dark:text-slate-100">Attribution health</h3>
+        <span className="text-[11px] text-slate-500 dark:text-slate-400">
+          {clean ? 'nothing is misattributed this month' : 'money that may be reaching the wrong person'}
+        </span>
+      </div>
+      <div className="grid grid-cols-1 sm:grid-cols-3 gap-px bg-amber-200/50 dark:bg-amber-800/40">
+        {checks.map(c => {
+          const count = c.data?.count || 0;
+          const isOpen = open === c.key;
+          return (
+            <div key={c.key} className="bg-white dark:bg-slate-800">
+              <button
+                onClick={() => setOpen(isOpen ? null : c.key)}
+                disabled={!count}
+                className="w-full text-left px-4 py-3 disabled:cursor-default hover:bg-slate-50 dark:hover:bg-slate-700/40 transition"
+              >
+                <div className="flex items-baseline justify-between gap-2">
+                  <span className={`text-2xl font-black tabular-nums ${count ? 'text-amber-700 dark:text-amber-400' : 'text-emerald-600 dark:text-emerald-400'}`}>
+                    {count}
+                  </span>
+                  {!!count && <ChevronDown className={`w-3.5 h-3.5 text-slate-400 transition ${isOpen ? 'rotate-180' : ''}`} />}
+                </div>
+                <div className="text-[11px] font-bold text-slate-700 dark:text-slate-200 mt-0.5">{c.title}</div>
+                <div className="text-[10px] text-slate-400 tabular-nums">
+                  {count ? `${inr(c.data.gross)} this month` : 'clear'}
+                </div>
+              </button>
+              {isOpen && (
+                <div className="px-4 pb-3 border-t border-slate-100 dark:border-slate-700 pt-2">
+                  <p className="text-[11px] text-slate-500 dark:text-slate-400 mb-2 leading-relaxed">{c.why}</p>
+                  <ul className="space-y-1.5 max-h-72 overflow-y-auto">
+                    {c.data.rows.map((r: any, i: number) => (
+                      <li key={i} className="text-xs text-slate-700 dark:text-slate-200 border-b border-slate-50 dark:border-slate-700/40 pb-1.5">
+                        <span className="font-mono tabular-nums text-slate-500 mr-2">{inr(r.gross)}</span>
+                        {c.render(r)}
+                      </li>
+                    ))}
+                  </ul>
+                  {c.data.count > c.data.rows.length && (
+                    <p className="text-[10px] text-slate-400 mt-2">
+                      Showing the largest {c.data.rows.length} of {c.data.count}.
+                    </p>
+                  )}
+                </div>
+              )}
+            </div>
+          );
+        })}
+      </div>
+    </div>
+  );
+};
