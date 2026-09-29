@@ -912,7 +912,7 @@ export const ClientsAndHierarchy: React.FC<ClientsAndHierarchyProps> = ({ curren
                           <td className="px-3 py-2 font-mono text-slate-500">{r.pan || '—'}</td>
                           <td className="px-3 py-2 text-slate-500">{r.amcName}</td>
                           <td className="px-3 py-2 text-right font-bold">{r.rows}</td>
-                          <td className="px-3 py-2 text-right font-bold">₹{Number(r.gross || 0).toLocaleString('en-IN', { minimumFractionDigits: 2 })}</td>
+                          <td className="px-3 py-2 text-right font-bold">₹{Number(r.gross || 0).toLocaleString('en-IN', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}</td>
                           <td className="px-3 py-2">
                             {!r.folio ? (
                               <span className="text-[10px] text-slate-500">No folio on this row — fix it on the transaction.</span>

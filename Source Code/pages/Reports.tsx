@@ -818,6 +818,16 @@ export const Reports: React.FC<ReportsProps> = ({ currentUser }) => {
 
     return team
       .filter(m => {
+        // ── System logins are NOT payout recipients ────────────────────────
+        // The ADMIN account sits in `level6Id` of 1,293 clients as a structural
+        // placeholder, so it accumulated ₹2,65,733.29 of gross for August while
+        // earning ₹0. That produced a row in this table — and in its Excel
+        // export — that looks like a branch manager holding 94% of the month.
+        // Sorted by name it lands between "Sunita Satapathy" and "VARALAXMI",
+        // so anyone pasting the export beside an AdvisorKhoj list had every row
+        // from V onwards shifted down by one and chased phantom differences.
+        // Gross for a login that cannot earn is meaningless; leave it out.
+        if (m.role === Role.ADMIN || m.role === Role.FINANCE) return false;
         if (!isAdmin && m.parentId !== currentUser.id) return false;
         const totals = memberTotals[m.id];
         // Include member if EITHER client side detected activity OR the server
@@ -1531,7 +1541,7 @@ export const Reports: React.FC<ReportsProps> = ({ currentUser }) => {
             )}
             <div className="bg-white dark:bg-slate-800 p-6 rounded-xl border border-slate-200 dark:border-slate-700 shadow-sm">
               <h3 className="text-slate-500 dark:text-slate-400 font-bold uppercase text-[10px] tracking-widest">My Net Payout</h3>
-              <p className="text-3xl font-black text-emerald-600 mt-2">₹{(myServerPeriodStats ? myServerPeriodStats.net : totalMyNetAllTime).toLocaleString(undefined, { minimumFractionDigits: 2 })}</p>
+              <p className="text-3xl font-black text-emerald-600 mt-2">₹{(myServerPeriodStats ? myServerPeriodStats.net : totalMyNetAllTime).toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}</p>
             </div>
             <div className="bg-white dark:bg-slate-800 p-6 rounded-xl border border-slate-200 dark:border-slate-700 shadow-sm">
               <h3 className="text-slate-500 dark:text-slate-400 font-bold uppercase text-[10px] tracking-widest">Transactions</h3>
@@ -1672,10 +1682,10 @@ export const Reports: React.FC<ReportsProps> = ({ currentUser }) => {
                     <tr key={m.month} className="hover:bg-slate-50 dark:hover:bg-slate-700/30 transition">
                       <td className="px-6 py-4 font-bold text-slate-700 dark:text-slate-300">{m.month}</td>
                       <td className="px-6 py-4 text-center text-slate-500 dark:text-slate-400 font-bold">{m.count}</td>
-                      <td className="px-6 py-4 text-right font-black text-emerald-600 dark:text-emerald-400 text-base">₹{m.myShare.toLocaleString(undefined, { minimumFractionDigits: 2 })}</td>
+                      <td className="px-6 py-4 text-right font-black text-emerald-600 dark:text-emerald-400 text-base">₹{m.myShare.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}</td>
                       {(taxConfig.gstEnabled || taxConfig.tdsEnabled) && (
                         <td className="px-6 py-4 text-right font-black text-blue-600 dark:text-blue-400">
-                          ₹{netPayable.toLocaleString(undefined, { minimumFractionDigits: 2 })}
+                          ₹{netPayable.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}
                           <div className="text-[9px] text-slate-400 font-normal">
                             {taxConfig.gstEnabled && `+GST ₹${gstAmt.toFixed(0)}`}
                             {taxConfig.gstEnabled && taxConfig.tdsEnabled && ' · '}
@@ -1774,7 +1784,7 @@ export const Reports: React.FC<ReportsProps> = ({ currentUser }) => {
                       </>
                     ) : <span className="text-slate-300 text-xs">—</span>}
                   </td>
-                  <td className="px-6 py-4 text-right font-black text-emerald-600 text-base">₹{c.myShare.toLocaleString(undefined, { minimumFractionDigits: 2 })}</td>
+                  <td className="px-6 py-4 text-right font-black text-emerald-600 text-base">₹{c.myShare.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}</td>
                 </tr>
               ))}
             </tbody>
@@ -1840,7 +1850,7 @@ export const Reports: React.FC<ReportsProps> = ({ currentUser }) => {
                       {myRate > 0 ? `${parseFloat(myRate.toFixed(4))}%` : '-'}
                     </td>
                     <td className="px-6 py-4 text-right font-black text-emerald-600">
-                      ₹{myShare.toLocaleString(undefined, { minimumFractionDigits: 2 })}
+                      ₹{myShare.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}
                     </td>
                   </tr>
                 );
@@ -2087,7 +2097,7 @@ export const Reports: React.FC<ReportsProps> = ({ currentUser }) => {
                     </td>
                   )}
                   <td className="px-6 py-4 text-right font-black text-slate-600">
-                    ₹{userOwnTotal.toLocaleString(undefined, { minimumFractionDigits: 2 })}
+                    ₹{userOwnTotal.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}
                   </td>
                   {isAdmin && (
                     <td className="px-6 py-4 text-right font-black text-indigo-600">
@@ -2100,7 +2110,7 @@ export const Reports: React.FC<ReportsProps> = ({ currentUser }) => {
                   )}
                   {!isAdmin && (
                     <td className="px-6 py-4 text-right font-black text-blue-600 bg-blue-50/20">
-                      ₹{myOverrideTotal.toLocaleString(undefined, { minimumFractionDigits: 2 })}
+                      ₹{myOverrideTotal.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}
                     </td>
                   )}
                   <td className="px-6 py-4 text-center">
@@ -2130,7 +2140,7 @@ export const Reports: React.FC<ReportsProps> = ({ currentUser }) => {
               <span className="text-xl font-black">
                 ₹{filteredTeamWithPayouts
                   .reduce((sum, item) => sum + item.myOverrideTotal, 0)
-                  .toLocaleString(undefined, { minimumFractionDigits: 2 })}
+                  .toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}
               </span>
             </div>
           )}
@@ -2138,7 +2148,7 @@ export const Reports: React.FC<ReportsProps> = ({ currentUser }) => {
             <div className="p-6 bg-slate-50 border-t border-slate-100 flex justify-end">
               <div className="text-right">
                 <p className="text-[10px] font-black uppercase tracking-widest text-slate-400 mb-1">Total Team Payout Pool</p>
-                <p className="text-2xl font-black text-slate-900">₹{visibleTransactions.reduce((acc, tx) => acc + (tx.grossAmount * (1 - (globalConfig.companyExpensePct / 100))), 0).toLocaleString(undefined, { minimumFractionDigits: 2 })}</p>
+                <p className="text-2xl font-black text-slate-900">₹{visibleTransactions.reduce((acc, tx) => acc + (tx.grossAmount * (1 - (globalConfig.companyExpensePct / 100))), 0).toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}</p>
               </div>
             </div>
           )}
@@ -2437,7 +2447,7 @@ export const Reports: React.FC<ReportsProps> = ({ currentUser }) => {
                       <div className="text-[9px] font-black uppercase tracking-widest text-slate-400">{t.label}</div>
                       <div className={`text-lg font-black tracking-tighter ${n > 0 ? 'text-amber-700 dark:text-amber-300' : 'text-emerald-700 dark:text-emerald-300'}`}>{n}</div>
                       {t.money && (v?.gross || 0) !== 0 && (
-                        <div className="text-[10px] font-bold text-slate-500">₹{Number(v.gross).toLocaleString('en-IN', { minimumFractionDigits: 2 })}</div>
+                        <div className="text-[10px] font-bold text-slate-500">₹{Number(v.gross).toLocaleString('en-IN', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}</div>
                       )}
                       {n > 0 && <div className="text-[9px] font-black uppercase tracking-widest text-amber-600 mt-0.5">{active ? 'Hide' : 'Open & fix'}</div>}
                     </button>
@@ -2529,7 +2539,7 @@ export const Reports: React.FC<ReportsProps> = ({ currentUser }) => {
                                 <td className="p-2">{r.investorName}</td>
                                 <td className="p-2 text-slate-500">{r.mappedTo || r.client || r.missingClientId || '—'}</td>
                                 <td className="p-2 text-right font-bold">{r.rows}</td>
-                                <td className="p-2 text-right font-bold">₹{Number(r.gross || 0).toLocaleString('en-IN', { minimumFractionDigits: 2 })}</td>
+                                <td className="p-2 text-right font-bold">₹{Number(r.gross || 0).toLocaleString('en-IN', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}</td>
                                 <td className="p-2">
                                   {excOpen === 'truncatedFolios' ? (
                                     <span className="text-[10px] text-slate-500">Re-download that source file as .xlsx — the digits are gone from the file itself.</span>
