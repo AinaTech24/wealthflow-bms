@@ -498,6 +498,15 @@ async function initDB() {
     "CREATE TABLE IF NOT EXISTS clients (id VARCHAR(100) PRIMARY KEY, primaryOwnerId VARCHAR(100), pan VARCHAR(50), name VARCHAR(255), data LONGTEXT, updatedAt DATETIME DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP, createdAt DATETIME DEFAULT CURRENT_TIMESTAMP)",
     "CREATE TABLE IF NOT EXISTS transactions (id VARCHAR(100) PRIMARY KEY, batchId VARCHAR(100), pan VARCHAR(50), investorName VARCHAR(255), transactionDate DATE, amcName VARCHAR(255), schemeName VARCHAR(255), grossAmount DECIMAL(15,2), brokeragePeriod VARCHAR(20), mappedClientId VARCHAR(120), data LONGTEXT, updatedAt DATETIME DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP, createdAt DATETIME DEFAULT CURRENT_TIMESTAMP, INDEX idx_batch (batchId), INDEX idx_pan (pan), INDEX idx_brokerage_period (brokeragePeriod), INDEX idx_mapped_client (mappedClientId), INDEX idx_period_client (brokeragePeriod, mappedClientId))",
     "CREATE TABLE IF NOT EXISTS batches (id VARCHAR(100) PRIMARY KEY, fileName VARCHAR(255), data LONGTEXT, updatedAt DATETIME DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP, createdAt DATETIME DEFAULT CURRENT_TIMESTAMP)",
+    // Holding area for the rows of a batch that is in Trash.
+    //
+    // Sending a batch to Trash used to stamp `deletedAt` on the batch row and
+    // leave every transaction in place, so a "deleted" month kept being counted
+    // in every report, dashboard and payout. Deleting August and re-uploading it
+    // therefore ADDED a second copy instead of replacing the first. Rows now MOVE
+    // here on delete and move back on restore, so "deleted" means deleted
+    // everywhere without giving up the 30-day recovery window.
+    "CREATE TABLE IF NOT EXISTS transactions_trash (id VARCHAR(100) PRIMARY KEY, batchId VARCHAR(100), pan VARCHAR(50), investorName VARCHAR(255), transactionDate DATE, amcName VARCHAR(255), schemeName VARCHAR(255), grossAmount DECIMAL(15,2), brokeragePeriod VARCHAR(20), mappedClientId VARCHAR(120), data LONGTEXT, updatedAt DATETIME NULL, createdAt DATETIME NULL, trashedAt DATETIME DEFAULT CURRENT_TIMESTAMP, INDEX idx_tt_batch (batchId))",
     "CREATE TABLE IF NOT EXISTS amc_mappings (original VARCHAR(255) PRIMARY KEY, standard VARCHAR(255))",
     "CREATE TABLE IF NOT EXISTS scheme_mappings (original VARCHAR(255) PRIMARY KEY, standard VARCHAR(255))",
     "CREATE TABLE IF NOT EXISTS config (id VARCHAR(100) PRIMARY KEY, data LONGTEXT)",
@@ -636,6 +645,7 @@ async function initDB() {
     for (const b of oldBatches) {
       await pool.query('DELETE FROM payout_ledger WHERE transactionId IN (SELECT id FROM transactions WHERE batchId = ?)', [b.id]);
       await pool.query('DELETE FROM transactions WHERE batchId = ?', [b.id]);
+      await pool.query('DELETE FROM transactions_trash WHERE batchId = ?', [b.id]);
       await pool.query('DELETE FROM batches WHERE id = ?', [b.id]);
     }
     if (oldBatches.length > 0) console.log(`🧹 [Retention] Auto-purged ${oldBatches.length} soft-deleted batches >30 days old`);
@@ -670,6 +680,94 @@ async function initDB() {
   } catch (e) {
     console.error('⚠️ [Migration] Password hashing failed:', e.message);
   }
+}
+
+// ── Batch rows in and out of Trash ─────────────────────────────────────────
+// A batch in Trash must contribute NOTHING: not gross, not AUM, not a payout
+// share. The only way to guarantee that across the ~30 aggregate queries in this
+// file is to take the rows out of `transactions` altogether, so no query has to
+// remember to filter them. They wait in `transactions_trash` for the 30-day
+// window and come back on restore.
+
+/** Move a batch's rows out of `transactions`. Returns how many moved. */
+async function trashBatchRows(batchId) {
+  await pool.query(
+    `INSERT INTO transactions_trash
+       (id, batchId, pan, investorName, transactionDate, amcName, schemeName,
+        grossAmount, brokeragePeriod, mappedClientId, data, updatedAt, createdAt)
+     SELECT id, batchId, pan, investorName, transactionDate, amcName, schemeName,
+            grossAmount, brokeragePeriod, mappedClientId, data, updatedAt, createdAt
+       FROM transactions WHERE batchId = ?
+     ON DUPLICATE KEY UPDATE batchId = VALUES(batchId), grossAmount = VALUES(grossAmount),
+            brokeragePeriod = VALUES(brokeragePeriod), mappedClientId = VALUES(mappedClientId),
+            data = VALUES(data), trashedAt = CURRENT_TIMESTAMP`, [batchId]);
+  await pool.query(
+    'DELETE FROM payout_ledger WHERE transactionId IN (SELECT id FROM transactions WHERE batchId = ?)',
+    [batchId]);
+  const [r] = await pool.query('DELETE FROM transactions WHERE batchId = ?', [batchId]);
+  return r.affectedRows || 0;
+}
+
+/** Move a trashed batch's rows back into `transactions`. Returns how many. */
+async function untrashBatchRows(batchId) {
+  const [r] = await pool.query(
+    `INSERT INTO transactions
+       (id, batchId, pan, investorName, transactionDate, amcName, schemeName,
+        grossAmount, brokeragePeriod, mappedClientId, data)
+     SELECT id, batchId, pan, investorName, transactionDate, amcName, schemeName,
+            grossAmount, brokeragePeriod, mappedClientId, data
+       FROM transactions_trash WHERE batchId = ?
+     ON DUPLICATE KEY UPDATE batchId = VALUES(batchId), grossAmount = VALUES(grossAmount),
+            brokeragePeriod = VALUES(brokeragePeriod), mappedClientId = VALUES(mappedClientId),
+            data = VALUES(data)`, [batchId]);
+  await pool.query('DELETE FROM transactions_trash WHERE batchId = ?', [batchId]);
+  return r.affectedRows || 0;
+}
+
+/**
+ * The "slot" an import occupies: the source feed plus the file it came from.
+ *
+ * Batch ids are `<SOURCE>_<timestamp>` (CAMS_1790592655171, KARVY_MFSD201_…), so
+ * every upload mints a brand-new id and nothing ever collided. Re-uploading a
+ * month therefore stored a SECOND batch beside the first. Identical rows merged
+ * (a transaction id is a hash of its contents) but any row that differed at all
+ * got a new id and was kept alongside the old one — which is exactly what doubled
+ * August 2026: the same file was uploaded twice, twelve minutes apart, and the
+ * second export carried 33,239 rows where the first had 33,168.
+ *
+ * Two uploads share a slot when they are the same feed and the same file name, so
+ * re-importing a month REPLACES it. A genuinely different file (a second AMC, a
+ * correction saved under a new name) keeps its own slot and is left alone.
+ */
+function importSlotOf(batchId = '', fileName = '') {
+  const source = String(batchId).replace(/_\d{6,}$/, '') || 'BATCH';
+  const file = String(fileName).trim().toLowerCase().replace(/\s+/g, ' ');
+  return `${source}|${file}`;
+}
+
+/**
+ * Send any earlier live batch in the same slot to Trash before the new one lands.
+ * Returns the ids superseded, for the import result.
+ */
+async function supersedeSameSlot(newId, fileName) {
+  const slot = importSlotOf(newId, fileName);
+  if (!slot.split('|')[1]) return [];          // no file name — cannot match safely
+  const [rows] = await pool.query('SELECT id, fileName, data FROM batches WHERE id <> ?', [newId]);
+  const hit = [];
+  for (const b of rows) {
+    let d = {}; try { d = b.data ? JSON.parse(b.data) : {}; } catch { continue; }
+    if (d.deletedAt) continue;                 // already in Trash
+    if (d.kind === 'partner_brokerage') continue; // partner imports upsert by row id already
+    if (importSlotOf(b.id, b.fileName) !== slot) continue;
+    d.deletedAt = new Date().toISOString();
+    d.deletedBy = 'system:superseded';
+    d.supersededBy = newId;
+    d.trashedRows = await trashBatchRows(b.id);
+    await pool.query('UPDATE batches SET data = ? WHERE id = ?', [JSON.stringify(d), b.id]);
+    hit.push({ id: b.id, rows: d.trashedRows });
+    console.log(`♻️  [Supersede] ${b.id} ("${b.fileName}") -> Trash, ${d.trashedRows} rows removed; replaced by ${newId}`);
+  }
+  return hit;
 }
 
 // ── Server-side recompute of ALL stored breakdowns + payout_ledger ──────────
@@ -3467,6 +3565,9 @@ app.all('/api/data', mutationLimiter, async (req, res) => {
       // record it changes) and brand-new records always pass. This is the durable
       // fix for the repeated "we corrected it yesterday, it reverted" problem.
       let staleConflicts = [];
+      // Earlier imports of the same file that this write replaced (see
+      // supersedeSameSlot). Reported back so the Imports screen can say so.
+      const supersededBatches = [];
       const nowISO = new Date().toISOString();
       if ((collection === 'clients' || collection === 'team') && items.length) {
         const ids = items.map(it => it && it.id).filter(Boolean);
@@ -3681,6 +3782,17 @@ app.all('/api/data', mutationLimiter, async (req, res) => {
               const { id, filename, fileName = filename || '', ...rest } = item;
               delete rest.filename;
               delete rest.fileName;
+              // Re-importing a file REPLACES the earlier import of that file rather
+              // than stacking a second copy beside it. Done before the new rows are
+              // written, so the month is never briefly counted twice.
+              if (!rest.deletedAt && !rest.supersededBy) {
+                try {
+                  const gone = await supersedeSameSlot(id, fileName);
+                  if (gone.length) supersededBatches.push(...gone);
+                } catch (e) {
+                  console.warn(`[Supersede] skipped for ${id}: ${e.message}`);
+                }
+              }
               await connection.query(`INSERT INTO batches (id, fileName, data) VALUES (?, ?, ?) ON DUPLICATE KEY UPDATE fileName=VALUES(fileName), data=VALUES(data)`, [id, fileName, JSON.stringify(rest)]);
             }
           } else if (collection === 'brokerage_masters') {
@@ -3824,7 +3936,11 @@ app.all('/api/data', mutationLimiter, async (req, res) => {
         // adopts it so its NEXT edit sends a current base version. Without this the
         // browser keeps the pre-save value, every following save looks stale, and
         // the user has to click Save repeatedly before one lands.
-        res.json({ success: true, saved: items.length, stamped: nowISO, conflicts: staleConflicts, conflictCount: staleConflicts.length });
+        res.json({
+          success: true, saved: items.length, stamped: nowISO,
+          conflicts: staleConflicts, conflictCount: staleConflicts.length,
+          superseded: supersededBatches,
+        });
       } catch (e) {
         await connection.rollback();
         throw e;
@@ -3855,10 +3971,16 @@ app.all('/api/data', mutationLimiter, async (req, res) => {
         try { data = rows[0].data ? JSON.parse(rows[0].data) : {}; } catch (e) {}
         data.deletedAt = new Date().toISOString();
         data.deletedBy = req.user?.id || null;
+        // Move the rows out of `transactions` (see transactions_trash). Without
+        // this the batch only DISAPPEARS FROM THE LIST while its gross, its AUM
+        // and its payout ledger keep counting — which is how re-uploading a month
+        // ended up doubling it instead of replacing it.
+        const moved = await trashBatchRows(id);
+        data.trashedRows = moved;
         await pool.query('UPDATE batches SET data = ? WHERE id = ?', [JSON.stringify(data), id]);
         invalidateSummaryCache();
-        console.log(`🗑️ [Soft-Delete Batch] id=${id} by user=${req.user?.id || 'system'}`);
-        return res.json({ success: true, softDelete: true });
+        console.log(`🗑️ [Soft-Delete Batch] id=${id} rows=${moved} by user=${req.user?.id || 'system'}`);
+        return res.json({ success: true, softDelete: true, rowsRemoved: moved });
       }
 
       // Restore a soft-deleted batch.
@@ -3869,10 +3991,16 @@ app.all('/api/data', mutationLimiter, async (req, res) => {
         try { data = rows[0].data ? JSON.parse(rows[0].data) : {}; } catch (e) {}
         delete data.deletedAt;
         delete data.deletedBy;
+        delete data.supersededBy;
+        delete data.trashedRows;
+        const back = await untrashBatchRows(id);
         await pool.query('UPDATE batches SET data = ? WHERE id = ?', [JSON.stringify(data), id]);
         invalidateSummaryCache();
-        console.log(`♻️  [Restore Batch] id=${id} by user=${req.user?.id || 'system'}`);
-        return res.json({ success: true });
+        // The ledger rows were dropped when the batch went to Trash, so the shares
+        // have to be rebuilt before any payout screen is believable again.
+        if (back) recomputeAllBreakdowns();
+        console.log(`♻️  [Restore Batch] id=${id} rows=${back} by user=${req.user?.id || 'system'}`);
+        return res.json({ success: true, rowsRestored: back });
       }
 
       // Permanently purge a soft-deleted batch (admin only).
@@ -3882,6 +4010,7 @@ app.all('/api/data', mutationLimiter, async (req, res) => {
         }
         await pool.query('DELETE FROM payout_ledger WHERE transactionId IN (SELECT id FROM transactions WHERE batchId = ?)', [id]);
         await pool.query('DELETE FROM transactions WHERE batchId = ?', [id]);
+        await pool.query('DELETE FROM transactions_trash WHERE batchId = ?', [id]);
         await pool.query('DELETE FROM batches WHERE id = ?', [id]);
         invalidateSummaryCache();
         console.log(`💣 [Purge Batch] id=${id} by admin=${req.user.id}`);

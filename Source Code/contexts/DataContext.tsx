@@ -202,6 +202,23 @@ export const DataProvider: React.FC<{ children: React.ReactNode }> = ({ children
       let body = await post({ collection, payload, upsertField });
       adopt(body?.stamped);
 
+      // ── An earlier import of this same file was replaced ──────────────────
+      // Re-uploading a month used to leave BOTH copies in place, so the month
+      // read roughly double. The server now sends the superseded import to Trash
+      // and takes its rows out of every figure. Say so out loud: the whole reason
+      // the doubling went unnoticed is that nothing ever mentioned it.
+      const gone = Array.isArray(body?.superseded) ? body.superseded : [];
+      if (gone.length) {
+        const rows = gone.reduce((s: number, g: any) => s + (Number(g?.rows) || 0), 0);
+        const ids = new Set(gone.map((g: any) => g?.id));
+        const stamp = new Date().toISOString();
+        setBatches(prev => prev.map(b => ids.has(b.id) ? { ...b, deletedAt: stamp } : b));
+        showToast(
+          `This file was already imported. The earlier import was moved to Trash and its ${rows.toLocaleString('en-IN')} row${rows === 1 ? '' : 's'} removed, so this month is counted once.`,
+          'success'
+        );
+      }
+
       // ── Stale base version → rebase and retry ONCE ───────────────────────
       // The server refuses a write whose base version is older than what it
       // holds. For an EXPLICIT single-record edit — the user typed these values
