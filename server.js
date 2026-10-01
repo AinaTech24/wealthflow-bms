@@ -1679,6 +1679,16 @@ app.all('/api/data', mutationLimiter, async (req, res) => {
           const MF = 'MF';
           const sourceKeys = new Set([MF]);
 
+          // A product exists the moment its statement is imported — not when its
+          // client codes are finally attached. The earnings query above only sees
+          // MAPPED rows, so seeding the list from it alone hid Motilal entirely
+          // while all 374 of its rows were still unattached: the dropdown offered
+          // "Mutual fund" and nothing else, and there was no way to look at the
+          // product at all, let alone see that it was earning nobody anything.
+          const [pbPartners] = await pool.query(
+            `SELECT DISTINCT partner FROM partner_brokerage WHERE partner IS NOT NULL AND partner <> ''`);
+          for (const r of pbPartners) sourceKeys.add(String(r.partner).trim().toUpperCase());
+
           // earned[userId][period][source] = amount
           const earned = new Map();
           const bump = (uid, period, key, amt) => {

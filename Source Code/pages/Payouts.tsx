@@ -367,9 +367,21 @@ export const Payouts: React.FC<Props> = ({ currentUser }) => {
 
         <div className="p-4">
           {!rows.length ? (
-            <p className="text-sm text-slate-400 py-8 text-center">
-              {busy ? 'Loading…' : onlyOwed ? 'Everyone is settled for this month.' : 'Nothing for this month.'}
-            </p>
+            <div className="py-8 text-center">
+              <p className="text-sm text-slate-400">
+                {busy ? 'Loading…' : onlyOwed ? 'Everyone is settled for this month.' : 'Nothing for this month.'}
+              </p>
+              {/* An empty product reads as a broken page unless it says why it is
+                  empty. Two things have to be true before a partner statement pays
+                  anybody, and neither of them happens on this page. */}
+              {!busy && !onlyOwed && source !== 'all' && source !== 'MF' && (
+                <p className="text-xs text-slate-500 dark:text-slate-400 mt-2 max-w-xl mx-auto leading-relaxed">
+                  {labelFor(source)} has statements imported, but none of it reaches a person yet. A partner
+                  statement pays somebody only once <b>a sharing %</b> is set for it <i>and</i> its <b>client codes
+                  are attached to clients</b> — both on the Partner Brokerage page, which an administrator runs.
+                </p>
+              )}
+            </div>
           ) : (
             <div className="overflow-x-auto">
               <table className="w-full text-sm">
