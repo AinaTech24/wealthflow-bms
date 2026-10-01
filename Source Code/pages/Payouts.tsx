@@ -14,20 +14,23 @@ interface MonthRow {
   /** GST the RM bills on top, TDS deducted, and the resulting cheque. Taken
    *  from their raised invoice where one exists, estimated otherwise. */
   gst: number; tds: number; payable: number; invoiced: boolean; invoiceStatus?: string;
-  /** The same three figures split by revenue stream, so one product can be read
-   *  on its own and still carry its own arrears. */
-  paidMf: number; paidPartner: number;
-  carriedInMf: number; carriedInPartner: number;
-  outstandingMf: number; outstandingPartner: number;
+  /** The same figures per product — 'MF' for fund trail, then each partner by
+   *  its own code — so one product reads on its own and carries its own arrears. */
+  bySource: Record<string, { earned: number; paid: number; carriedIn: number; outstanding: number }>;
 }
 
-/** Which revenue stream the desk is looking at. */
-type Source = 'all' | 'mf' | 'partner';
-const SOURCE_LABEL: Record<Source, string> = {
-  all: 'All products',
-  mf: 'Mutual fund',
-  partner: 'Partner broking',
+/**
+ * Friendly names for the product codes the server reports.
+ *
+ * A code with no entry here shows as itself, which is why adding the next broker
+ * needs no change on this page: it appears in the dropdown as 'ANGEL' the day its
+ * first statement lands, and gets a nicer name here whenever someone bothers.
+ */
+const SOURCE_LABEL: Record<string, string> = {
+  MF: 'Mutual fund',
+  MOFSL: 'Motilal Oswal',
 };
+const labelFor = (key: string) => (key === 'all' ? 'All products' : SOURCE_LABEL[key] || key);
 interface Person {
   userId: string; name: string; code: string; role: string; level: number | null;
   months: MonthRow[]; totalEarned: number; totalPaid: number; outstanding: number;
@@ -54,9 +57,10 @@ export const Payouts: React.FC<Props> = ({ currentUser }) => {
   const isAdmin = currentUser.role === Role.ADMIN;
   const isFinance = currentUser.role === Role.FINANCE;
 
-  const [data, setData] = useState<{ periods: string[]; people: Person[] } | null>(null);
+  const [data, setData] = useState<{ periods: string[]; people: Person[]; sources?: string[] } | null>(null);
   const [period, setPeriod] = useState('');
-  const [source, setSource] = useState<Source>('all');
+  /** 'all', or one of the product codes the server reports. */
+  const [source, setSource] = useState('all');
   const [busy, setBusy] = useState(false);
   const [search, setSearch] = useState('');
   const [onlyOwed, setOnlyOwed] = useState(false);
@@ -104,11 +108,9 @@ export const Payouts: React.FC<Props> = ({ currentUser }) => {
    * arrear that was really partner broking — that would have finance paying the
    * same money twice.
    */
-  const view = (m: MonthRow) => source === 'mf'
-    ? { carriedIn: m.carriedInMf, earned: m.mf, paid: m.paidMf, outstanding: m.outstandingMf }
-    : source === 'partner'
-      ? { carriedIn: m.carriedInPartner, earned: m.partner, paid: m.paidPartner, outstanding: m.outstandingPartner }
-      : { carriedIn: m.carriedIn, earned: m.earned, paid: m.paid, outstanding: m.outstanding };
+  const view = (m: MonthRow) => source === 'all'
+    ? { carriedIn: m.carriedIn, earned: m.earned, paid: m.paid, outstanding: m.outstanding }
+    : (m.bySource?.[source] || { carriedIn: 0, earned: 0, paid: 0, outstanding: 0 });
 
   // One row per person FOR THE CHOSEN MONTH, carrying their prior balance in.
   const rows = useMemo(() => {
@@ -139,6 +141,16 @@ export const Payouts: React.FC<Props> = ({ currentUser }) => {
   // not split by product, so they are only shown when nothing is filtered out.
   const showTax = source === 'all';
   const anyPartner = source === 'all' && rows.some(x => x.m.partner !== 0);
+  /**
+   * Which product a payment recorded from this page is booked against.
+   *
+   * On a single-product view that is the product on screen, so a Motilal cheque
+   * clears the Motilal balance and nothing else. On the combined view it stays
+   * the fund stream, which is what an unlabelled payment has always meant here.
+   */
+  const paySource = source === 'all' ? 'MF' : source;
+  /** The dialog's figures follow the same product the table is showing. */
+  const payView = payFor ? view(payFor.m) : null;
 
   // ── Bulk import ───────────────────────────────────────────────────────────
   // Export the month, fill the "Pay now" column, upload it back. Settling 121
@@ -185,12 +197,15 @@ export const Payouts: React.FC<Props> = ({ currentUser }) => {
       const total = payload.reduce((a, x) => a + x.amount, 0);
       if (!window.confirm(
         `Record ${payload.length} payment${payload.length !== 1 ? 's' : ''} totalling ${inr(total)} ` +
-        `for ${prettyMonth(period)}?\n\nThis adds to whatever has already been recorded for this month.`)) return;
+        `for ${prettyMonth(period)}, against ${labelFor(paySource)}?` +
+        `\n\nThis adds to whatever has already been recorded for this month.`)) return;
 
       const save = await authFetch('/api/data', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ action: 'settle_bulk', payload: { source: 'MF', period, rows: payload } }),
+        // Booked against the product on screen, same as a single payment — an
+        // uploaded Motilal sheet must not clear mutual fund balances.
+        body: JSON.stringify({ action: 'settle_bulk', payload: { source: paySource, period, rows: payload } }),
       });
       const sj = await save.json();
       if (!save.ok) { showToast(sj?.error || 'Import failed.', 'error'); return; }
@@ -216,7 +231,7 @@ export const Payouts: React.FC<Props> = ({ currentUser }) => {
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
         action: 'settle',
-        payload: { source: 'MF', period: payFor.m.period, userId: payFor.p.userId, amount: amt, reference: reference || null },
+        payload: { source: paySource, period: payFor.m.period, userId: payFor.p.userId, amount: amt, reference: reference || null },
       }),
     });
     const j = await res.json();
@@ -239,12 +254,12 @@ export const Payouts: React.FC<Props> = ({ currentUser }) => {
           <select
             id="payout-source"
             value={source}
-            onChange={e => setSource(e.target.value as Source)}
+            onChange={e => setSource(e.target.value)}
             className="px-3 py-2 rounded-lg border border-slate-200 dark:border-slate-600 dark:bg-slate-800 dark:text-slate-100 text-sm font-bold"
-            title="Which revenue stream to show"
+            title="Which product to show"
           >
-            {(['all', 'mf', 'partner'] as Source[]).map(s => (
-              <option key={s} value={s}>{SOURCE_LABEL[s]}</option>
+            {['all', ...(data?.sources || ['MF'])].map(s => (
+              <option key={s} value={s}>{labelFor(s)}</option>
             ))}
           </select>
           <select
@@ -271,7 +286,7 @@ export const Payouts: React.FC<Props> = ({ currentUser }) => {
               // already-Paid column to be re-read would double every payment.
               exportToExcel(rows.map(({ p, m, v }) => ({
                 Name: p.name, Code: p.code, Level: p.level ?? '',
-                Product: SOURCE_LABEL[source],
+                Product: labelFor(source),
                 'Brought forward': v.carriedIn,
                 ...(showTax ? { 'Mutual fund': m.mf, 'Partner': m.partner } : {}),
                 'Earned this month': v.earned,
@@ -310,7 +325,7 @@ export const Payouts: React.FC<Props> = ({ currentUser }) => {
         <Tile
           label="Earned this month"
           value={totals.earned}
-          hint={source === 'all' ? `${rows.length} people` : `${rows.length} people · ${SOURCE_LABEL[source].toLowerCase()} only`}
+          hint={source === 'all' ? `${rows.length} people` : `${rows.length} people · ${labelFor(source).toLowerCase()} only`}
         />
         {showTax && <Tile label="GST on top" value={totals.gst} hint="only RMs with a GSTIN bill it" />}
         {showTax && <Tile label="Payable (after GST &amp; TDS)" value={totals.payable} accent="emerald" hint="what the cheques come to" />}
@@ -320,10 +335,10 @@ export const Payouts: React.FC<Props> = ({ currentUser }) => {
 
       {!showTax && (
         <p className="text-[11px] text-slate-500 dark:text-slate-400 -mt-2">
-          Showing <b>{SOURCE_LABEL[source].toLowerCase()}</b> only. GST, TDS and the cheque amount come from the RM&rsquo;s
+          Showing <b>{labelFor(source).toLowerCase()}</b> only. GST, TDS and the cheque amount come from the RM&rsquo;s
           invoice for the whole month and are not split by product, so they are hidden here — switch to{' '}
           <b>All products</b> to see them.
-          {source === 'partner' && ' Partner payments are recorded on the Partner Brokerage page, where each partner has its own ledger.'}
+          {' '}A payment recorded here is booked against <b>{labelFor(source)}</b>, so it clears this balance and no other.
         </p>
       )}
 
@@ -397,19 +412,14 @@ export const Payouts: React.FC<Props> = ({ currentUser }) => {
                       <Num v={v.paid} tone="emerald" />
                       <Num v={v.outstanding} bold tone={v.outstanding > 0.005 ? 'red' : 'emerald'} />
                       <td className="py-2 pr-4 text-right">
-                        {/* A settlement carries the stream it paid. Recording one while
-                            filtered to partner broking would have to guess WHICH partner,
-                            so that is done on the Partner Brokerage page instead. */}
-                        {source === 'partner' ? (
-                          <span className="text-[10px] text-slate-400">on Partner Brokerage</span>
-                        ) : (
-                          <button
-                            onClick={() => { setPayFor({ p, m }); setAmount(v.outstanding > 0 ? String(Math.round(v.outstanding * 100) / 100) : ''); setReference(''); }}
-                            className="px-2.5 py-1 rounded-lg border border-slate-200 dark:border-slate-600 text-[10px] font-black uppercase tracking-widest text-slate-600 dark:text-slate-300 hover:border-emerald-400 hover:text-emerald-600 transition whitespace-nowrap"
-                          >
-                            Record payment
-                          </button>
-                        )}
+                        {/* The settlement is booked against whichever product is on
+                            screen, so a Motilal cheque clears the Motilal balance. */}
+                        <button
+                          onClick={() => { setPayFor({ p, m }); setAmount(v.outstanding > 0 ? String(Math.round(v.outstanding * 100) / 100) : ''); setReference(''); }}
+                          className="px-2.5 py-1 rounded-lg border border-slate-200 dark:border-slate-600 text-[10px] font-black uppercase tracking-widest text-slate-600 dark:text-slate-300 hover:border-emerald-400 hover:text-emerald-600 transition whitespace-nowrap"
+                        >
+                          Record payment
+                        </button>
                       </td>
                     </tr>
                   ))}
@@ -439,21 +449,21 @@ export const Payouts: React.FC<Props> = ({ currentUser }) => {
         </div>
       )}
 
-      {payFor && (
+      {payFor && payView && (
         <div className="fixed inset-0 z-50 bg-slate-900/50 flex items-center justify-center p-4" onClick={() => setPayFor(null)}>
           <div className="bg-white dark:bg-slate-800 rounded-2xl border border-slate-200 dark:border-slate-700 p-5 w-full max-w-sm" onClick={e => e.stopPropagation()}>
             <h3 className="font-bold text-slate-900 dark:text-slate-100">Record a payment</h3>
             <p className="text-xs text-slate-500 dark:text-slate-400 mt-0.5">
-              {payFor.p.name} · {prettyMonth(payFor.m.period)}
+              {payFor.p.name} · {prettyMonth(payFor.m.period)} · <b>{labelFor(paySource)}</b>
             </p>
             <dl className="mt-3 text-xs space-y-1">
-              <Line k="Brought forward" v={payFor.m.carriedIn} />
-              <Line k="Earned this month" v={payFor.m.earned} />
-              {payFor.m.gst > 0 && <Line k="GST" v={payFor.m.gst} />}
-              {payFor.m.tds > 0 && <Line k="Less TDS" v={-payFor.m.tds} />}
-              <Line k={payFor.m.invoiced ? "Payable (invoice)" : "Payable (estimated)"} v={payFor.m.payable} />
-              <Line k="Already paid" v={payFor.m.paid} />
-              <Line k="Still owed" v={payFor.m.outstanding} strong />
+              <Line k="Brought forward" v={payView.carriedIn} />
+              <Line k="Earned this month" v={payView.earned} />
+              {showTax && payFor.m.gst > 0 && <Line k="GST" v={payFor.m.gst} />}
+              {showTax && payFor.m.tds > 0 && <Line k="Less TDS" v={-payFor.m.tds} />}
+              {showTax && <Line k={payFor.m.invoiced ? "Payable (invoice)" : "Payable (estimated)"} v={payFor.m.payable} />}
+              <Line k="Already paid" v={payView.paid} />
+              <Line k="Still owed" v={payView.outstanding} strong />
             </dl>
             {/* The ledger runs on earnings, not on the cheque. GST is collected on
                 the RM's behalf and TDS is withheld, so entering the payable here
@@ -467,10 +477,10 @@ export const Payouts: React.FC<Props> = ({ currentUser }) => {
               className="w-full px-3 py-2 rounded-lg border border-slate-200 dark:border-slate-600 dark:bg-slate-900 dark:text-slate-100 tabular-nums"
               placeholder="0.00"
             />
-            {Number(amount) > payFor.m.outstanding + 0.5 && (
+            {Number(amount) > payView.outstanding + 0.5 && (
               <p className="text-[11px] text-amber-700 dark:text-amber-400 mt-1.5 leading-relaxed">
-                That is more than the {inr(payFor.m.outstanding)} outstanding
-                {Math.abs(Number(amount) - payFor.m.payable) < 1 && <> — it looks like the payable {inr(payFor.m.payable)}, which includes GST</>}.
+                That is more than the {inr(payView.outstanding)} outstanding
+                {showTax && Math.abs(Number(amount) - payFor.m.payable) < 1 && <> — it looks like the payable {inr(payFor.m.payable)}, which includes GST</>}.
                 Recording it leaves a credit that carries into next month.
               </p>
             )}

@@ -1671,46 +1671,58 @@ app.all('/api/data', mutationLimiter, async (req, res) => {
             }
           }
 
-          // earned[userId][period] = { mf, partner }
+          // Everything is keyed by SOURCE: 'MF' for fund trail, and the partner's
+          // own code ('MOFSL', …) for each broking statement. Keeping the partner
+          // code rather than folding every broker into one "partner" bucket is
+          // what lets the accounts desk answer "how much of this is Motilal?" —
+          // and it costs nothing, because a settlement already stores the code.
+          const MF = 'MF';
+          const sourceKeys = new Set([MF]);
+
+          // earned[userId][period][source] = amount
           const earned = new Map();
           const bump = (uid, period, key, amt) => {
+            sourceKeys.add(key);
             if (!earned.has(uid)) earned.set(uid, new Map());
             const byP = earned.get(uid);
-            const e = byP.get(period) || { mf: 0, partner: 0 };
-            e[key] += amt;
+            const e = byP.get(period) || {};
+            e[key] = (e[key] || 0) + amt;
             byP.set(period, e);
           };
-          for (const r of mfRows) bump(r.userId, r.period, 'mf', Number(r.earned) || 0);
+          for (const r of mfRows) bump(r.userId, r.period, MF, Number(r.earned) || 0);
           for (const r of pbRows) {
             const raw = cfg?.partnerSharing?.[r.partner];
             const pct = (typeof raw === 'number') ? { 3: raw } : (raw || {});
             const h = hier.get(r.cid); if (!h) continue;
+            const key = String(r.partner || '').trim().toUpperCase() || 'PARTNER';
+            // A partner with rows but no sharing % yet still has to appear in the
+            // product list, or finance cannot tell "nothing earned" from "this
+            // product does not exist".
+            sourceKeys.add(key);
             for (let lvl = 1; lvl <= 7; lvl++) {
               const p = Number(pct[lvl]) || 0; if (!p) continue;
               const uid = h[`level${lvl}Id`]; if (!uid) continue;
-              bump(uid, r.period, 'partner', Number(r.ours) * p / 100);
+              bump(uid, r.period, key, Number(r.ours) * p / 100);
             }
           }
 
-          // 3. What has actually been paid.
-          //    Split by SOURCE as well as person and month. A settlement already
-          //    records which revenue stream it paid ('MF', or the partner code),
-          //    so the accounts desk can look at one product at a time and still
-          //    see a balance that carries correctly within that stream.
+          // 3. What has actually been paid, by person, month and source.
           const [paidRows] = await pool.query(
             `SELECT userId, period, source, ROUND(SUM(amount),2) paid
              FROM payout_settlements GROUP BY userId, period, source`);
           const paid = new Map();
           for (const r of paidRows) {
+            const key = String(r.source || '').trim().toUpperCase() || MF;
+            sourceKeys.add(key);
             if (!paid.has(r.userId)) paid.set(r.userId, new Map());
             const byP = paid.get(r.userId);
-            const e = byP.get(r.period) || { mf: 0, partner: 0 };
-            // Anything that is not the fund stream is partner revenue, whichever
-            // broker it came from — one more partner must not silently vanish.
-            if (String(r.source || '').toUpperCase() === 'MF') e.mf += Number(r.paid) || 0;
-            else e.partner += Number(r.paid) || 0;
+            const e = byP.get(r.period) || {};
+            e[key] = (e[key] || 0) + (Number(r.paid) || 0);
             byP.set(r.period, e);
           }
+          // MF first, then the partners alphabetically — a stable order so the
+          // dropdown does not reshuffle itself between loads.
+          const sources = [MF, ...[...sourceKeys].filter(k => k !== MF).sort()];
 
           const [teamRows] = await pool.query(`SELECT id, name, code, role, level, data FROM team`);
           const team = new Map(teamRows.map(t => [t.id, t]));
@@ -1776,35 +1788,41 @@ app.all('/api/data', mutationLimiter, async (req, res) => {
           const people = [];
           for (const uid of new Set([...earned.keys(), ...paid.keys()])) {
             const t = team.get(uid);
-            // Three balances walk forward together: the combined one the desk
-            // pays against, and one per revenue stream so a single-product view
-            // carries its own arrears rather than borrowing the other's.
-            let running = 0, runMf = 0, runPartner = 0;
+            // The combined balance the desk pays against, plus one balance per
+            // source walking alongside it, so a single-product view carries its
+            // own arrears rather than borrowing another product's.
+            let running = 0;
+            const runBy = Object.fromEntries(sources.map(s => [s, 0]));
             const r2 = (n) => Math.round(n * 100) / 100;
             const months = periods.map(p => {
-              const e = earned.get(uid)?.get(p) || { mf: 0, partner: 0 };
-              const pdSplit = paid.get(uid)?.get(p) || { mf: 0, partner: 0 };
-              const tot = e.mf + e.partner;
-              const pd = pdSplit.mf + pdSplit.partner;
-              const carriedIn = running, carriedInMf = runMf, carriedInPartner = runPartner;
+              const e = earned.get(uid)?.get(p) || {};
+              const pdSplit = paid.get(uid)?.get(p) || {};
+              let tot = 0, pd = 0;
+              const bySource = {};
+              for (const s of sources) {
+                const se = e[s] || 0, sp = pdSplit[s] || 0;
+                tot += se; pd += sp;
+                bySource[s] = {
+                  earned: r2(se),
+                  paid: r2(sp),
+                  carriedIn: r2(runBy[s]),
+                  outstanding: r2(runBy[s] + se - sp),
+                };
+                runBy[s] += se - sp;
+              }
+              const carriedIn = running;
               running += tot - pd;
-              runMf += e.mf - pdSplit.mf;
-              runPartner += e.partner - pdSplit.partner;
               const tax = taxFor(uid, p, r2(tot));
               return {
                 period: p,
-                mf: r2(e.mf),
-                partner: r2(e.partner),
+                // The two headline splits the table still shows side by side.
+                mf: r2(e[MF] || 0),
+                partner: r2(sources.reduce((a, s) => a + (s === MF ? 0 : (e[s] || 0)), 0)),
                 earned: r2(tot),
                 paid: r2(pd),
-                paidMf: r2(pdSplit.mf),
-                paidPartner: r2(pdSplit.partner),
                 carriedIn: r2(carriedIn),
-                carriedInMf: r2(carriedInMf),
-                carriedInPartner: r2(carriedInPartner),
                 outstanding: r2(running),
-                outstandingMf: r2(runMf),
-                outstandingPartner: r2(runPartner),
+                bySource,
                 ...tax,
               };
             }).filter(m => m.earned !== 0 || m.paid !== 0 || m.carriedIn !== 0);
@@ -1823,7 +1841,7 @@ app.all('/api/data', mutationLimiter, async (req, res) => {
           }
           people.sort((a, b) => b.outstanding - a.outstanding || b.totalEarned - a.totalEarned);
 
-          const body = { generatedAt: new Date().toISOString(), periods, people };
+          const body = { generatedAt: new Date().toISOString(), periods, people, sources };
           payoutOverviewCache = { at: now, body };
           res.set('X-Cache', 'MISS');
           return res.json(body);
