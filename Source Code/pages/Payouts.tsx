@@ -14,7 +14,20 @@ interface MonthRow {
   /** GST the RM bills on top, TDS deducted, and the resulting cheque. Taken
    *  from their raised invoice where one exists, estimated otherwise. */
   gst: number; tds: number; payable: number; invoiced: boolean; invoiceStatus?: string;
+  /** The same three figures split by revenue stream, so one product can be read
+   *  on its own and still carry its own arrears. */
+  paidMf: number; paidPartner: number;
+  carriedInMf: number; carriedInPartner: number;
+  outstandingMf: number; outstandingPartner: number;
 }
+
+/** Which revenue stream the desk is looking at. */
+type Source = 'all' | 'mf' | 'partner';
+const SOURCE_LABEL: Record<Source, string> = {
+  all: 'All products',
+  mf: 'Mutual fund',
+  partner: 'Partner broking',
+};
 interface Person {
   userId: string; name: string; code: string; role: string; level: number | null;
   months: MonthRow[]; totalEarned: number; totalPaid: number; outstanding: number;
@@ -43,6 +56,7 @@ export const Payouts: React.FC<Props> = ({ currentUser }) => {
 
   const [data, setData] = useState<{ periods: string[]; people: Person[] } | null>(null);
   const [period, setPeriod] = useState('');
+  const [source, setSource] = useState<Source>('all');
   const [busy, setBusy] = useState(false);
   const [search, setSearch] = useState('');
   const [onlyOwed, setOnlyOwed] = useState(false);
@@ -82,6 +96,20 @@ export const Payouts: React.FC<Props> = ({ currentUser }) => {
     return () => { cancelled = true; };
   }, [period]);
 
+  /**
+   * The four money figures for whichever product is selected.
+   *
+   * Each stream carries its own balance forward, because a settlement records
+   * which stream it paid. Reading only mutual fund must therefore not show an
+   * arrear that was really partner broking — that would have finance paying the
+   * same money twice.
+   */
+  const view = (m: MonthRow) => source === 'mf'
+    ? { carriedIn: m.carriedInMf, earned: m.mf, paid: m.paidMf, outstanding: m.outstandingMf }
+    : source === 'partner'
+      ? { carriedIn: m.carriedInPartner, earned: m.partner, paid: m.paidPartner, outstanding: m.outstandingPartner }
+      : { carriedIn: m.carriedIn, earned: m.earned, paid: m.paid, outstanding: m.outstanding };
+
   // One row per person FOR THE CHOSEN MONTH, carrying their prior balance in.
   const rows = useMemo(() => {
     if (!data || !period) return [];
@@ -89,21 +117,28 @@ export const Payouts: React.FC<Props> = ({ currentUser }) => {
     return data.people
       .map(p => ({ p, m: p.months.find(m => m.period === period) }))
       .filter((x): x is { p: Person; m: MonthRow } => !!x.m)
+      .map(x => ({ ...x, v: view(x.m) }))
       .filter(x => !q || x.p.name.toLowerCase().includes(q) || (x.p.code || '').toLowerCase().includes(q))
-      .filter(x => !onlyOwed || x.m.outstanding > 0.005)
-      .sort((a, b) => b.m.outstanding - a.m.outstanding || b.m.earned - a.m.earned);
-  }, [data, period, search, onlyOwed]);
+      // A person with nothing at all in this stream is noise, not a zero worth reading.
+      .filter(x => source === 'all' || x.v.earned !== 0 || x.v.paid !== 0 || x.v.carriedIn !== 0)
+      .filter(x => !onlyOwed || x.v.outstanding > 0.005)
+      .sort((a, b) => b.v.outstanding - a.v.outstanding || b.v.earned - a.v.earned);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [data, period, search, onlyOwed, source]);
 
   const totals = useMemo(() => rows.reduce((a, x) => ({
-    earned: a.earned + x.m.earned,
-    paid: a.paid + x.m.paid,
-    carriedIn: a.carriedIn + x.m.carriedIn,
-    outstanding: a.outstanding + x.m.outstanding,
+    earned: a.earned + x.v.earned,
+    paid: a.paid + x.v.paid,
+    carriedIn: a.carriedIn + x.v.carriedIn,
+    outstanding: a.outstanding + x.v.outstanding,
     gst: a.gst + x.m.gst,
     payable: a.payable + x.m.payable,
   }), { earned: 0, paid: 0, carriedIn: 0, outstanding: 0, gst: 0, payable: 0 }), [rows]);
 
-  const anyPartner = rows.some(x => x.m.partner !== 0);
+  // GST, TDS and the cheque are month-level facts off the RM's invoice — they are
+  // not split by product, so they are only shown when nothing is filtered out.
+  const showTax = source === 'all';
+  const anyPartner = source === 'all' && rows.some(x => x.m.partner !== 0);
 
   // ── Bulk import ───────────────────────────────────────────────────────────
   // Export the month, fill the "Pay now" column, upload it back. Settling 121
@@ -202,6 +237,17 @@ export const Payouts: React.FC<Props> = ({ currentUser }) => {
         </div>
         <div className="flex items-center gap-2 flex-wrap">
           <select
+            id="payout-source"
+            value={source}
+            onChange={e => setSource(e.target.value as Source)}
+            className="px-3 py-2 rounded-lg border border-slate-200 dark:border-slate-600 dark:bg-slate-800 dark:text-slate-100 text-sm font-bold"
+            title="Which revenue stream to show"
+          >
+            {(['all', 'mf', 'partner'] as Source[]).map(s => (
+              <option key={s} value={s}>{SOURCE_LABEL[s]}</option>
+            ))}
+          </select>
+          <select
             id="payout-period"
             value={period}
             onChange={e => setPeriod(e.target.value)}
@@ -223,18 +269,19 @@ export const Payouts: React.FC<Props> = ({ currentUser }) => {
               // "Pay now" ships empty on purpose: fill it in, upload the same
               // sheet back, and those become the month's payments. Leaving the
               // already-Paid column to be re-read would double every payment.
-              exportToExcel(rows.map(({ p, m }) => ({
+              exportToExcel(rows.map(({ p, m, v }) => ({
                 Name: p.name, Code: p.code, Level: p.level ?? '',
-                'Brought forward': m.carriedIn,
-                'Mutual fund': m.mf, 'Partner': m.partner,
-                'Earned this month': m.earned,
-                GST: m.gst, TDS: m.tds, 'Payable': m.payable,
-                'Invoice raised': m.invoiced ? (m.invoiceStatus || 'YES') : 'no',
-                'Already paid': m.paid,
-                'Still owed': m.outstanding,
+                Product: SOURCE_LABEL[source],
+                'Brought forward': v.carriedIn,
+                ...(showTax ? { 'Mutual fund': m.mf, 'Partner': m.partner } : {}),
+                'Earned this month': v.earned,
+                ...(showTax ? { GST: m.gst, TDS: m.tds, 'Payable': m.payable,
+                                'Invoice raised': m.invoiced ? (m.invoiceStatus || 'YES') : 'no' } : {}),
+                'Already paid': v.paid,
+                'Still owed': v.outstanding,
                 'Pay now': '',
                 Reference: '',
-              })), `Payouts_${period}`, 'Payouts');
+              })), `Payouts_${period}${source === 'all' ? '' : `_${source}`}`, 'Payouts');
             }}
             className="px-3 py-2 rounded-lg border border-slate-200 dark:border-slate-600 text-slate-600 dark:text-slate-300 text-xs font-bold flex items-center gap-1.5 hover:border-emerald-400 transition"
           >
@@ -260,11 +307,25 @@ export const Payouts: React.FC<Props> = ({ currentUser }) => {
 
       <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-4">
         <Tile label="Brought forward" value={totals.carriedIn} hint="unpaid from earlier months" />
-        <Tile label="Earned this month" value={totals.earned} hint={`${rows.length} people`} />
-        <Tile label="GST on top" value={totals.gst} hint="only RMs with a GSTIN bill it" />
-        <Tile label="Payable (after GST &amp; TDS)" value={totals.payable} accent="emerald" hint="what the cheques come to" />
+        <Tile
+          label="Earned this month"
+          value={totals.earned}
+          hint={source === 'all' ? `${rows.length} people` : `${rows.length} people · ${SOURCE_LABEL[source].toLowerCase()} only`}
+        />
+        {showTax && <Tile label="GST on top" value={totals.gst} hint="only RMs with a GSTIN bill it" />}
+        {showTax && <Tile label="Payable (after GST &amp; TDS)" value={totals.payable} accent="emerald" hint="what the cheques come to" />}
+        <Tile label="Paid" value={totals.paid} accent="emerald" hint="recorded against this month" />
         <Tile label="Still owed" value={totals.outstanding} accent={totals.outstanding > 0 ? 'red' : 'emerald'} hint="carries into next month" />
       </div>
+
+      {!showTax && (
+        <p className="text-[11px] text-slate-500 dark:text-slate-400 -mt-2">
+          Showing <b>{SOURCE_LABEL[source].toLowerCase()}</b> only. GST, TDS and the cheque amount come from the RM&rsquo;s
+          invoice for the whole month and are not split by product, so they are hidden here — switch to{' '}
+          <b>All products</b> to see them.
+          {source === 'partner' && ' Partner payments are recorded on the Partner Brokerage page, where each partner has its own ledger.'}
+        </p>
+      )}
 
       {health && <AttributionHealth h={health} open={openCheck} setOpen={setOpenCheck} />}
 
@@ -304,16 +365,16 @@ export const Payouts: React.FC<Props> = ({ currentUser }) => {
                     {anyPartner && <th className="pb-2 pr-4 text-right">Mutual fund</th>}
                     {anyPartner && <th className="pb-2 pr-4 text-right">Partner</th>}
                     <th className="pb-2 pr-4 text-right">Earned</th>
-                    <th className="pb-2 pr-4 text-right">GST</th>
-                    <th className="pb-2 pr-4 text-right">TDS</th>
-                    <th className="pb-2 pr-4 text-right">Payable</th>
+                    {showTax && <th className="pb-2 pr-4 text-right">GST</th>}
+                    {showTax && <th className="pb-2 pr-4 text-right">TDS</th>}
+                    {showTax && <th className="pb-2 pr-4 text-right">Payable</th>}
                     <th className="pb-2 pr-4 text-right">Paid</th>
                     <th className="pb-2 pr-4 text-right">Still owed</th>
                     <th className="pb-2 pr-4 text-right"></th>
                   </tr>
                 </thead>
                 <tbody>
-                  {rows.map(({ p, m }) => (
+                  {rows.map(({ p, m, v }) => (
                     <tr key={p.userId} className="border-b border-slate-100 dark:border-slate-700/50">
                       <td className="py-2 pr-4">
                         <div className="font-bold text-slate-900 dark:text-slate-100">{p.name}</div>
@@ -321,25 +382,34 @@ export const Payouts: React.FC<Props> = ({ currentUser }) => {
                           {p.code || p.userId.slice(0, 12)}{p.level != null && ` · L${p.level}`}
                         </div>
                       </td>
-                      <Num v={m.carriedIn} muted />
+                      <Num v={v.carriedIn} muted />
                       {anyPartner && <Num v={m.mf} muted />}
                       {anyPartner && <Num v={m.partner} muted />}
-                      <Num v={m.earned} bold />
-                      <Num v={m.gst} muted />
-                      <Num v={m.tds} muted />
-                      <td className="py-2 pr-4 text-right font-mono text-xs tabular-nums font-bold text-slate-900 dark:text-slate-100 whitespace-nowrap">
-                        {inr(m.payable)}
-                        {!m.invoiced && <span className="ml-1 text-[9px] font-black uppercase tracking-widest text-amber-600" title="No invoice raised for this month — estimated from the configured GST and TDS rates">est</span>}
-                      </td>
-                      <Num v={m.paid} tone="emerald" />
-                      <Num v={m.outstanding} bold tone={m.outstanding > 0.005 ? 'red' : 'emerald'} />
+                      <Num v={v.earned} bold />
+                      {showTax && <Num v={m.gst} muted />}
+                      {showTax && <Num v={m.tds} muted />}
+                      {showTax && (
+                        <td className="py-2 pr-4 text-right font-mono text-xs tabular-nums font-bold text-slate-900 dark:text-slate-100 whitespace-nowrap">
+                          {inr(m.payable)}
+                          {!m.invoiced && <span className="ml-1 text-[9px] font-black uppercase tracking-widest text-amber-600" title="No invoice raised for this month — estimated from the configured GST and TDS rates">est</span>}
+                        </td>
+                      )}
+                      <Num v={v.paid} tone="emerald" />
+                      <Num v={v.outstanding} bold tone={v.outstanding > 0.005 ? 'red' : 'emerald'} />
                       <td className="py-2 pr-4 text-right">
-                        <button
-                          onClick={() => { setPayFor({ p, m }); setAmount(m.outstanding > 0 ? String(Math.round(m.outstanding * 100) / 100) : ''); setReference(''); }}
-                          className="px-2.5 py-1 rounded-lg border border-slate-200 dark:border-slate-600 text-[10px] font-black uppercase tracking-widest text-slate-600 dark:text-slate-300 hover:border-emerald-400 hover:text-emerald-600 transition whitespace-nowrap"
-                        >
-                          Record payment
-                        </button>
+                        {/* A settlement carries the stream it paid. Recording one while
+                            filtered to partner broking would have to guess WHICH partner,
+                            so that is done on the Partner Brokerage page instead. */}
+                        {source === 'partner' ? (
+                          <span className="text-[10px] text-slate-400">on Partner Brokerage</span>
+                        ) : (
+                          <button
+                            onClick={() => { setPayFor({ p, m }); setAmount(v.outstanding > 0 ? String(Math.round(v.outstanding * 100) / 100) : ''); setReference(''); }}
+                            className="px-2.5 py-1 rounded-lg border border-slate-200 dark:border-slate-600 text-[10px] font-black uppercase tracking-widest text-slate-600 dark:text-slate-300 hover:border-emerald-400 hover:text-emerald-600 transition whitespace-nowrap"
+                          >
+                            Record payment
+                          </button>
+                        )}
                       </td>
                     </tr>
                   ))}

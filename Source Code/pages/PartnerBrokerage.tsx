@@ -79,6 +79,12 @@ const num = (v: any) => {
   return Number.isFinite(n) ? n : 0;
 };
 
+/** "2026-07" → "July 2026". Falls back to the raw key rather than "Invalid Date". */
+const prettyMonth = (p: string) => {
+  const d = new Date(`${p}-01T00:00:00`);
+  return Number.isNaN(d.getTime()) ? p : d.toLocaleString('en-IN', { month: 'long', year: 'numeric' });
+};
+
 interface CodeRow {
   partner: string; clientCode: string; rows_: number;
   firstPeriod: string; lastPeriod: string; ourShare: number;
@@ -115,17 +121,34 @@ export const PartnerBrokerage: React.FC<Props> = ({ currentUser }) => {
   const [payAmount, setPayAmount] = useState('');
   const [payRef, setPayRef] = useState('');
 
-  const load = async () => {
+  // '' means every month. Kept separate from the month LIST, which always covers
+  // everything imported — otherwise choosing a month would leave the dropdown
+  // holding only that month and there would be no way back.
+  const [period, setPeriod] = useState('');
+  const [allPeriods, setAllPeriods] = useState<string[]>([]);
+
+  const load = async (p = period) => {
     setBusy(true);
+    const q = p ? `&period=${encodeURIComponent(p)}` : '';
     try {
       const [s, r, l] = await Promise.all([
-        authFetch(`/api/data?action=partner_summary&_=${Date.now()}`, { cache: 'no-store' }),
-        authFetch(`/api/data?action=partner_rows&_=${Date.now()}`, { cache: 'no-store' }),
+        authFetch(`/api/data?action=partner_summary${q}&_=${Date.now()}`, { cache: 'no-store' }),
+        authFetch(`/api/data?action=partner_rows${q}&_=${Date.now()}`, { cache: 'no-store' }),
         authFetch(`/api/data?action=partner_ledger&partner=${partner}&_=${Date.now()}`, { cache: 'no-store' }),
       ]);
-      if (s.ok) setSummary(await s.json());
+      if (s.ok) {
+        const body = await s.json();
+        setSummary(body);
+        // An unfiltered call already lists every month, so take it from there and
+        // save a round trip.
+        if (!p) setAllPeriods((body.periods || []).map((x: any) => x.period));
+      }
       if (r.ok) setRows(await r.json());
       if (l.ok) setLedger(await l.json());
+      if (p) {
+        const a = await authFetch(`/api/data?action=partner_summary&_=${Date.now()}`, { cache: 'no-store' });
+        if (a.ok) setAllPeriods(((await a.json()).periods || []).map((x: any) => x.period));
+      }
       if (canWrite) {
         const c = await authFetch(`/api/data?action=partner_codes&_=${Date.now()}`, { cache: 'no-store' });
         if (c.ok) setCodes(await c.json());
@@ -136,6 +159,10 @@ export const PartnerBrokerage: React.FC<Props> = ({ currentUser }) => {
   };
 
   useEffect(() => { load(); /* eslint-disable-next-line */ }, []);
+  // Changing the month refetches rather than filtering in the browser: the row
+  // endpoint caps at 20,000 rows, so a client-side filter would quietly lie once
+  // more than one month of statements is in.
+  useEffect(() => { if (allPeriods.length) load(period); /* eslint-disable-next-line */ }, [period]);
 
   // ── Upload ────────────────────────────────────────────────────────────────
   const handleFile = async (file: File) => {
@@ -265,7 +292,7 @@ export const PartnerBrokerage: React.FC<Props> = ({ currentUser }) => {
         </div>
         <div className="flex items-center gap-2">
           <button
-            onClick={load}
+            onClick={() => load()}
             className="px-3 py-2 rounded-lg border border-slate-200 dark:border-slate-600 text-slate-600 dark:text-slate-300 text-xs font-bold flex items-center gap-1.5 hover:border-blue-400 transition"
           >
             <RefreshCw className={`w-3.5 h-3.5 ${busy ? 'animate-spin' : ''}`} /> Refresh
@@ -293,28 +320,57 @@ export const PartnerBrokerage: React.FC<Props> = ({ currentUser }) => {
       </div>
 
       {/* ── Money ─────────────────────────────────────────────────────────── */}
+      {/* Total = Mentor + Partner, exactly as the statement splits it: "Parent
+          Sharing" is our side, "MOFSL Sharing" is theirs. Payout is the slice of
+          OUR side that reaches people, so it is a part of Mentor, not a fifth
+          number beside it. */}
       <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-4">
         <Tile label="Total brokerage" value={totals?.totalBrokerage} hint="what the partner billed" />
-        <Tile label={canWrite ? 'Our share' : 'Your clients’ share'} value={totals?.ourShare} accent hint="the firm's cut, stated by the file" />
+        <Tile
+          label={canWrite ? 'Mentor brokerage' : 'Your clients’ share'}
+          value={totals?.ourShare}
+          accent
+          hint={canWrite ? 'our side of the split, stated by the file' : "the firm's cut on your clients"}
+        />
+        <Tile label="Partner brokerage" value={totals?.partnerShare} hint={`retained by ${partner}`} />
         {canWrite
-          ? <Tile label="Partner's share" value={totals?.partnerShare} hint="retained by the partner" />
+          ? <Tile
+              label="Payout brokerage"
+              value={(Number(totals?.ourShare) || 0) * (sharePct / 100)}
+              hint={sharePct ? `${sharePct}% of mentor brokerage` : 'no sharing % set yet — set one below'}
+            />
           : <Tile label="Your payout" value={myEarning ?? 0} accent hint={sharePct ? `${sharePct}% of your clients' share` : 'no sharing % set yet'} />}
-        <Tile label="Rows" value={totals?.rows_} raw hint={`${totals?.codes ?? 0} client code${(totals?.codes ?? 0) !== 1 ? 's' : ''}`} />
       </div>
 
+      {/* ── Month ─────────────────────────────────────────────────────────── */}
+      {allPeriods.length > 0 && (
+        <div className="flex items-center gap-3 flex-wrap">
+          <label htmlFor="pb-month" className="text-[10px] font-black uppercase tracking-widest text-slate-400">Month</label>
+          <select
+            id="pb-month"
+            value={period}
+            onChange={e => setPeriod(e.target.value)}
+            className="px-3 py-2 rounded-lg border border-slate-200 dark:border-slate-600 dark:bg-slate-900 dark:text-slate-100 text-xs font-bold"
+          >
+            <option value="">All months</option>
+            {allPeriods.map(p => <option key={p} value={p}>{prettyMonth(p)}</option>)}
+          </select>
+          <span className="text-[11px] text-slate-500 dark:text-slate-400">
+            {period
+              ? `${totals?.rows_ ?? 0} row${(totals?.rows_ ?? 0) !== 1 ? 's' : ''} from ${totals?.codes ?? 0} client code${(totals?.codes ?? 0) !== 1 ? 's' : ''}`
+              : `${allPeriods.length} month${allPeriods.length !== 1 ? 's' : ''} imported · ${totals?.rows_ ?? 0} rows, ${totals?.codes ?? 0} codes`}
+          </span>
+        </div>
+      )}
+
       {canWrite && (
-        <div className={`rounded-xl border-2 p-4 ${sharePct === 0
-          ? 'border-amber-300 dark:border-amber-700 bg-amber-50 dark:bg-amber-900/20'
-          : 'border-slate-200 dark:border-slate-700 bg-white dark:bg-slate-800'}`}>
+        <div className="rounded-xl border-2 border-slate-200 dark:border-slate-700 bg-white dark:bg-slate-800 p-4">
           <div className="flex items-start gap-3">
-            {sharePct === 0 && <AlertTriangle className="w-5 h-5 text-amber-600 flex-shrink-0 mt-0.5" />}
             <div className="flex-1">
-              <p className={`text-sm font-bold ${sharePct === 0 ? 'text-amber-800 dark:text-amber-300' : 'text-slate-900 dark:text-slate-100'}`}>
-                {sharePct === 0
-                  ? `No sharing % is set for ${partner}, so nobody is owed anything yet.`
-                  : `Sharing for ${partner}`}
+              <p className="text-sm font-bold text-slate-900 dark:text-slate-100">
+                Sharing for {partner}
               </p>
-              <p className={`text-[11px] mt-1 max-w-3xl ${sharePct === 0 ? 'text-amber-700/90 dark:text-amber-400/90' : 'text-slate-500 dark:text-slate-400'}`}>
+              <p className="text-[11px] mt-1 max-w-3xl text-slate-500 dark:text-slate-400">
                 The statement says what the firm earns; it says nothing about what reaches a person, because broking
                 carries no level ladder of its own. Set a percentage against the hierarchy level that should be paid —
                 most clients here sit at level 3 (RM) with their manager at level 4.
@@ -390,7 +446,7 @@ export const PartnerBrokerage: React.FC<Props> = ({ currentUser }) => {
           : (
             <div className="overflow-x-auto">
               <table className="w-full text-sm">
-                <Head cols={['Partner', 'Month', 'Rows', 'Codes', 'Total brokerage', 'Our share', 'Partner share', 'Unmapped']} />
+                <Head cols={['Partner', 'Month', 'Rows', 'Codes', 'Total brokerage', 'Mentor brokerage', 'Partner brokerage', 'Unmapped']} />
                 <tbody>
                   {summary.periods.map((p: any) => (
                     <tr key={`${p.partner}-${p.period}`} className="border-b border-slate-100 dark:border-slate-700/50">

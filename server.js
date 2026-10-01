@@ -1693,12 +1693,23 @@ app.all('/api/data', mutationLimiter, async (req, res) => {
           }
 
           // 3. What has actually been paid.
+          //    Split by SOURCE as well as person and month. A settlement already
+          //    records which revenue stream it paid ('MF', or the partner code),
+          //    so the accounts desk can look at one product at a time and still
+          //    see a balance that carries correctly within that stream.
           const [paidRows] = await pool.query(
-            `SELECT userId, period, ROUND(SUM(amount),2) paid FROM payout_settlements GROUP BY userId, period`);
+            `SELECT userId, period, source, ROUND(SUM(amount),2) paid
+             FROM payout_settlements GROUP BY userId, period, source`);
           const paid = new Map();
           for (const r of paidRows) {
             if (!paid.has(r.userId)) paid.set(r.userId, new Map());
-            paid.get(r.userId).set(r.period, Number(r.paid) || 0);
+            const byP = paid.get(r.userId);
+            const e = byP.get(r.period) || { mf: 0, partner: 0 };
+            // Anything that is not the fund stream is partner revenue, whichever
+            // broker it came from — one more partner must not silently vanish.
+            if (String(r.source || '').toUpperCase() === 'MF') e.mf += Number(r.paid) || 0;
+            else e.partner += Number(r.paid) || 0;
+            byP.set(r.period, e);
           }
 
           const [teamRows] = await pool.query(`SELECT id, name, code, role, level, data FROM team`);
@@ -1765,22 +1776,35 @@ app.all('/api/data', mutationLimiter, async (req, res) => {
           const people = [];
           for (const uid of new Set([...earned.keys(), ...paid.keys()])) {
             const t = team.get(uid);
-            let running = 0;
+            // Three balances walk forward together: the combined one the desk
+            // pays against, and one per revenue stream so a single-product view
+            // carries its own arrears rather than borrowing the other's.
+            let running = 0, runMf = 0, runPartner = 0;
+            const r2 = (n) => Math.round(n * 100) / 100;
             const months = periods.map(p => {
               const e = earned.get(uid)?.get(p) || { mf: 0, partner: 0 };
+              const pdSplit = paid.get(uid)?.get(p) || { mf: 0, partner: 0 };
               const tot = e.mf + e.partner;
-              const pd = paid.get(uid)?.get(p) || 0;
-              const carriedIn = running;
+              const pd = pdSplit.mf + pdSplit.partner;
+              const carriedIn = running, carriedInMf = runMf, carriedInPartner = runPartner;
               running += tot - pd;
-              const tax = taxFor(uid, p, Math.round(tot * 100) / 100);
+              runMf += e.mf - pdSplit.mf;
+              runPartner += e.partner - pdSplit.partner;
+              const tax = taxFor(uid, p, r2(tot));
               return {
                 period: p,
-                mf: Math.round(e.mf * 100) / 100,
-                partner: Math.round(e.partner * 100) / 100,
-                earned: Math.round(tot * 100) / 100,
-                paid: Math.round(pd * 100) / 100,
-                carriedIn: Math.round(carriedIn * 100) / 100,
-                outstanding: Math.round(running * 100) / 100,
+                mf: r2(e.mf),
+                partner: r2(e.partner),
+                earned: r2(tot),
+                paid: r2(pd),
+                paidMf: r2(pdSplit.mf),
+                paidPartner: r2(pdSplit.partner),
+                carriedIn: r2(carriedIn),
+                carriedInMf: r2(carriedInMf),
+                carriedInPartner: r2(carriedInPartner),
+                outstanding: r2(running),
+                outstandingMf: r2(runMf),
+                outstandingPartner: r2(runPartner),
                 ...tax,
               };
             }).filter(m => m.earned !== 0 || m.paid !== 0 || m.carriedIn !== 0);
