@@ -3,15 +3,9 @@ name: Deploy Backend
 # Ships server.js (the live entrypoint - index.js is retired) and src/ to Hostinger.
 # Mirrors the manual steps in DEPLOY.md.
 
+# RETIRED 2026-10-02: production moved to AWS (see deploy-aws.yml). Kept as a
+# manual-only fallback in case nflx.in is ever pointed back at Hostinger.
 on:
-  push:
-    branches: [main]
-    paths:
-      - 'server.js'
-      - 'src/**'
-      - 'package.json'
-      - 'package-lock.json'
-      - '.github/workflows/deploy-backend.yml'
   workflow_dispatch:
 
 concurrency:

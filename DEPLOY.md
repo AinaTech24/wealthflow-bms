@@ -1,5 +1,29 @@
 # WealthFlow BMS — Deployment (single source of truth)
 
+## Production is on AWS (since 2026-10-02)
+
+| Piece | Where |
+|---|---|
+| Domain | nflx.in → A record `16.4.86.199` (DNS still managed in Hostinger hPanel; email/MX stays on Hostinger Mail) |
+| App server | EC2 `wealthflow-prod` (t3.large, Ubuntu 24.04, ap-south-1a), app in `/home/ubuntu/wealthflow`, run by pm2 as `wealthflow`, nginx in front, Let's Encrypt HTTPS (auto-renews) |
+| Database | RDS MariaDB 11.8 `wealthflow-db` (private, TLS required). Password lives in AWS Secrets Manager and the server's `.env` only |
+| Backups | RDS automated backups (7 days); the deploy script keeps the last 5 code versions in `/home/ubuntu/backups` |
+
+**Deploying:** push to `main`. `.github/workflows/deploy-aws.yml` runs the backend
+tests, builds the frontend, ships both, reloads pm2 and checks
+`https://nflx.in/api/health`. If the new version cannot reach the database,
+`scripts/aws-deploy.sh` restores the previous one automatically. It can also be
+run by hand from the Actions tab.
+
+**SSH by hand:** `ssh -i ~/.ssh/wealthflow-key.pem ubuntu@16.4.86.199`. Port 22 only
+accepts the admin IP listed in security group `wealthflow-web-sg`; if your IP
+changes, update that rule.
+
+Everything below describes the old Hostinger setup. Its two workflows are now
+manual-only and kept as a fallback.
+
+---
+
 > This file supersedes every other deploy guide and package folder in this repo.
 > If you find `DEPLOYMENT_GUIDE.md`, `FINAL_*`, `deploy_*`, or any `*.zip` — they are
 > **obsolete**. Do not use them.

@@ -1,5 +1,6 @@
 import mysql from 'mysql2/promise';
 import dotenv from 'dotenv';
+import fs from 'fs';
 import path from 'path';
 import { fileURLToPath } from 'url';
 
@@ -25,11 +26,22 @@ console.log('USER:', process.env.DB_USER || 'NOT SET');
 console.log('DB:', process.env.DB_NAME || 'NOT SET');
 console.log('-----------------------');
 
+// TLS to the database. AWS RDS refuses unencrypted connections
+// (require_secure_transport=ON), so there DB_SSL_CA points at the RDS CA bundle
+// and the server certificate is verified. Unset (Hostinger, local), the
+// connection stays exactly as it was.
+let ssl;
+if (process.env.DB_SSL_CA) {
+  ssl = { ca: fs.readFileSync(process.env.DB_SSL_CA, 'utf8'), rejectUnauthorized: true };
+  console.log(`🔒 DB TLS on (CA: ${process.env.DB_SSL_CA})`);
+}
+
 /**
  * DATABASE CONNECTION POOL
- * Configured for Hostinger Premium Shared Hosting
+ * Hostinger shared hosting, or AWS RDS when DB_SSL_CA is set.
  */
 const pool = mysql.createPool({
+  ssl,
   host: process.env.DB_HOST || '127.0.0.1',
   port: parseInt(process.env.DB_PORT || '3306'),
   user: process.env.DB_USER || 'root',

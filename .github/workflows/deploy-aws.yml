@@ -1,0 +1,166 @@
+name: Deploy to AWS (production)
+
+# Every push to main that touches the app tests it, builds the frontend, and ships
+# both to the EC2 server behind https://nflx.in. The server keeps the last five
+# versions and rolls back on its own if the new one cannot reach the database
+# (see scripts/aws-deploy.sh).
+#
+# SSH on the server is closed to the internet. This job opens port 22 to the
+# runner's own IP for the length of the deploy and closes it again afterwards,
+# whatever happens. AWS access is a short-lived role (GitHub OIDC), so no AWS
+# keys are stored in GitHub.
+#
+# One-time setup (repo → Settings → Secrets and variables → Actions):
+#   AWS_DEPLOY_ROLE_ARN  IAM role this workflow assumes (can edit the web SG only)
+#   EC2_SSH_KEY          private key of the deploy key in ~ubuntu/.ssh/authorized_keys
+#   EC2_KNOWN_HOSTS      the server's host key line, so the runner never trusts a stranger
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'server.js'
+      - 'src/**'
+      - 'package.json'
+      - 'package-lock.json'
+      - 'Source Code/**'
+      - 'scripts/aws-deploy.sh'
+      - '.github/workflows/deploy-aws.yml'
+  workflow_dispatch:
+
+concurrency:
+  group: deploy-aws
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+  id-token: write
+
+env:
+  AWS_REGION: ap-south-1
+  EC2_HOST: 16.4.86.199
+  EC2_USER: ubuntu
+  WEB_SG_ID: sg-01d4376f826a3f007
+  HEALTH_URL: https://nflx.in/api/health
+
+jobs:
+  test:
+    name: Backend tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci --no-audit --no-fund
+      - run: npm test
+
+  build:
+    name: Build frontend
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: Source Code
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: Source Code/package-lock.json
+      - run: npm ci --no-audit --no-fund
+      - run: npm run build
+      - uses: actions/upload-artifact@v4
+        with:
+          name: frontend-dist
+          path: Source Code/dist
+          retention-days: 7
+
+  deploy:
+    name: Deploy to EC2
+    needs: [test, build]
+    runs-on: ubuntu-latest
+    environment: production
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: frontend-dist
+          path: dist
+
+      - name: Package the release
+        run: |
+          mkdir pkg
+          git archive HEAD | tar -x -C pkg
+          # The server runs the built bundle, not the React sources.
+          rm -rf "pkg/Source Code" pkg/public/assets
+          mkdir -p pkg/public
+          cp -r dist/. pkg/public/
+          tar -czf release.tgz -C pkg .
+          echo "Release: $(du -h release.tgz | cut -f1), bundle $(grep -oE 'assets/index-[A-Za-z0-9_.-]+\.js' pkg/public/index.html)"
+
+      - name: Check secrets are set
+        env:
+          ROLE: ${{ secrets.AWS_DEPLOY_ROLE_ARN }}
+          KEY: ${{ secrets.EC2_SSH_KEY }}
+          HOSTS: ${{ secrets.EC2_KNOWN_HOSTS }}
+        run: |
+          missing=""
+          [ -n "$ROLE" ]  || missing="$missing AWS_DEPLOY_ROLE_ARN"
+          [ -n "$KEY" ]   || missing="$missing EC2_SSH_KEY"
+          [ -n "$HOSTS" ] || missing="$missing EC2_KNOWN_HOSTS"
+          if [ -n "$missing" ]; then
+            echo "::error::Missing repository secrets:$missing (see the setup notes at the top of this workflow)"
+            exit 1
+          fi
+
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_DEPLOY_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Open SSH for this runner only
+        id: sg
+        run: |
+          ip=$(curl -fsS https://checkip.amazonaws.com | tr -d '[:space:]')
+          echo "ip=$ip" >> "$GITHUB_OUTPUT"
+          aws ec2 authorize-security-group-ingress --group-id "$WEB_SG_ID" \
+            --ip-permissions "IpProtocol=tcp,FromPort=22,ToPort=22,IpRanges=[{CidrIp=$ip/32,Description=github-actions-run-${{ github.run_id }}}]"
+          echo "Port 22 opened for $ip"
+
+      - name: Configure SSH
+        env:
+          KEY: ${{ secrets.EC2_SSH_KEY }}
+          HOSTS: ${{ secrets.EC2_KNOWN_HOSTS }}
+        run: |
+          install -m 700 -d ~/.ssh
+          printf '%s\n' "$KEY" > ~/.ssh/deploy_key
+          chmod 600 ~/.ssh/deploy_key
+          printf '%s\n' "$HOSTS" > ~/.ssh/known_hosts
+          chmod 644 ~/.ssh/known_hosts
+
+      - name: Upload and deploy
+        run: |
+          SSH="ssh -i ~/.ssh/deploy_key -o StrictHostKeyChecking=yes -o ConnectTimeout=20"
+          for i in 1 2 3 4 5; do $SSH "$EC2_USER@$EC2_HOST" true && break; echo "waiting for SSH ($i)"; sleep 5; done
+          scp -i ~/.ssh/deploy_key -o StrictHostKeyChecking=yes release.tgz "$EC2_USER@$EC2_HOST:/tmp/release.tgz"
+          $SSH "$EC2_USER@$EC2_HOST" 'bash -s' < scripts/aws-deploy.sh
+
+      - name: Public health check
+        run: |
+          for i in $(seq 1 10); do
+            body=$(curl -fsS -m 10 "$HEALTH_URL" || true)
+            if echo "$body" | grep -q '"database":"connected"'; then echo "✅ $HEALTH_URL → $body"; exit 0; fi
+            sleep 5
+          done
+          echo "::error::$HEALTH_URL did not report a connected database"
+          exit 1
+
+      - name: Close SSH again
+        if: always() && steps.sg.outputs.ip != ''
+        run: |
+          aws ec2 revoke-security-group-ingress --group-id "$WEB_SG_ID" \
+            --ip-permissions "IpProtocol=tcp,FromPort=22,ToPort=22,IpRanges=[{CidrIp=${{ steps.sg.outputs.ip }}/32}]"
+          echo "Port 22 closed for ${{ steps.sg.outputs.ip }}"

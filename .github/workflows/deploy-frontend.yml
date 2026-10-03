@@ -3,12 +3,9 @@ name: Deploy Frontend
 # Builds the SPA in "Source Code/" and ships dist/ to the Hostinger web root.
 # Mirrors the manual steps in DEPLOY.md.
 
+# RETIRED 2026-10-02: production moved to AWS (see deploy-aws.yml). Kept as a
+# manual-only fallback in case nflx.in is ever pointed back at Hostinger.
 on:
-  push:
-    branches: [main]
-    paths:
-      - 'Source Code/**'
-      - '.github/workflows/deploy-frontend.yml'
   workflow_dispatch:
 
 concurrency:
