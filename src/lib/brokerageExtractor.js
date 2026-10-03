@@ -928,6 +928,100 @@ export function extractColumnarRows(rawText, amcName, sourceFile) {
     return rows;
 }
 
+/**
+ * Cards that price each scheme over a TENURE GRID — qsif (quant's SIF) is the
+ * first of them.
+ *
+ * The scheme name is spread over two or three lines, then one row per holding
+ * period, each carrying nine numbers: three AUM slabs (BASE PLUS, BASE, OPEN)
+ * times three figures (without GST, GST, total). pdf-parse flattens all of it,
+ * and the ordinals arrive in pieces — "1", "st", "Year 0.97 0.18 …" on three
+ * separate lines:
+ *
+ *     qsif Equity
+ *     Long Short Fund
+ *     (Equity)
+ *     1
+ *     st
+ *     Year 0.97 0.18 1.15 0.78 0.14 0.92 0.63 0.11 0.74
+ *
+ * The generic line reader needs a name and a rate on ONE line, so it found three
+ * fragments in a five-scheme document and glued them to the wrong names — the
+ * review screen offered "Long Short Fund qsif Equity Ex-Top Fund (" at 0.97.
+ *
+ * The rate taken is the FIRST number of the FIRST tenure row: the first slab's
+ * figure before GST, which is what this master stores everywhere else. Every
+ * slab is kept in rawLine so the choice can be checked against the card.
+ */
+export function extractTenureGridRows(rawText, amcName, sourceFile) {
+    const lines = (rawText || "").split("\n").map(l => String(l).replace(/\s+/g, " ").trim());
+
+    const ORDINAL = /^\d{1,2}$/;
+    const SUFFIX = /^(st|nd|rd|th)$/i;
+    const TENURE = /^years?\b/i;
+    const numbersIn = (l) => (String(l).match(/\d+\.\d{1,3}/g) || []).map(Number);
+    // Prose, footers and the column headers that sit above the grid.
+    const NOISE = /^(category|investment|strategy|period|without|gst|amt|total|onwards|base|open|document|communication|notes?|applicable|in case of|\*|registered office)/i;
+
+    const schemes = [];
+    let name = [];
+
+    for (let i = 0; i < lines.length; i++) {
+        const l = lines[i];
+        if (!l) continue;
+
+        // A tenure marker: "1" + "st" + "Year …" across three lines.
+        if (ORDINAL.test(l) && SUFFIX.test(lines[i + 1] || "") && TENURE.test(lines[i + 2] || "")) {
+            let nums = numbersIn(lines[i + 2]);
+            let j = i + 2;
+            // "3rd Years / onwards* / 0.89 0.16 …" puts the figures further down.
+            while (nums.length < 3 && j + 1 < lines.length && j < i + 5) {
+                j++;
+                nums = numbersIn(lines[j]);
+            }
+            const label = `${l}${lines[i + 1]}`;
+            if (nums.length >= 3 && name.length) {
+                schemes.push({ name: name.join(" ").trim(), label, nums });
+                name = [];                      // later tenures belong to this scheme
+            }
+            i = j;
+            continue;
+        }
+
+        // Anything else is either part of a scheme name or noise.
+        if (NOISE.test(l)) { name = []; continue; }
+        if (numbersIn(l).length >= 3) continue;             // a stray figures row
+        if (l.length < 3 || l.length > 80) continue;
+        name.push(l);
+        if (name.length > 4) name.shift();                  // names run to three lines
+    }
+
+    // Only claim this layout when it is unmistakable. Two schemes priced over a
+    // grid is a grid; one is a coincidence another reader probably handles better.
+    if (schemes.length < 2) return [];
+
+    const rows = [];
+    for (const s of schemes) {
+        const rate = s.nums[0];
+        if (!(rate >= 0) || rate > 10) continue;
+        // The card puts the asset class on its own line under the name. Read the
+        // category from it, then drop it: leaving it on some names and not others
+        // would file one scheme under two keys in the master.
+        const bare = s.name.replace(/\s*\((equity|hybrid|debt|liquid|arbitrage)\)\s*$/i, "").trim();
+        const cleaned = cleanSchemeName(bare) || bare;
+        if (!cleaned || cleaned.length < 5) continue;
+        rows.push({
+            amcName,
+            schemeName: cleaned,
+            trailRate: rate,
+            category: guessCategory(s.name),
+            sourceFile,
+            rawLine: `${s.name} | ${s.label} | slabs: ${s.nums.join(" ")}`,
+        });
+    }
+    return rows;
+}
+
 export function extractBrokerageRowsFromText(rawText, amcName, sourceFile) {
     try {
         let lines = (rawText || "").split("\n").map(normalizeSpaces).filter(l => l.length > 0);
@@ -1133,13 +1227,21 @@ export async function extractBrokerageRowsFromPdfBuffer(buffer, amcName, sourceF
         rowsC = extractColumnarRows(data.text || "", amcName, sourceFile);
     } catch (_) { /* source A already logged the parse failure */ }
 
+    // Source D: tenure-grid cards (qsif), where the name spans several lines and
+    // the rates sit in a holding-period grid beneath it.
+    let rowsD = [];
+    try {
+        const data = await pdf(buffer);
+        rowsD = extractTenureGridRows(data.text || "", amcName, sourceFile);
+    } catch (_) { /* source A already logged the parse failure */ }
+
     // Rank by DISTINCT schemes, not row count. Helios' card gave pdf-parse 33 rows
     // carrying only 2 names — the rates were right but every one had been glued to
     // the wrong text — and that beat the 8 correct rows the other reader produced.
     const distinct = (rows) => new Set(rows.map(r => String(r.schemeName || "").toUpperCase().replace(/[^A-Z0-9]/g, ""))).size;
-    const cands = [["pdf-parse", rowsA], ["pdfjs-rows", rowsB], ["columnar", rowsC]];
+    const cands = [["pdf-parse", rowsA], ["pdfjs-rows", rowsB], ["columnar", rowsC], ["tenure-grid", rowsD]];
     let [label, winner] = cands[0];
     for (const [l, r] of cands.slice(1)) if (distinct(r) > distinct(winner)) { label = l; winner = r; }
-    console.log(`✅ [Extractor] ${amcName}: pdf-parse=${distinct(rowsA)}, pdfjs-rows=${distinct(rowsB)}, columnar=${distinct(rowsC)} distinct → using ${label} (${distinct(winner)} schemes)`);
+    console.log(`✅ [Extractor] ${amcName}: pdf-parse=${distinct(rowsA)}, pdfjs-rows=${distinct(rowsB)}, columnar=${distinct(rowsC)}, tenure-grid=${distinct(rowsD)} distinct → using ${label} (${distinct(winner)} schemes)`);
     return winner;
 }

@@ -9,7 +9,7 @@
 // found by reading the PDF by hand. Each case below is a shape that has broken (or
 // could plausibly break) in production — run this before shipping any change to
 // brokerageExtractor.js. A scheme that must parse, and boilerplate that must NOT.
-import { extractBrokerageRowsFromText } from './brokerageExtractor.js';
+import { extractBrokerageRowsFromText, extractTenureGridRows } from './brokerageExtractor.js';
 
 let pass = 0, fail = 0;
 
@@ -145,6 +145,114 @@ shouldSkip('Motilal Oswal Flexi Cap Fund 70 13 83 70 13 83 210 39 249');
 // 600 bps = 6% p.a., past the 5% ceiling extractPercentages() enforces.
 bpsSkip('Motilal Oswal Impossible Fund 600 108 708');
 
+
+
+// ── Tenure-grid cards (qsif) ────────────────────────────────────────────────
+// Verbatim from qsif.pdf as pdf-parse reads it: the scheme name over three
+// lines, then a row per holding period carrying nine figures — three AUM slabs
+// times (without GST, GST, total). The ordinals arrive in pieces, "1" / "st" /
+// "Year 0.97 …", which is why the line reader found three fragments in a
+// five-scheme card and offered "Long Short Fund qsif Equity Ex-Top Fund (".
+const QSIF = `Category BASE PLUS BASE OPEN
+Investment
+Strategy
+Period
+Without
+GST
+GST
+Amt
+Total
+qsif Equity
+Long Short Fund
+(Equity)
+1
+st
+ Year 0.97 0.18 1.15 0.78 0.14 0.92 0.63 0.11 0.74
+2
+nd
+ Years 0.97 0.18 1.15 0.78 0.14 0.92 0.63 0.11 0.74
+3
+rd
+ Years
+onwards*
+0.89 0.16 1.05 0.69 0.13 0.82 0.54 0.10 0.64
+qsif Equity Ex-Top
+100 Long Short
+Fund (Equity)
+1
+st
+ Year 1.23 0.22 1.45 0.98 0.18 1.16 0.80 0.14 0.94
+2
+nd
+ Years 1.23 0.22 1.45 0.98 0.18 1.16 0.80 0.14 0.94
+3
+rd
+ Years
+onwards*
+1.14 0.21 1.35 0.90 0.16 1.06 0.71 0.13 0.84
+qsif Hybrid
+Long Short Fund
+(Hybrid)
+1
+st
+ Year 1.06 0.19 1.25 0.85 0.15 1.00 0.68 0.12 0.80
+2
+nd
+ Years 1.06 0.19 1.25 0.85 0.15 1.00 0.68 0.12 0.80
+3
+rd
+ Years
+onwards*
+0.97 0.18 1.15 0.76 0.14 0.9 0.59 0.11 0.70`;
+
+{
+  const rows = extractTenureGridRows(QSIF, 'QSIF', 'qsif.pdf');
+  const want = [
+    ['qsif equity long short fund', 0.97, 'Equity'],
+    ['ex-top', 1.23, 'Equity'],
+    ['qsif hybrid long short fund', 1.06, 'Hybrid'],
+  ];
+  if (rows.length !== want.length) {
+    console.log(`  FAIL  tenure grid: ${rows.length} rows, expected ${want.length}`);
+    for (const r of rows) console.log(`        got ${r.trailRate}% ${r.schemeName}`);
+    fail++;
+  } else {
+    let ok = true;
+    want.forEach(([frag, rate, cat], i) => {
+      const r = rows[i];
+      if (!r.schemeName.toLowerCase().includes(frag)) {
+        console.log(`  FAIL  tenure grid row ${i}: "${r.schemeName}" missing "${frag}"`); ok = false;
+      } else if (Math.abs(r.trailRate - rate) > 0.001) {
+        console.log(`  FAIL  tenure grid row ${i}: rate ${r.trailRate} != ${rate}`); ok = false;
+      } else if (r.category !== cat) {
+        console.log(`  FAIL  tenure grid row ${i}: category ${r.category} != ${cat}`); ok = false;
+      }
+    });
+    ok ? pass++ : fail++;
+  }
+
+  // The FIRST tenure's FIRST slab is the rate — never a later year, and never
+  // the GST-inclusive total sitting beside it.
+  const r0 = rows[0];
+  if (r0 && (r0.trailRate === 0.89 || r0.trailRate === 1.15)) {
+    console.log(`  FAIL  tenure grid took ${r0.trailRate} — that is a later year or the GST-inclusive total`); fail++;
+  } else pass++;
+
+  // A trailing "(Equity)" must not survive on some names and not others, or one
+  // scheme files itself under two keys in the master.
+  if (rows.some(r => /\((equity|hybrid|debt)\)\s*$/i.test(r.schemeName))) {
+    console.log('  FAIL  tenure grid left an asset-class suffix on a scheme name'); fail++;
+  } else pass++;
+}
+
+// One scheme priced over a grid is a coincidence, not this layout — the reader
+// must stand aside so a better-suited one wins.
+{
+  const ONE = `Some Fund\n(Equity)\n1\nst\n Year 0.97 0.18 1.15`;
+  if (extractTenureGridRows(ONE, 'X', 't.pdf').length !== 0) {
+    console.log('  FAIL  tenure grid claimed a single-scheme document'); fail++;
+  } else pass++;
+}
 
 console.log(`\n${pass} passed, ${fail} failed`);
 process.exit(fail ? 1 : 0);
