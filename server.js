@@ -2981,18 +2981,18 @@ app.all('/api/data', mutationLimiter, async (req, res) => {
           // most-seen name winning — a folio's own statements are the only
           // first-hand evidence of whose it is.
           const topInvestor = new Map();
-          const folioKeys = conflicted.map(([f]) => f);
-          for (let i = 0; i < folioKeys.length; i += 400) {
-            const chunk = folioKeys.slice(i, i + 400);
-            const [rows] = await pool.query(
-              `SELECT JSON_UNQUOTE(JSON_EXTRACT(data,'$.folio')) folio, investorName, COUNT(*) n
-                 FROM transactions
-                WHERE JSON_UNQUOTE(JSON_EXTRACT(data,'$.folio')) IN (${chunk.map(() => '?').join(',')})
-                GROUP BY 1, 2`, chunk);
-            for (const r of rows) {
-              const cur = topInvestor.get(r.folio);
-              if (!cur || Number(r.n) > cur.n) topInvestor.set(r.folio, { name: r.investorName || '', n: Number(r.n) });
-            }
+          const wanted = new Set(conflicted.map(([f]) => f));
+          // ONE pass over the table, filtered in Node. The earlier version ran a
+          // fresh full scan per 400 folios; with hundreds of conflicted folios that
+          // is minutes on 6 lakh rows, long enough for the proxy to give up and the
+          // page to reload — which looked like the button "sent me home".
+          const [rows] = await pool.query(
+            `SELECT JSON_UNQUOTE(JSON_EXTRACT(data,'$.folio')) folio, investorName, COUNT(*) n
+               FROM transactions GROUP BY 1, 2`);
+          for (const r of rows) {
+            if (!wanted.has(r.folio)) continue;
+            const cur = topInvestor.get(r.folio);
+            if (!cur || Number(r.n) > cur.n) topInvestor.set(r.folio, { name: r.investorName || '', n: Number(r.n) });
           }
 
           const resolved = [], unresolved = [];

@@ -1060,6 +1060,10 @@ export const Settings: React.FC<SettingsProps> = ({ currentUser }) => {
                                         const j = await r.json();
                                         if (!r.ok) { showToast(j?.error || 'Check failed.', 'error'); return; }
                                         setFolioResult(j);
+                                    } catch (e: any) {
+                                        // A timeout or a proxy error page is not JSON. Say so
+                                        // rather than failing silently.
+                                        showToast(`Check did not finish (${e?.message || 'no response'}). Nothing was changed.`, 'error');
                                     } finally { setFolioBusy(false); }
                                 }}
                                 disabled={folioBusy}
@@ -1088,6 +1092,8 @@ export const Settings: React.FC<SettingsProps> = ({ currentUser }) => {
                                         if (!r.ok) { showToast(j?.error || 'Clean-up failed.', 'error'); return; }
                                         setFolioResult(j);
                                         showToast(`Removed ${j.foliosRemoved} claim(s) from ${j.recordsChanged} client record(s).`, 'success');
+                                    } catch (e: any) {
+                                        showToast(`Clean-up did not finish (${e?.message || 'no response'}). Run Check only again to see what is left.`, 'error');
                                     } finally { setFolioBusy(false); }
                                 }}
                                 disabled={folioBusy || !folioResult || !folioResult.claimsToRemove}
