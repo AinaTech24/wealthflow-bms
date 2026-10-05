@@ -1,0 +1,102 @@
+name: Reconciliation diagnostic (read-only)
+
+# Runs scripts/diagnose.mjs ON the production server and prints the answer to this
+# log. Every statement in that script is a SELECT; nothing is written, nothing is
+# deployed, the app is not restarted.
+#
+# WHY IT EXISTS
+# The EC2 key is a GitHub secret, which is write-only by design — no workstation
+# can read it, so nobody can reach the database from their laptop to answer
+# "which investor is the ₹35 sitting under MSA?". This job can, using the same
+# secret the deploy uses, without the key ever leaving GitHub.
+#
+# Manual only. It is never triggered by a push.
+
+on:
+  workflow_dispatch:
+    inputs:
+      period:
+        description: 'Brokerage period to examine (YYYY-MM)'
+        required: true
+        default: '2026-08'
+
+concurrency:
+  group: diagnose
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+  id-token: write
+
+env:
+  AWS_REGION: ap-south-1
+  EC2_HOST: 16.4.86.199
+  EC2_USER: ubuntu
+  WEB_SG_ID: sg-01d4376f826a3f007
+  APP_DIR: /home/ubuntu/wealthflow
+
+jobs:
+  diagnose:
+    name: Read the live figures
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Check the secrets are present
+        env:
+          ROLE: ${{ secrets.AWS_DEPLOY_ROLE_ARN }}
+          KEY: ${{ secrets.EC2_SSH_KEY }}
+          HOSTS: ${{ secrets.EC2_KNOWN_HOSTS }}
+        run: |
+          missing=""
+          [ -n "$ROLE" ]  || missing="$missing AWS_DEPLOY_ROLE_ARN"
+          [ -n "$KEY" ]   || missing="$missing EC2_SSH_KEY"
+          [ -n "$HOSTS" ] || missing="$missing EC2_KNOWN_HOSTS"
+          if [ -n "$missing" ]; then
+            echo "::error::Missing repository secrets:$missing"
+            exit 1
+          fi
+
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_DEPLOY_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Open SSH for this runner only
+        id: sg
+        run: |
+          ip=$(curl -fsS https://checkip.amazonaws.com | tr -d '[:space:]')
+          echo "ip=$ip" >> "$GITHUB_OUTPUT"
+          aws ec2 authorize-security-group-ingress --group-id "$WEB_SG_ID" \
+            --ip-permissions "IpProtocol=tcp,FromPort=22,ToPort=22,IpRanges=[{CidrIp=$ip/32,Description=github-actions-diagnose-${{ github.run_id }}}]"
+          echo "Port 22 opened for $ip"
+
+      - name: Configure SSH
+        env:
+          KEY: ${{ secrets.EC2_SSH_KEY }}
+          HOSTS: ${{ secrets.EC2_KNOWN_HOSTS }}
+        run: |
+          install -m 700 -d ~/.ssh
+          printf '%s\n' "$KEY" > ~/.ssh/deploy_key
+          chmod 600 ~/.ssh/deploy_key
+          printf '%s\n' "$HOSTS" > ~/.ssh/known_hosts
+          chmod 644 ~/.ssh/known_hosts
+
+      - name: Run the diagnostic on the server
+        run: |
+          SSH="ssh -i ~/.ssh/deploy_key -o StrictHostKeyChecking=yes -o ConnectTimeout=20"
+          for i in 1 2 3 4 5; do $SSH "$EC2_USER@$EC2_HOST" true && break; echo "waiting for SSH ($i)"; sleep 5; done
+          # Sent to a temp path and removed afterwards — the deployed app is not touched.
+          scp -i ~/.ssh/deploy_key -o StrictHostKeyChecking=yes \
+            scripts/diagnose.mjs "$EC2_USER@$EC2_HOST:/tmp/diagnose.mjs"
+          $SSH "$EC2_USER@$EC2_HOST" \
+            "cp /tmp/diagnose.mjs $APP_DIR/scripts/_diagnose.mjs && \
+             cd $APP_DIR && node scripts/_diagnose.mjs '${{ inputs.period }}'; \
+             rc=\$?; rm -f $APP_DIR/scripts/_diagnose.mjs /tmp/diagnose.mjs; exit \$rc"
+
+      - name: Close SSH again
+        if: always() && steps.sg.outputs.ip != ''
+        run: |
+          aws ec2 revoke-security-group-ingress --group-id "$WEB_SG_ID" \
+            --ip-permissions "IpProtocol=tcp,FromPort=22,ToPort=22,IpRanges=[{CidrIp=${{ steps.sg.outputs.ip }}/32}]"
+          echo "Port 22 closed for ${{ steps.sg.outputs.ip }}"
