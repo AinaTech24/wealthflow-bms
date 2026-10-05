@@ -8,6 +8,8 @@ import express from 'express';
 import compression from 'compression';
 import cors from 'cors';
 import pool from './src/lib/db.js';
+// Shared with the importer — see src/lib/nameMatch.js for why there is only one copy.
+import { nameTokens } from './src/lib/nameMatch.js';
 import bcrypt from 'bcrypt';
 import jwt from 'jsonwebtoken';
 import rateLimit from 'express-rate-limit';
@@ -1950,11 +1952,11 @@ app.all('/api/data', mutationLimiter, async (req, res) => {
           //     ignore. What actually marks a catch-all is investors with no name
           //     in common at all (the Amit Menghani record held Thilak, Poosari,
           //     Desai, Singh and Keswani). That rule takes August from 28 to 1.
-          const STOP = new Set(['KUMAR', 'HUF', 'REP', 'BY', 'MR', 'MRS', 'SHRI', 'SMT', 'DEVI', 'LATE']);
-          const nameTokens = s => new Set(String(s || '').toUpperCase()
-            .replace(/\bREP(RESENTED)?\s+BY\b.*$/, '')
-            .replace(/[^A-Z\s]/g, ' ')
-            .split(/\s+/).filter(t => t.length > 2 && !STOP.has(t)));
+          //     The rule itself lives in src/lib/nameMatch.js, shared with the
+          //     IMPORTER, which uses it to decide whose client a folio belongs to.
+          //     Two copies would drift, and the difference between what the
+          //     importer attributes and what this check reports is money paid to
+          //     the wrong person that nothing flags.
           const [investorRows] = await pool.query(
             `SELECT mappedClientId cid, investorName, ROUND(SUM(grossAmount),2) gross
              FROM transactions WHERE brokeragePeriod = ? AND mappedClientId IS NOT NULL

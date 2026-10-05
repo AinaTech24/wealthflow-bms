@@ -9,7 +9,7 @@
     "build": "echo 'Frontend pre-built in public folder'",
     "test:extractor": "node src/lib/extractor.test.mjs",
     "test:rates": "node src/lib/effectiveRates.test.mjs",
-    "test": "node src/lib/extractor.test.mjs && node src/lib/effectiveRates.test.mjs && node src/lib/clawback.test.mjs && node src/lib/residual.test.mjs && node src/lib/pgCompat.test.mjs",
+    "test": "node src/lib/nameMatch.test.mjs && node src/lib/extractor.test.mjs && node src/lib/effectiveRates.test.mjs && node src/lib/clawback.test.mjs && node src/lib/residual.test.mjs && node src/lib/pgCompat.test.mjs",
     "test:residual": "node src/lib/residual.test.mjs",
     "test:pg": "node src/lib/pgCompat.test.mjs",
     "pg:audit": "node tools/pgAudit.mjs"

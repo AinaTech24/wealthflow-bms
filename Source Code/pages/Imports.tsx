@@ -12,6 +12,7 @@ import { runBatchCalculation } from '../services/calculationService';
 import { Pagination } from '../components/Pagination';
 import { useToast } from '../components/Toast';
 
+import { nameContradicts } from '../../src/lib/nameMatch.js';
 interface ImportsProps {
   currentUser: TeamMember;
 }
@@ -813,6 +814,18 @@ export const Imports: React.FC<ImportsProps> = ({ currentUser }) => {
       //    client import that's 10M+ ops (the cause of the long wait).
       const clientByPan = new Map<string, Client>();
       const clientByFolio = new Map<string, Client>();
+      /** Every client record claiming a folio — see where it is filled. */
+      const clientsByFolio = new Map<string, Client[]>();
+
+      // ── Does this client's NAME agree with the investor on the row? ─────────
+      // Folio is the strongest mapping key, but only when the record claiming it
+      // is plausibly the same person. One record ("Amit Parshotam Menghani") had
+      // collected ten folios belonging to six other investors, and because folio
+      // is consulted first it quietly took ₹1,137.10 a month off RAVISANKAR K K
+      // and Vinubhai Nathubhai Desai and gave it to Mahek Haresh Chugh.
+      //
+      // Tokens shorter than three letters and the words below carry no identity —
+      // half the book shares "KUMAR" — so they are never evidence of a match.
       // Name index for auto-inheriting the RM on a brand-new folio: a folio not
       // yet on file, whose investor NAME uniquely matches one existing client,
       // is attached to that client so its brokerage follows the client's RM
@@ -857,7 +870,19 @@ export const Imports: React.FC<ImportsProps> = ({ currentUser }) => {
           const pk = p + '|' + nameKey(c.name);
           if (!clientByPanName.has(pk)) clientByPanName.set(pk, c);
         }
-        for (const f of (c.folios || [])) clientByFolio.set(f, c);
+        // Keep EVERY record that claims a folio, not just the last one seen.
+        //
+        // `clientByFolio.set(f, c)` let the last writer win, and folio lists are
+        // polluted: single folios are claimed by 80+ client records. So the winner
+        // was whichever record happened to come last in `clients` — arbitrary, and
+        // different between imports. That is why attribution moved on its own from
+        // one month to the next, and why deleting a month and re-importing it
+        // reproduced the same misattribution every time.
+        for (const f of (c.folios || [])) {
+          if (!clientsByFolio.has(f)) clientsByFolio.set(f, []);
+          clientsByFolio.get(f)!.push(c);
+          clientByFolio.set(f, c);          // kept for the enrichment paths below
+        }
         const nn = normName(c.name);
         if (nn && nn !== 'unknown') {
           clientByName.set(nn, clientByName.has(nn) ? null : c);
@@ -1027,8 +1052,27 @@ export const Imports: React.FC<ImportsProps> = ({ currentUser }) => {
         // PAN is only trusted when the NAME also matches, or when that PAN has
         // exactly one client on file (no family sharing it).
         const panOwners = effectivePan ? (clientsByPan.get(effectivePan) || []) : [];
+
+        // Resolve the folio against EVERY record claiming it, and let the investor
+        // name break the tie. One claimant is used unless the name flatly
+        // contradicts it; several claimants are only resolved when exactly one
+        // agrees with the name. Anything still ambiguous yields no folio match, so
+        // the row falls through to PAN/name and, failing that, stays unmapped.
+        //
+        // Unmapped is the right failure: it is visible on this page and reaches
+        // nobody, whereas a confident wrong guess reaches the wrong person's payout
+        // and nothing says so.
+        const folioClaimants = folio ? (clientsByFolio.get(folio) || []) : [];
+        let folioMatch: Client | undefined;
+        if (folioClaimants.length === 1) {
+          folioMatch = nameContradicts(folioClaimants[0].name, investorName) ? undefined : folioClaimants[0];
+        } else if (folioClaimants.length > 1) {
+          const agree = folioClaimants.filter(c => !nameContradicts(c.name, investorName));
+          folioMatch = agree.length === 1 ? agree[0] : undefined;
+        }
+
         let matchedClient: Client | undefined =
-          (folio ? clientByFolio.get(folio) : undefined) ||
+          folioMatch ||
           (effectivePan ? clientByPanName.get(effectivePan + '|' + nameKey(investorName)) : undefined) ||
           (panOwners.length === 1 ? panOwners[0] : undefined);
 
