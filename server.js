@@ -2457,155 +2457,15 @@ app.all('/api/data', mutationLimiter, async (req, res) => {
       //    content hash, so re-importing the same statement updates rows in place
       //    instead of doubling the month — a statement that gets re-sent with a
       //    correction must not be able to double anyone's revenue.
-      if (action === 'partner_import') {
-        if (!canMutate(req, action)) return res.status(403).json({ error: 'Admin privileges required' });
-        try {
-          const partner = String(payload?.partner || '').trim().toUpperCase();
-          const fileName = String(payload?.fileName || '').trim();
-          const rows = Array.isArray(payload?.rows) ? payload.rows : [];
-          if (!partner) return res.status(400).json({ error: 'partner is required' });
-          if (!rows.length) return res.status(400).json({ error: 'No rows to import' });
-
-          const batchId = `PB_${partner}_${Date.now()}`;
-          await pool.query(
-            `INSERT INTO batches (id, fileName, data) VALUES (?, ?, ?)
-             ON DUPLICATE KEY UPDATE fileName = VALUES(fileName), data = VALUES(data)`,
-            [batchId, fileName || `${partner} import`, JSON.stringify({ partner, kind: 'partner_brokerage', rowCount: rows.length })]);
-
-          // Codes already mapped attach themselves on the way in, so a second
-          // month's file lands pre-attributed and the mapping screen only ever
-          // shows what is genuinely new.
-          const [mapRows] = await pool.query(
-            `SELECT clientCode, clientId FROM partner_client_map WHERE partner = ?`, [partner]);
-          const codeToClient = new Map(mapRows.map(r => [String(r.clientCode), r.clientId]));
-
-          // Two genuinely separate trades can be identical in every column — same
-          // client, same day, same segment, same brokerage. On a pure content hash
-          // they collapse into one row and that second trade's money disappears
-          // silently. Counting occurrences keeps them apart while a re-import of
-          // the same statement still lands on the same ids.
-          const seen = new Map();
-          let written = 0;
-          for (let i = 0; i < rows.length; i += 400) {
-            const chunk = rows.slice(i, i + 400);
-            const values = [];
-            const params = [];
-            for (const r of chunk) {
-              const clientCode = String(r.clientCode || '').trim();
-              const tradeDate = r.tradeDate || null;
-              const period = String(r.period || '').slice(0, 7);
-              const key = `${partner}|${tradeDate}|${clientCode}|${r.segment || ''}|${r.tradeCategory || ''}|` +
-                          `${r.totalBrokerage || 0}|${r.ourShare || 0}|${r.partnerShare || 0}|${r.product || ''}|${r.parentProfile || ''}`;
-              const nth = (seen.get(key) || 0) + 1;
-              seen.set(key, nth);
-              const id = `${partner}_${period}_${hash53(nth > 1 ? `${key}#${nth}` : key)}`;
-              values.push('(?,?,?,?,?,?,?,?,?,?,?,?,?)');
-              params.push(
-                id, partner, batchId, tradeDate, period, clientCode,
-                r.segment || null, r.tradeCategory || null,
-                Number(r.totalBrokerage) || 0, Number(r.ourShare) || 0, Number(r.partnerShare) || 0,
-                codeToClient.get(clientCode) || null,
-                JSON.stringify(r.extra || {}));
-            }
-            const [res2] = await pool.query(
-              `INSERT INTO partner_brokerage
-                 (id, partner, batchId, tradeDate, period, clientCode, segment, tradeCategory,
-                  totalBrokerage, ourShare, partnerShare, mappedClientId, data)
-               VALUES ${values.join(',')}
-               ON DUPLICATE KEY UPDATE
-                 batchId = VALUES(batchId), tradeDate = VALUES(tradeDate), period = VALUES(period),
-                 segment = VALUES(segment), tradeCategory = VALUES(tradeCategory),
-                 totalBrokerage = VALUES(totalBrokerage), ourShare = VALUES(ourShare),
-                 partnerShare = VALUES(partnerShare), data = VALUES(data)`, params);
-            written += chunk.length;
-          }
-          const [[after]] = await pool.query(
-            `SELECT COUNT(*) rows_, COUNT(DISTINCT clientCode) codes,
-                    ROUND(SUM(ourShare),2) ourShare,
-                    SUM(mappedClientId IS NULL) unmapped
-             FROM partner_brokerage WHERE batchId = ?`, [batchId]);
-          await pool.query('INSERT INTO activity_log (userId, userName, action, description, createdAt) VALUES (?,?,?,?,NOW())',
-            [req.user?.id || '', req.user?.name || '', 'partner_import',
-             `${partner}: ${written} row(s) from ${fileName || 'upload'} — our share Rs ${after.ourShare}`]);
-          return res.json({ success: true, batchId, written, ...after });
-        } catch (e) {
-          console.error('[partner_import]', e);
-          return res.status(500).json({ error: e.message });
-        }
-      }
 
       // Attach a partner client code to one of our clients. Stored in the map so
       // future imports self-attribute, and backfilled onto rows already loaded.
       // Passing clientId as null unmaps the code again.
-      if (action === 'partner_map') {
-        if (!canMutate(req, action)) return res.status(403).json({ error: 'Admin privileges required' });
-        try {
-          const partner = String(payload?.partner || '').trim().toUpperCase();
-          const pairs = Array.isArray(payload?.pairs) ? payload.pairs : [];
-          if (!partner || !pairs.length) return res.status(400).json({ error: 'partner and pairs are required' });
-          let mapped = 0, rowsTouched = 0;
-          for (const p of pairs) {
-            const code = String(p.clientCode || '').trim();
-            if (!code) continue;
-            const clientId = p.clientId ? String(p.clientId) : null;
-            await pool.query(
-              `INSERT INTO partner_client_map (partner, clientCode, clientId, label)
-               VALUES (?,?,?,?)
-               ON DUPLICATE KEY UPDATE clientId = VALUES(clientId), label = VALUES(label)`,
-              [partner, code, clientId, p.label ? String(p.label).slice(0, 255) : null]);
-            const [r] = await pool.query(
-              `UPDATE partner_brokerage SET mappedClientId = ? WHERE partner = ? AND clientCode = ?`,
-              [clientId, partner, code]);
-            mapped++; rowsTouched += r.affectedRows || 0;
-          }
-          invalidateSummaryCache();
-          payoutOverviewCache = null;
-          await pool.query('INSERT INTO activity_log (userId, userName, action, description, createdAt) VALUES (?,?,?,?,NOW())',
-            [req.user?.id || '', req.user?.name || '', 'partner_map',
-             `${partner}: ${mapped} client code(s) mapped, ${rowsTouched} row(s) re-attributed`]);
-          return res.json({ success: true, mapped, rowsTouched });
-        } catch (e) {
-          console.error('[partner_map]', e);
-          return res.status(500).json({ error: e.message });
-        }
-      }
 
       // Record money actually paid to a person against a partner month. Payments
       // are append-only: a month settled in two instalments is two rows, and the
       // ledger adds them up. Deleting one is a deliberate act with its own action,
       // so a payment can never quietly change after it has been reported.
-      if (action === 'partner_pay') {
-        if (!canMutate(req, action)) return res.status(403).json({ error: 'Admin or Finance privileges required' });
-        try {
-          const partner = String(payload?.partner || '').trim().toUpperCase();
-          const period = String(payload?.period || '').slice(0, 7);
-          const userId = String(payload?.userId || '').trim();
-          const amount = Number(payload?.amount);
-          if (!partner || !period || !userId) return res.status(400).json({ error: 'partner, period and userId are required' });
-          if (!Number.isFinite(amount) || amount === 0) return res.status(400).json({ error: 'amount must be a non-zero number' });
-          const [[who]] = await pool.query(`SELECT name FROM team WHERE id = ?`, [userId]);
-          if (!who) return res.status(400).json({ error: 'No such team member' });
-          const id = `PS_${partner}_${period}_${userId}_${Date.now()}`;
-          await pool.query(
-            // One settlements table for every revenue source, so the Payouts page
-            // and this one can never disagree about what has been paid.
-            `INSERT INTO payout_settlements (id, source, period, userId, amount, paidOn, method, reference, note, createdBy)
-             VALUES (?,?,?,?,?,?,?,?,?,?)`,
-            [id, partner, period, userId, amount,
-             payload?.paidOn || new Date().toISOString().slice(0, 10),
-             payload?.method ? String(payload.method).slice(0, 40) : null,
-             payload?.reference ? String(payload.reference).slice(0, 120) : null,
-             payload?.note ? String(payload.note).slice(0, 500) : null,
-             req.user?.id || '']);
-          await pool.query('INSERT INTO activity_log (userId, userName, action, description, createdAt) VALUES (?,?,?,?,NOW())',
-            [req.user?.id || '', req.user?.name || '', 'partner_pay',
-             `${partner} ${period}: Rs ${amount} paid to ${who.name}`]);
-          return res.json({ success: true, id });
-        } catch (e) {
-          console.error('[partner_pay]', e);
-          return res.status(500).json({ error: e.message });
-        }
-      }
 
       if (action === 'partner_pay_delete') {
         if (!canMutate(req, action)) return res.status(403).json({ error: 'Admin or Finance privileges required' });
@@ -2629,37 +2489,6 @@ app.all('/api/data', mutationLimiter, async (req, res) => {
       // settled in instalments is several rows that the ledger adds up, so a
       // figure already reported to someone can never quietly change underneath
       // them. Removing one is its own action, and both are logged.
-      if (action === 'settle') {
-        if (!canMutate(req, action)) return res.status(403).json({ error: 'Admin or Finance privileges required' });
-        try {
-          const period = String(payload?.period || '').slice(0, 7);
-          const userId = String(payload?.userId || '').trim();
-          const amount = Number(payload?.amount);
-          const source = String(payload?.source || 'MF').trim().toUpperCase();
-          if (!period || !userId) return res.status(400).json({ error: 'period and userId are required' });
-          if (!Number.isFinite(amount) || amount === 0) return res.status(400).json({ error: 'amount must be a non-zero number' });
-          const [[who]] = await pool.query(`SELECT name FROM team WHERE id = ?`, [userId]);
-          if (!who) return res.status(400).json({ error: 'No such team member' });
-          const id = `PS_${source}_${period}_${userId}_${Date.now()}`;
-          await pool.query(
-            `INSERT INTO payout_settlements (id, source, period, userId, amount, paidOn, method, reference, note, createdBy)
-             VALUES (?,?,?,?,?,?,?,?,?,?)`,
-            [id, source, period, userId, amount,
-             payload?.paidOn || new Date().toISOString().slice(0, 10),
-             payload?.method ? String(payload.method).slice(0, 40) : null,
-             payload?.reference ? String(payload.reference).slice(0, 120) : null,
-             payload?.note ? String(payload.note).slice(0, 500) : null,
-             req.user?.id || '']);
-          payoutOverviewCache = null;
-          await pool.query('INSERT INTO activity_log (userId, userName, action, description, createdAt) VALUES (?,?,?,?,NOW())',
-            [req.user?.id || '', req.user?.name || '', 'settle',
-             `${source} ${period}: Rs ${amount} paid to ${who.name}`]);
-          return res.json({ success: true, id });
-        } catch (e) {
-          console.error('[settle]', e);
-          return res.status(500).json({ error: e.message });
-        }
-      }
 
       // Record many payments at once from a filled-in sheet. Finance settles ~121
       // people a month; doing that one dialog at a time is not a workflow.
@@ -2667,66 +2496,6 @@ app.all('/api/data', mutationLimiter, async (req, res) => {
       // names repeat, codes do not — and anything unmatched is reported back
       // rather than quietly skipped, because a payment that silently lands
       // nowhere is worse than one that fails loudly.
-      if (action === 'settle_bulk') {
-        if (!canMutate(req, 'settle')) return res.status(403).json({ error: 'Admin or Finance privileges required' });
-        try {
-          const period = String(payload?.period || '').slice(0, 7);
-          const source = String(payload?.source || 'MF').trim().toUpperCase();
-          const rows = Array.isArray(payload?.rows) ? payload.rows : [];
-          if (!period) return res.status(400).json({ error: 'period is required' });
-          if (!rows.length) return res.status(400).json({ error: 'No rows to record' });
-
-          const [teamRows] = await pool.query(`SELECT id, name, code FROM team`);
-          const byId = new Map(teamRows.map(t => [t.id, t]));
-          const byCode = new Map();
-          const byName = new Map();
-          for (const t of teamRows) {
-            const c = String(t.code || '').trim().toUpperCase();
-            if (c && !byCode.has(c)) byCode.set(c, t);
-            const n = String(t.name || '').trim().toUpperCase();
-            // Only index a name when it is unambiguous; duplicates stay unmatched.
-            if (n) byName.set(n, byName.has(n) ? null : t);
-          }
-
-          const stamp = Date.now();
-          const accepted = [], skipped = [];
-          const values = [], params = [];
-          let i = 0;
-          for (const r of rows) {
-            const amount = Number(r.amount);
-            const label = String(r.code || r.name || r.userId || '').trim();
-            if (!Number.isFinite(amount) || amount === 0) { skipped.push({ label, why: 'no amount' }); continue; }
-            const who = (r.userId && byId.get(String(r.userId)))
-              || (r.code && byCode.get(String(r.code).trim().toUpperCase()))
-              || (r.name && byName.get(String(r.name).trim().toUpperCase()))
-              || null;
-            if (!who) { skipped.push({ label, why: 'no matching team member' }); continue; }
-            values.push('(?,?,?,?,?,?,?,?,?,?)');
-            params.push(`PS_${source}_${period}_${who.id}_${stamp}_${i++}`, source, period, who.id, amount,
-              payload?.paidOn || new Date().toISOString().slice(0, 10),
-              'bulk-import',
-              r.reference ? String(r.reference).slice(0, 120) : null,
-              payload?.note ? String(payload.note).slice(0, 500) : null,
-              req.user?.id || '');
-            accepted.push({ name: who.name, amount });
-          }
-          if (values.length) {
-            await pool.query(
-              `INSERT INTO payout_settlements (id, source, period, userId, amount, paidOn, method, reference, note, createdBy)
-               VALUES ${values.join(',')}`, params);
-          }
-          payoutOverviewCache = null;
-          const total = accepted.reduce((a, x) => a + x.amount, 0);
-          await pool.query('INSERT INTO activity_log (userId, userName, action, description, createdAt) VALUES (?,?,?,?,NOW())',
-            [req.user?.id || '', req.user?.name || '', 'settle_bulk',
-             `${source} ${period}: ${accepted.length} payment(s) totalling Rs ${total.toFixed(2)} recorded from a sheet` +
-             (skipped.length ? `, ${skipped.length} row(s) skipped` : '')]);
-          return res.json({ success: true, recorded: accepted.length, total: Math.round(total * 100) / 100, skipped });
-        } catch (e) {
-          console.error('[settle_bulk]', e);
-          return res.status(500).json({ error: e.message });
-        }
-      }
 
       if (action === 'settle_delete') {
         if (!canMutate(req, action)) return res.status(403).json({ error: 'Admin or Finance privileges required' });
@@ -2743,112 +2512,6 @@ app.all('/api/data', mutationLimiter, async (req, res) => {
           return res.json({ success: true });
         } catch (e) {
           console.error('[settle_delete]', e);
-          return res.status(500).json({ error: e.message });
-        }
-      }
-
-      // ── Folio conflicts: one folio claimed by many client records ─────────
-      //
-      //    A folio belongs to one investor at one fund house, so exactly one
-      //    client record should claim it. Here single folios are claimed by 80+
-      //    records. The importer survives that now — it makes the investor's name
-      //    break the tie — but a folio no name can resolve leaves its rows
-      //    attached to nobody, which is money sitting in the house account.
-      //
-      //    This removes a folio from every record that is NOT its owner, deciding
-      //    the owner from the statements themselves: the investor name on that
-      //    folio's own transactions. It is deliberately timid — it acts only when
-      //    exactly ONE claimant agrees with that name, and otherwise reports the
-      //    folio for a human. It never ADDS a folio to a record.
-      //
-      //    Run it with apply=false first; the answer is the same either way.
-      if (action === 'folio_conflicts') {
-        if (!req.user || req.user.role !== 'ADMIN') return res.status(403).json({ error: 'Admin privileges required' });
-        const apply = payload?.apply === true;
-        try {
-          const [clientRows] = await pool.query("SELECT id, name, data FROM clients");
-          const claimants = new Map();                 // folio -> [{id, name}]
-          const dataOf = new Map();                    // id -> parsed data
-          for (const c of clientRows) {
-            let d = {}; try { d = JSON.parse(c.data || '{}'); } catch { continue; }
-            dataOf.set(c.id, d);
-            for (const f of (Array.isArray(d.folios) ? d.folios : [])) {
-              const k = String(f).trim(); if (!k) continue;
-              if (!claimants.has(k)) claimants.set(k, []);
-              claimants.get(k).push({ id: c.id, name: c.name || '' });
-            }
-          }
-          const conflicted = [...claimants.entries()].filter(([, list]) => list.length > 1);
-
-          // The investor name that actually appears on each folio's rows, with the
-          // most-seen name winning — a folio's own statements are the only
-          // first-hand evidence of whose it is.
-          const topInvestor = new Map();
-          const folioKeys = conflicted.map(([f]) => f);
-          for (let i = 0; i < folioKeys.length; i += 400) {
-            const chunk = folioKeys.slice(i, i + 400);
-            const [rows] = await pool.query(
-              `SELECT JSON_UNQUOTE(JSON_EXTRACT(data,'$.folio')) folio, investorName, COUNT(*) n
-                 FROM transactions
-                WHERE JSON_UNQUOTE(JSON_EXTRACT(data,'$.folio')) IN (${chunk.map(() => '?').join(',')})
-                GROUP BY 1, 2`, chunk);
-            for (const r of rows) {
-              const cur = topInvestor.get(r.folio);
-              if (!cur || Number(r.n) > cur.n) topInvestor.set(r.folio, { name: r.investorName || '', n: Number(r.n) });
-            }
-          }
-
-          const resolved = [], unresolved = [];
-          const strip = new Map();                     // clientId -> Set(folio to remove)
-          for (const [folio, list] of conflicted) {
-            const investor = topInvestor.get(folio)?.name || '';
-            if (!investor) { unresolved.push({ folio, claimants: list.length, why: 'no transactions carry this folio' }); continue; }
-            const agree = list.filter(c => !nameContradicts(c.name, investor));
-            if (agree.length !== 1) {
-              unresolved.push({ folio, investor, claimants: list.length, agreeing: agree.length,
-                why: agree.length === 0 ? 'no claimant matches the investor name' : 'several claimants match the investor name' });
-              continue;
-            }
-            const owner = agree[0];
-            const losers = list.filter(c => c.id !== owner.id);
-            for (const l of losers) {
-              if (!strip.has(l.id)) strip.set(l.id, new Set());
-              strip.get(l.id).add(folio);
-            }
-            resolved.push({ folio, investor, owner: owner.name, ownerId: owner.id, removedFrom: losers.length });
-          }
-
-          let recordsChanged = 0, foliosRemoved = 0;
-          if (apply) {
-            for (const [cid, folios] of strip) {
-              const d = dataOf.get(cid); if (!d) continue;
-              const before = (d.folios || []).length;
-              d.folios = (d.folios || []).filter(f => !folios.has(String(f).trim()));
-              if (d.folios.length === before) continue;
-              d.updatedAt = new Date().toISOString();
-              await pool.query("UPDATE clients SET data=? WHERE id=?", [JSON.stringify(d), cid]);
-              recordsChanged++; foliosRemoved += before - d.folios.length;
-            }
-            await pool.query(
-              'INSERT INTO activity_log (userId, userName, action, description, createdAt) VALUES (?,?,?,?,NOW())',
-              [req.user.id, req.user.name || req.user.email || 'admin', 'FOLIO_CONFLICTS',
-               `Resolved ${resolved.length} folio(s); removed ${foliosRemoved} claim(s) from ${recordsChanged} client record(s)`]);
-            invalidateSummaryCache();
-          }
-
-          return res.json({
-            apply,
-            foliosTotal: claimants.size,
-            foliosConflicted: conflicted.length,
-            resolvable: resolved.length,
-            unresolved: unresolved.length,
-            claimsToRemove: [...strip.values()].reduce((a, s) => a + s.size, 0),
-            recordsChanged, foliosRemoved,
-            sampleResolved: resolved.slice(0, 50),
-            sampleUnresolved: unresolved.slice(0, 50),
-          });
-        } catch (e) {
-          console.error('[folio_conflicts]', e);
           return res.status(500).json({ error: e.message });
         }
       }
@@ -3044,6 +2707,349 @@ app.all('/api/data', mutationLimiter, async (req, res) => {
         console.warn(`🛑 [WRITE] 403 POST action=${action || '(persist)'} coll=${collection || '-'} blocked user=${req.user?.id || 'none'} role=${req.user?.role || 'none'}`);
         return res.status(403).json({ error: 'Admin or Finance privileges required to modify data' });
       }
+
+      if (action === 'partner_import') {
+        if (!canMutate(req, action)) return res.status(403).json({ error: 'Admin privileges required' });
+        try {
+          const partner = String(payload?.partner || '').trim().toUpperCase();
+          const fileName = String(payload?.fileName || '').trim();
+          const rows = Array.isArray(payload?.rows) ? payload.rows : [];
+          if (!partner) return res.status(400).json({ error: 'partner is required' });
+          if (!rows.length) return res.status(400).json({ error: 'No rows to import' });
+
+          const batchId = `PB_${partner}_${Date.now()}`;
+          await pool.query(
+            `INSERT INTO batches (id, fileName, data) VALUES (?, ?, ?)
+             ON DUPLICATE KEY UPDATE fileName = VALUES(fileName), data = VALUES(data)`,
+            [batchId, fileName || `${partner} import`, JSON.stringify({ partner, kind: 'partner_brokerage', rowCount: rows.length })]);
+
+          // Codes already mapped attach themselves on the way in, so a second
+          // month's file lands pre-attributed and the mapping screen only ever
+          // shows what is genuinely new.
+          const [mapRows] = await pool.query(
+            `SELECT clientCode, clientId FROM partner_client_map WHERE partner = ?`, [partner]);
+          const codeToClient = new Map(mapRows.map(r => [String(r.clientCode), r.clientId]));
+
+          // Two genuinely separate trades can be identical in every column — same
+          // client, same day, same segment, same brokerage. On a pure content hash
+          // they collapse into one row and that second trade's money disappears
+          // silently. Counting occurrences keeps them apart while a re-import of
+          // the same statement still lands on the same ids.
+          const seen = new Map();
+          let written = 0;
+          for (let i = 0; i < rows.length; i += 400) {
+            const chunk = rows.slice(i, i + 400);
+            const values = [];
+            const params = [];
+            for (const r of chunk) {
+              const clientCode = String(r.clientCode || '').trim();
+              const tradeDate = r.tradeDate || null;
+              const period = String(r.period || '').slice(0, 7);
+              const key = `${partner}|${tradeDate}|${clientCode}|${r.segment || ''}|${r.tradeCategory || ''}|` +
+                          `${r.totalBrokerage || 0}|${r.ourShare || 0}|${r.partnerShare || 0}|${r.product || ''}|${r.parentProfile || ''}`;
+              const nth = (seen.get(key) || 0) + 1;
+              seen.set(key, nth);
+              const id = `${partner}_${period}_${hash53(nth > 1 ? `${key}#${nth}` : key)}`;
+              values.push('(?,?,?,?,?,?,?,?,?,?,?,?,?)');
+              params.push(
+                id, partner, batchId, tradeDate, period, clientCode,
+                r.segment || null, r.tradeCategory || null,
+                Number(r.totalBrokerage) || 0, Number(r.ourShare) || 0, Number(r.partnerShare) || 0,
+                codeToClient.get(clientCode) || null,
+                JSON.stringify(r.extra || {}));
+            }
+            const [res2] = await pool.query(
+              `INSERT INTO partner_brokerage
+                 (id, partner, batchId, tradeDate, period, clientCode, segment, tradeCategory,
+                  totalBrokerage, ourShare, partnerShare, mappedClientId, data)
+               VALUES ${values.join(',')}
+               ON DUPLICATE KEY UPDATE
+                 batchId = VALUES(batchId), tradeDate = VALUES(tradeDate), period = VALUES(period),
+                 segment = VALUES(segment), tradeCategory = VALUES(tradeCategory),
+                 totalBrokerage = VALUES(totalBrokerage), ourShare = VALUES(ourShare),
+                 partnerShare = VALUES(partnerShare), data = VALUES(data)`, params);
+            written += chunk.length;
+          }
+          const [[after]] = await pool.query(
+            `SELECT COUNT(*) rows_, COUNT(DISTINCT clientCode) codes,
+                    ROUND(SUM(ourShare),2) ourShare,
+                    SUM(mappedClientId IS NULL) unmapped
+             FROM partner_brokerage WHERE batchId = ?`, [batchId]);
+          await pool.query('INSERT INTO activity_log (userId, userName, action, description, createdAt) VALUES (?,?,?,?,NOW())',
+            [req.user?.id || '', req.user?.name || '', 'partner_import',
+             `${partner}: ${written} row(s) from ${fileName || 'upload'} — our share Rs ${after.ourShare}`]);
+          return res.json({ success: true, batchId, written, ...after });
+        } catch (e) {
+          console.error('[partner_import]', e);
+          return res.status(500).json({ error: e.message });
+        }
+      }
+
+      if (action === 'partner_map') {
+        if (!canMutate(req, action)) return res.status(403).json({ error: 'Admin privileges required' });
+        try {
+          const partner = String(payload?.partner || '').trim().toUpperCase();
+          const pairs = Array.isArray(payload?.pairs) ? payload.pairs : [];
+          if (!partner || !pairs.length) return res.status(400).json({ error: 'partner and pairs are required' });
+          let mapped = 0, rowsTouched = 0;
+          for (const p of pairs) {
+            const code = String(p.clientCode || '').trim();
+            if (!code) continue;
+            const clientId = p.clientId ? String(p.clientId) : null;
+            await pool.query(
+              `INSERT INTO partner_client_map (partner, clientCode, clientId, label)
+               VALUES (?,?,?,?)
+               ON DUPLICATE KEY UPDATE clientId = VALUES(clientId), label = VALUES(label)`,
+              [partner, code, clientId, p.label ? String(p.label).slice(0, 255) : null]);
+            const [r] = await pool.query(
+              `UPDATE partner_brokerage SET mappedClientId = ? WHERE partner = ? AND clientCode = ?`,
+              [clientId, partner, code]);
+            mapped++; rowsTouched += r.affectedRows || 0;
+          }
+          invalidateSummaryCache();
+          payoutOverviewCache = null;
+          await pool.query('INSERT INTO activity_log (userId, userName, action, description, createdAt) VALUES (?,?,?,?,NOW())',
+            [req.user?.id || '', req.user?.name || '', 'partner_map',
+             `${partner}: ${mapped} client code(s) mapped, ${rowsTouched} row(s) re-attributed`]);
+          return res.json({ success: true, mapped, rowsTouched });
+        } catch (e) {
+          console.error('[partner_map]', e);
+          return res.status(500).json({ error: e.message });
+        }
+      }
+
+      if (action === 'partner_pay') {
+        if (!canMutate(req, action)) return res.status(403).json({ error: 'Admin or Finance privileges required' });
+        try {
+          const partner = String(payload?.partner || '').trim().toUpperCase();
+          const period = String(payload?.period || '').slice(0, 7);
+          const userId = String(payload?.userId || '').trim();
+          const amount = Number(payload?.amount);
+          if (!partner || !period || !userId) return res.status(400).json({ error: 'partner, period and userId are required' });
+          if (!Number.isFinite(amount) || amount === 0) return res.status(400).json({ error: 'amount must be a non-zero number' });
+          const [[who]] = await pool.query(`SELECT name FROM team WHERE id = ?`, [userId]);
+          if (!who) return res.status(400).json({ error: 'No such team member' });
+          const id = `PS_${partner}_${period}_${userId}_${Date.now()}`;
+          await pool.query(
+            // One settlements table for every revenue source, so the Payouts page
+            // and this one can never disagree about what has been paid.
+            `INSERT INTO payout_settlements (id, source, period, userId, amount, paidOn, method, reference, note, createdBy)
+             VALUES (?,?,?,?,?,?,?,?,?,?)`,
+            [id, partner, period, userId, amount,
+             payload?.paidOn || new Date().toISOString().slice(0, 10),
+             payload?.method ? String(payload.method).slice(0, 40) : null,
+             payload?.reference ? String(payload.reference).slice(0, 120) : null,
+             payload?.note ? String(payload.note).slice(0, 500) : null,
+             req.user?.id || '']);
+          await pool.query('INSERT INTO activity_log (userId, userName, action, description, createdAt) VALUES (?,?,?,?,NOW())',
+            [req.user?.id || '', req.user?.name || '', 'partner_pay',
+             `${partner} ${period}: Rs ${amount} paid to ${who.name}`]);
+          return res.json({ success: true, id });
+        } catch (e) {
+          console.error('[partner_pay]', e);
+          return res.status(500).json({ error: e.message });
+        }
+      }
+
+      if (action === 'settle') {
+        if (!canMutate(req, action)) return res.status(403).json({ error: 'Admin or Finance privileges required' });
+        try {
+          const period = String(payload?.period || '').slice(0, 7);
+          const userId = String(payload?.userId || '').trim();
+          const amount = Number(payload?.amount);
+          const source = String(payload?.source || 'MF').trim().toUpperCase();
+          if (!period || !userId) return res.status(400).json({ error: 'period and userId are required' });
+          if (!Number.isFinite(amount) || amount === 0) return res.status(400).json({ error: 'amount must be a non-zero number' });
+          const [[who]] = await pool.query(`SELECT name FROM team WHERE id = ?`, [userId]);
+          if (!who) return res.status(400).json({ error: 'No such team member' });
+          const id = `PS_${source}_${period}_${userId}_${Date.now()}`;
+          await pool.query(
+            `INSERT INTO payout_settlements (id, source, period, userId, amount, paidOn, method, reference, note, createdBy)
+             VALUES (?,?,?,?,?,?,?,?,?,?)`,
+            [id, source, period, userId, amount,
+             payload?.paidOn || new Date().toISOString().slice(0, 10),
+             payload?.method ? String(payload.method).slice(0, 40) : null,
+             payload?.reference ? String(payload.reference).slice(0, 120) : null,
+             payload?.note ? String(payload.note).slice(0, 500) : null,
+             req.user?.id || '']);
+          payoutOverviewCache = null;
+          await pool.query('INSERT INTO activity_log (userId, userName, action, description, createdAt) VALUES (?,?,?,?,NOW())',
+            [req.user?.id || '', req.user?.name || '', 'settle',
+             `${source} ${period}: Rs ${amount} paid to ${who.name}`]);
+          return res.json({ success: true, id });
+        } catch (e) {
+          console.error('[settle]', e);
+          return res.status(500).json({ error: e.message });
+        }
+      }
+
+      if (action === 'settle_bulk') {
+        if (!canMutate(req, 'settle')) return res.status(403).json({ error: 'Admin or Finance privileges required' });
+        try {
+          const period = String(payload?.period || '').slice(0, 7);
+          const source = String(payload?.source || 'MF').trim().toUpperCase();
+          const rows = Array.isArray(payload?.rows) ? payload.rows : [];
+          if (!period) return res.status(400).json({ error: 'period is required' });
+          if (!rows.length) return res.status(400).json({ error: 'No rows to record' });
+
+          const [teamRows] = await pool.query(`SELECT id, name, code FROM team`);
+          const byId = new Map(teamRows.map(t => [t.id, t]));
+          const byCode = new Map();
+          const byName = new Map();
+          for (const t of teamRows) {
+            const c = String(t.code || '').trim().toUpperCase();
+            if (c && !byCode.has(c)) byCode.set(c, t);
+            const n = String(t.name || '').trim().toUpperCase();
+            // Only index a name when it is unambiguous; duplicates stay unmatched.
+            if (n) byName.set(n, byName.has(n) ? null : t);
+          }
+
+          const stamp = Date.now();
+          const accepted = [], skipped = [];
+          const values = [], params = [];
+          let i = 0;
+          for (const r of rows) {
+            const amount = Number(r.amount);
+            const label = String(r.code || r.name || r.userId || '').trim();
+            if (!Number.isFinite(amount) || amount === 0) { skipped.push({ label, why: 'no amount' }); continue; }
+            const who = (r.userId && byId.get(String(r.userId)))
+              || (r.code && byCode.get(String(r.code).trim().toUpperCase()))
+              || (r.name && byName.get(String(r.name).trim().toUpperCase()))
+              || null;
+            if (!who) { skipped.push({ label, why: 'no matching team member' }); continue; }
+            values.push('(?,?,?,?,?,?,?,?,?,?)');
+            params.push(`PS_${source}_${period}_${who.id}_${stamp}_${i++}`, source, period, who.id, amount,
+              payload?.paidOn || new Date().toISOString().slice(0, 10),
+              'bulk-import',
+              r.reference ? String(r.reference).slice(0, 120) : null,
+              payload?.note ? String(payload.note).slice(0, 500) : null,
+              req.user?.id || '');
+            accepted.push({ name: who.name, amount });
+          }
+          if (values.length) {
+            await pool.query(
+              `INSERT INTO payout_settlements (id, source, period, userId, amount, paidOn, method, reference, note, createdBy)
+               VALUES ${values.join(',')}`, params);
+          }
+          payoutOverviewCache = null;
+          const total = accepted.reduce((a, x) => a + x.amount, 0);
+          await pool.query('INSERT INTO activity_log (userId, userName, action, description, createdAt) VALUES (?,?,?,?,NOW())',
+            [req.user?.id || '', req.user?.name || '', 'settle_bulk',
+             `${source} ${period}: ${accepted.length} payment(s) totalling Rs ${total.toFixed(2)} recorded from a sheet` +
+             (skipped.length ? `, ${skipped.length} row(s) skipped` : '')]);
+          return res.json({ success: true, recorded: accepted.length, total: Math.round(total * 100) / 100, skipped });
+        } catch (e) {
+          console.error('[settle_bulk]', e);
+          return res.status(500).json({ error: e.message });
+        }
+      }
+
+      // ── Folio conflicts: one folio claimed by many client records ─────────
+      //
+      //    A folio belongs to one investor at one fund house, so exactly one
+      //    client record should claim it. Here single folios are claimed by 80+
+      //    records. The importer survives that now — it makes the investor's name
+      //    break the tie — but a folio no name can resolve leaves its rows
+      //    attached to nobody, which is money sitting in the house account.
+      //
+      //    This removes a folio from every record that is NOT its owner, deciding
+      //    the owner from the statements themselves: the investor name on that
+      //    folio's own transactions. It is deliberately timid — it acts only when
+      //    exactly ONE claimant agrees with that name, and otherwise reports the
+      //    folio for a human. It never ADDS a folio to a record.
+      //
+      //    Run it with apply=false first; the answer is the same either way.
+      if (action === 'folio_conflicts') {
+        if (!req.user || req.user.role !== 'ADMIN') return res.status(403).json({ error: 'Admin privileges required' });
+        const apply = payload?.apply === true;
+        try {
+          const [clientRows] = await pool.query("SELECT id, name, data FROM clients");
+          const claimants = new Map();                 // folio -> [{id, name}]
+          const dataOf = new Map();                    // id -> parsed data
+          for (const c of clientRows) {
+            let d = {}; try { d = JSON.parse(c.data || '{}'); } catch { continue; }
+            dataOf.set(c.id, d);
+            for (const f of (Array.isArray(d.folios) ? d.folios : [])) {
+              const k = String(f).trim(); if (!k) continue;
+              if (!claimants.has(k)) claimants.set(k, []);
+              claimants.get(k).push({ id: c.id, name: c.name || '' });
+            }
+          }
+          const conflicted = [...claimants.entries()].filter(([, list]) => list.length > 1);
+
+          // The investor name that actually appears on each folio's rows, with the
+          // most-seen name winning — a folio's own statements are the only
+          // first-hand evidence of whose it is.
+          const topInvestor = new Map();
+          const folioKeys = conflicted.map(([f]) => f);
+          for (let i = 0; i < folioKeys.length; i += 400) {
+            const chunk = folioKeys.slice(i, i + 400);
+            const [rows] = await pool.query(
+              `SELECT JSON_UNQUOTE(JSON_EXTRACT(data,'$.folio')) folio, investorName, COUNT(*) n
+                 FROM transactions
+                WHERE JSON_UNQUOTE(JSON_EXTRACT(data,'$.folio')) IN (${chunk.map(() => '?').join(',')})
+                GROUP BY 1, 2`, chunk);
+            for (const r of rows) {
+              const cur = topInvestor.get(r.folio);
+              if (!cur || Number(r.n) > cur.n) topInvestor.set(r.folio, { name: r.investorName || '', n: Number(r.n) });
+            }
+          }
+
+          const resolved = [], unresolved = [];
+          const strip = new Map();                     // clientId -> Set(folio to remove)
+          for (const [folio, list] of conflicted) {
+            const investor = topInvestor.get(folio)?.name || '';
+            if (!investor) { unresolved.push({ folio, claimants: list.length, why: 'no transactions carry this folio' }); continue; }
+            const agree = list.filter(c => !nameContradicts(c.name, investor));
+            if (agree.length !== 1) {
+              unresolved.push({ folio, investor, claimants: list.length, agreeing: agree.length,
+                why: agree.length === 0 ? 'no claimant matches the investor name' : 'several claimants match the investor name' });
+              continue;
+            }
+            const owner = agree[0];
+            const losers = list.filter(c => c.id !== owner.id);
+            for (const l of losers) {
+              if (!strip.has(l.id)) strip.set(l.id, new Set());
+              strip.get(l.id).add(folio);
+            }
+            resolved.push({ folio, investor, owner: owner.name, ownerId: owner.id, removedFrom: losers.length });
+          }
+
+          let recordsChanged = 0, foliosRemoved = 0;
+          if (apply) {
+            for (const [cid, folios] of strip) {
+              const d = dataOf.get(cid); if (!d) continue;
+              const before = (d.folios || []).length;
+              d.folios = (d.folios || []).filter(f => !folios.has(String(f).trim()));
+              if (d.folios.length === before) continue;
+              d.updatedAt = new Date().toISOString();
+              await pool.query("UPDATE clients SET data=? WHERE id=?", [JSON.stringify(d), cid]);
+              recordsChanged++; foliosRemoved += before - d.folios.length;
+            }
+            await pool.query(
+              'INSERT INTO activity_log (userId, userName, action, description, createdAt) VALUES (?,?,?,?,NOW())',
+              [req.user.id, req.user.name || req.user.email || 'admin', 'FOLIO_CONFLICTS',
+               `Resolved ${resolved.length} folio(s); removed ${foliosRemoved} claim(s) from ${recordsChanged} client record(s)`]);
+            invalidateSummaryCache();
+          }
+
+          return res.json({
+            apply,
+            foliosTotal: claimants.size,
+            foliosConflicted: conflicted.length,
+            resolvable: resolved.length,
+            unresolved: unresolved.length,
+            claimsToRemove: [...strip.values()].reduce((a, s) => a + s.size, 0),
+            recordsChanged, foliosRemoved,
+            sampleResolved: resolved.slice(0, 50),
+            sampleUnresolved: unresolved.slice(0, 50),
+          });
+        } catch (e) {
+          console.error('[folio_conflicts]', e);
+          return res.status(500).json({ error: e.message });
+        }
+      }
+
 
       // ── Map RM from registrar file ───────────────────────────────────────
       // body: { action:'map_rm_folios', rmId, folios:[...], hierarchy?, leadSourceLevel? }
