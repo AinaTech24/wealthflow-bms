@@ -1068,7 +1068,17 @@ export const Imports: React.FC<ImportsProps> = ({ currentUser }) => {
           folioMatch = nameContradicts(folioClaimants[0].name, investorName) ? undefined : folioClaimants[0];
         } else if (folioClaimants.length > 1) {
           const agree = folioClaimants.filter(c => !nameContradicts(c.name, investorName));
-          folioMatch = agree.length === 1 ? agree[0] : undefined;
+          if (agree.length === 1) {
+            folioMatch = agree[0];
+          } else if (agree.length > 1) {
+            // Several records carry this investor's name — the same person filed
+            // more than once. When they all sit under the same RM and BM it does
+            // not matter which one is used, so use the first rather than leave
+            // the row unattached. When their RMs differ, WHICH RM owns this
+            // investor is a business decision this importer must not make.
+            const sigOf = (c: Client) => `${c.hierarchy?.level3Id || ''}|${c.hierarchy?.level4Id || ''}`;
+            if (new Set(agree.map(sigOf)).size === 1) folioMatch = agree[0];
+          }
         }
 
         let matchedClient: Client | undefined =

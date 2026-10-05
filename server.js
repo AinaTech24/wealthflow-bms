@@ -2964,6 +2964,8 @@ app.all('/api/data', mutationLimiter, async (req, res) => {
         const apply = payload?.apply === true;
         try {
           const [clientRows] = await pool.query("SELECT id, name, data FROM clients");
+          const [teamRows] = await pool.query("SELECT id, name FROM team");
+          const teamName = new Map(teamRows.map(t => [t.id, String(t.name || '').trim()]));
           const claimants = new Map();                 // folio -> [{id, name}]
           const dataOf = new Map();                    // id -> parsed data
           for (const c of clientRows) {
@@ -2995,24 +2997,59 @@ app.all('/api/data', mutationLimiter, async (req, res) => {
             if (!cur || Number(r.n) > cur.n) topInvestor.set(r.folio, { name: r.investorName || '', n: Number(r.n) });
           }
 
-          const resolved = [], unresolved = [];
+          const resolved = [], unresolved = [], sameRm = [], differentRm = [];
+          let truncated = 0;
           const strip = new Map();                     // clientId -> Set(folio to remove)
-          for (const [folio, list] of conflicted) {
-            const investor = topInvestor.get(folio)?.name || '';
-            if (!investor) { unresolved.push({ folio, claimants: list.length, why: 'no transactions carry this folio' }); continue; }
-            const agree = list.filter(c => !nameContradicts(c.name, investor));
-            if (agree.length !== 1) {
-              unresolved.push({ folio, investor, claimants: list.length, agreeing: agree.length,
-                why: agree.length === 0 ? 'no claimant matches the investor name' : 'several claimants match the investor name' });
-              continue;
-            }
-            const owner = agree[0];
-            const losers = list.filter(c => c.id !== owner.id);
-            for (const l of losers) {
+          const stripFrom = (list, folio) => {
+            for (const l of list) {
               if (!strip.has(l.id)) strip.set(l.id, new Set());
               strip.get(l.id).add(folio);
             }
-            resolved.push({ folio, investor, owner: owner.name, ownerId: owner.id, removedFrom: losers.length });
+          };
+          const sig = (c) => {
+            const h = dataOf.get(c.id)?.hierarchy || {};
+            return `${h.level3Id || ''}|${h.level4Id || ''}`;
+          };
+          const who = (c) => {
+            const h = dataOf.get(c.id)?.hierarchy || {};
+            return { name: c.name, rm: teamName.get(h.level3Id) || '(no RM)', bm: teamName.get(h.level4Id) || '' };
+          };
+          for (const [folio, list] of conflicted) {
+            // "477413000000": six digits then zeros is Excel's scientific notation
+            // eating a real folio. It identifies nobody, matches no transaction, and
+            // the importer already refuses to attach one — so every claim to it is
+            // stale and safe to drop.
+            if (/^\d{6}0{5,}$/.test(folio)) {
+              stripFrom(list, folio); truncated++;
+              resolved.push({ folio, investor: '', owner: '(truncated folio — no owner)', ownerId: '', removedFrom: list.length });
+              continue;
+            }
+            const investor = topInvestor.get(folio)?.name || '';
+            if (!investor) { unresolved.push({ folio, claimants: list.length, why: 'no transactions carry this folio' }); continue; }
+            const agree = list.filter(c => !nameContradicts(c.name, investor));
+            if (agree.length === 0) {
+              unresolved.push({ folio, investor, claimants: list.length, agreeing: 0, why: 'no claimant matches the investor name' });
+              continue;
+            }
+            if (agree.length > 1) {
+              // Several records carry this investor's name: the same person filed
+              // more than once. If they all sit under the same RM and BM it does not
+              // matter which one the importer picks — the money reaches the same
+              // people. If they sit under DIFFERENT RMs, which RM owns this investor
+              // is a business decision, and nothing here may make it.
+              if (new Set(agree.map(sig)).size === 1) {
+                sameRm.push({ folio, investor, records: agree.length });
+              } else {
+                const entry = { folio, investor, claimants: list.length, agreeing: agree.length,
+                                why: 'duplicate records of this investor sit under different RMs',
+                                records: agree.map(who) };
+                differentRm.push(entry); unresolved.push(entry);
+              }
+              continue;
+            }
+            const owner = agree[0];
+            stripFrom(list.filter(c => c.id !== owner.id), folio);
+            resolved.push({ folio, investor, owner: owner.name, ownerId: owner.id, removedFrom: list.length - 1 });
           }
 
           let recordsChanged = 0, foliosRemoved = 0;
@@ -3038,11 +3075,14 @@ app.all('/api/data', mutationLimiter, async (req, res) => {
             foliosTotal: claimants.size,
             foliosConflicted: conflicted.length,
             resolvable: resolved.length,
+            truncatedFolios: truncated,
+            duplicatesSameRm: sameRm.length,
+            duplicatesDifferentRm: differentRm.length,
             unresolved: unresolved.length,
             claimsToRemove: [...strip.values()].reduce((a, s) => a + s.size, 0),
             recordsChanged, foliosRemoved,
             sampleResolved: resolved.slice(0, 50),
-            sampleUnresolved: unresolved.slice(0, 50),
+            sampleUnresolved: unresolved.slice(0, 60),
           });
         } catch (e) {
           console.error('[folio_conflicts]', e);

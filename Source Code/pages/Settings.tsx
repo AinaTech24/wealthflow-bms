@@ -1105,8 +1105,12 @@ export const Settings: React.FC<SettingsProps> = ({ currentUser }) => {
                         {folioResult && (
                             <div className="mt-5 text-sm text-slate-700 space-y-1">
                                 <p><b>{folioResult.foliosConflicted}</b> of {folioResult.foliosTotal} folios are claimed by more than one client.</p>
-                                <p><b>{folioResult.resolvable}</b> can be settled from the statements &mdash; {folioResult.claimsToRemove} wrong claim(s) to remove.</p>
-                                <p><b>{folioResult.unresolved}</b> need a person to decide.</p>
+                                <p><b>{folioResult.resolvable}</b> can be settled from the statements &mdash; {folioResult.claimsToRemove} wrong claim(s) to remove
+                                    {folioResult.truncatedFolios > 0 && <> (of which {folioResult.truncatedFolios} are folios Excel truncated, e.g. 477413000000)</>}.</p>
+                                <p><b>{folioResult.duplicatesSameRm ?? 0}</b> are the same investor filed more than once under the <i>same</i> RM &mdash; harmless, the importer now handles them.</p>
+                                <p className={folioResult.duplicatesDifferentRm ? 'text-red-700 font-bold' : ''}>
+                                    <b>{folioResult.duplicatesDifferentRm ?? 0}</b> are the same investor under <i>different</i> RMs &mdash; you decide who owns them.
+                                </p>
                                 {folioResult.apply && (
                                     <p className="text-emerald-700 font-bold">
                                         Done: {folioResult.foliosRemoved} claim(s) removed from {folioResult.recordsChanged} record(s).
@@ -1116,11 +1120,20 @@ export const Settings: React.FC<SettingsProps> = ({ currentUser }) => {
                                 {!!folioResult.sampleUnresolved?.length && (
                                     <details className="mt-2">
                                         <summary className="cursor-pointer text-xs font-black uppercase tracking-widest text-slate-400">
-                                            The ones needing a decision
+                                            The ones that need your decision
                                         </summary>
                                         <ul className="mt-2 text-xs text-slate-600 space-y-0.5">
                                             {folioResult.sampleUnresolved.map((u: any) => (
-                                                <li key={u.folio}><span className="font-mono">{u.folio}</span> &mdash; {u.why}{u.investor ? ` (statements say "${u.investor}")` : ''}</li>
+                                                <li key={u.folio}>
+                                                    <span className="font-mono">{u.folio}</span> &mdash; {u.why}{u.investor ? ` (statements say "${u.investor}")` : ''}
+                                                    {Array.isArray(u.records) && (
+                                                        <ul className="ml-4 list-disc">
+                                                            {u.records.map((r: any, i: number) => (
+                                                                <li key={i}>{r.name} &rarr; RM <b>{r.rm}</b>{r.bm ? `, BM ${r.bm}` : ''}</li>
+                                                            ))}
+                                                        </ul>
+                                                    )}
+                                                </li>
                                             ))}
                                         </ul>
                                     </details>
