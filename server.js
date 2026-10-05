@@ -9,7 +9,7 @@ import compression from 'compression';
 import cors from 'cors';
 import pool from './src/lib/db.js';
 // Shared with the importer — see src/lib/nameMatch.js for why there is only one copy.
-import { nameTokens } from './src/lib/nameMatch.js';
+import { nameTokens, nameContradicts } from './src/lib/nameMatch.js';
 import bcrypt from 'bcrypt';
 import jwt from 'jsonwebtoken';
 import rateLimit from 'express-rate-limit';
@@ -2743,6 +2743,112 @@ app.all('/api/data', mutationLimiter, async (req, res) => {
           return res.json({ success: true });
         } catch (e) {
           console.error('[settle_delete]', e);
+          return res.status(500).json({ error: e.message });
+        }
+      }
+
+      // ── Folio conflicts: one folio claimed by many client records ─────────
+      //
+      //    A folio belongs to one investor at one fund house, so exactly one
+      //    client record should claim it. Here single folios are claimed by 80+
+      //    records. The importer survives that now — it makes the investor's name
+      //    break the tie — but a folio no name can resolve leaves its rows
+      //    attached to nobody, which is money sitting in the house account.
+      //
+      //    This removes a folio from every record that is NOT its owner, deciding
+      //    the owner from the statements themselves: the investor name on that
+      //    folio's own transactions. It is deliberately timid — it acts only when
+      //    exactly ONE claimant agrees with that name, and otherwise reports the
+      //    folio for a human. It never ADDS a folio to a record.
+      //
+      //    Run it with apply=false first; the answer is the same either way.
+      if (action === 'folio_conflicts') {
+        if (!req.user || req.user.role !== 'ADMIN') return res.status(403).json({ error: 'Admin privileges required' });
+        const apply = payload?.apply === true;
+        try {
+          const [clientRows] = await pool.query("SELECT id, name, data FROM clients");
+          const claimants = new Map();                 // folio -> [{id, name}]
+          const dataOf = new Map();                    // id -> parsed data
+          for (const c of clientRows) {
+            let d = {}; try { d = JSON.parse(c.data || '{}'); } catch { continue; }
+            dataOf.set(c.id, d);
+            for (const f of (Array.isArray(d.folios) ? d.folios : [])) {
+              const k = String(f).trim(); if (!k) continue;
+              if (!claimants.has(k)) claimants.set(k, []);
+              claimants.get(k).push({ id: c.id, name: c.name || '' });
+            }
+          }
+          const conflicted = [...claimants.entries()].filter(([, list]) => list.length > 1);
+
+          // The investor name that actually appears on each folio's rows, with the
+          // most-seen name winning — a folio's own statements are the only
+          // first-hand evidence of whose it is.
+          const topInvestor = new Map();
+          const folioKeys = conflicted.map(([f]) => f);
+          for (let i = 0; i < folioKeys.length; i += 400) {
+            const chunk = folioKeys.slice(i, i + 400);
+            const [rows] = await pool.query(
+              `SELECT JSON_UNQUOTE(JSON_EXTRACT(data,'$.folio')) folio, investorName, COUNT(*) n
+                 FROM transactions
+                WHERE JSON_UNQUOTE(JSON_EXTRACT(data,'$.folio')) IN (${chunk.map(() => '?').join(',')})
+                GROUP BY 1, 2`, chunk);
+            for (const r of rows) {
+              const cur = topInvestor.get(r.folio);
+              if (!cur || Number(r.n) > cur.n) topInvestor.set(r.folio, { name: r.investorName || '', n: Number(r.n) });
+            }
+          }
+
+          const resolved = [], unresolved = [];
+          const strip = new Map();                     // clientId -> Set(folio to remove)
+          for (const [folio, list] of conflicted) {
+            const investor = topInvestor.get(folio)?.name || '';
+            if (!investor) { unresolved.push({ folio, claimants: list.length, why: 'no transactions carry this folio' }); continue; }
+            const agree = list.filter(c => !nameContradicts(c.name, investor));
+            if (agree.length !== 1) {
+              unresolved.push({ folio, investor, claimants: list.length, agreeing: agree.length,
+                why: agree.length === 0 ? 'no claimant matches the investor name' : 'several claimants match the investor name' });
+              continue;
+            }
+            const owner = agree[0];
+            const losers = list.filter(c => c.id !== owner.id);
+            for (const l of losers) {
+              if (!strip.has(l.id)) strip.set(l.id, new Set());
+              strip.get(l.id).add(folio);
+            }
+            resolved.push({ folio, investor, owner: owner.name, ownerId: owner.id, removedFrom: losers.length });
+          }
+
+          let recordsChanged = 0, foliosRemoved = 0;
+          if (apply) {
+            for (const [cid, folios] of strip) {
+              const d = dataOf.get(cid); if (!d) continue;
+              const before = (d.folios || []).length;
+              d.folios = (d.folios || []).filter(f => !folios.has(String(f).trim()));
+              if (d.folios.length === before) continue;
+              d.updatedAt = new Date().toISOString();
+              await pool.query("UPDATE clients SET data=? WHERE id=?", [JSON.stringify(d), cid]);
+              recordsChanged++; foliosRemoved += before - d.folios.length;
+            }
+            await pool.query(
+              'INSERT INTO activity_log (userId, userName, action, description, createdAt) VALUES (?,?,?,?,NOW())',
+              [req.user.id, req.user.name || req.user.email || 'admin', 'FOLIO_CONFLICTS',
+               `Resolved ${resolved.length} folio(s); removed ${foliosRemoved} claim(s) from ${recordsChanged} client record(s)`]);
+            invalidateSummaryCache();
+          }
+
+          return res.json({
+            apply,
+            foliosTotal: claimants.size,
+            foliosConflicted: conflicted.length,
+            resolvable: resolved.length,
+            unresolved: unresolved.length,
+            claimsToRemove: [...strip.values()].reduce((a, s) => a + s.size, 0),
+            recordsChanged, foliosRemoved,
+            sampleResolved: resolved.slice(0, 50),
+            sampleUnresolved: unresolved.slice(0, 50),
+          });
+        } catch (e) {
+          console.error('[folio_conflicts]', e);
           return res.status(500).json({ error: e.message });
         }
       }

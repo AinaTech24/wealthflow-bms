@@ -3,7 +3,7 @@ import React, { useState, useEffect, useMemo, useCallback } from 'react';
 import { Save, AlertCircle, User, Trash2, Shield, CreditCard, Users, Search, ChevronRight, X, RefreshCcw, AlertTriangle, MapPin, Loader2, ClipboardList, Clock, Key, GitBranch } from 'lucide-react';
 import { SharingConfig, TeamMember, BankDetails, Role, Address } from '../types';
 import { calculatePayout } from '../services/calculationService';
-import { useData } from '../contexts/DataContext';
+import { useData, authFetch } from '../contexts/DataContext';
 import { useToast } from '../components/Toast';
 
 interface SettingsProps {
@@ -305,6 +305,9 @@ export const Settings: React.FC<SettingsProps> = ({ currentUser }) => {
     };
 
     const [isRecalculating, setIsRecalculating] = useState(false);
+    // Folio ownership clean-up — see the panel in the System tab.
+    const [folioBusy, setFolioBusy] = useState(false);
+    const [folioResult, setFolioResult] = useState<any>(null);
 
     const handlePasswordReset = async () => {
         if (!resetPasswordModal) return;
@@ -1030,6 +1033,94 @@ export const Settings: React.FC<SettingsProps> = ({ currentUser }) => {
                             {isRecalculating ? <Loader2 className="w-4 h-4 mr-2 animate-spin" /> : <RefreshCcw className="w-4 h-4 mr-2" />}
                             {isRecalculating ? 'Recalculating...' : 'Recalculate All Transactions'}
                         </button>
+                    </div>
+                    {/* A folio belongs to one investor at one fund house, so one client
+                        record should claim it. Here single folios are claimed by 80+
+                        records, which is why a re-import could attach a month's rows to
+                        a different person than last time. The importer now breaks the tie
+                        on the investor's name; this removes the wrong claims for good. */}
+                    <div className="p-8 border-b border-slate-100">
+                        <h4 className="font-bold text-slate-900 mb-2">Folio ownership</h4>
+                        <p className="text-sm text-slate-600 mb-4">
+                            Finds folios claimed by more than one client and removes the claim from every record
+                            that is not the owner. The owner is decided from the investor name on that folio&rsquo;s own
+                            statements &mdash; and only when exactly one claimant matches it. Anything less certain is
+                            listed for you rather than guessed at. Folios are never added to a record.
+                        </p>
+                        <div className="flex items-center gap-3 flex-wrap">
+                            <button
+                                onClick={async () => {
+                                    setFolioBusy(true); setFolioResult(null);
+                                    try {
+                                        const r = await authFetch('/api/data', {
+                                            method: 'POST',
+                                            headers: { 'Content-Type': 'application/json' },
+                                            body: JSON.stringify({ action: 'folio_conflicts', payload: { apply: false } }),
+                                        });
+                                        const j = await r.json();
+                                        if (!r.ok) { showToast(j?.error || 'Check failed.', 'error'); return; }
+                                        setFolioResult(j);
+                                    } finally { setFolioBusy(false); }
+                                }}
+                                disabled={folioBusy}
+                                className="bg-slate-800 text-white px-5 py-3 rounded-xl font-black uppercase tracking-widest text-[10px] hover:bg-slate-900 transition disabled:opacity-50 flex items-center"
+                            >
+                                {folioBusy ? <Loader2 className="w-4 h-4 mr-2 animate-spin" /> : <Search className="w-4 h-4 mr-2" />}
+                                Check only
+                            </button>
+                            <button
+                                onClick={async () => {
+                                    const confirmed = await showConfirm({
+                                        title: 'Clean up folio ownership?',
+                                        message: `This removes ${folioResult?.claimsToRemove ?? 'the'} wrong folio claim(s) from client records. Transactions are not touched; re-run Recalculate afterwards so the reports follow.`,
+                                        confirmText: 'Clean up',
+                                        variant: 'warning',
+                                    });
+                                    if (!confirmed) return;
+                                    setFolioBusy(true);
+                                    try {
+                                        const r = await authFetch('/api/data', {
+                                            method: 'POST',
+                                            headers: { 'Content-Type': 'application/json' },
+                                            body: JSON.stringify({ action: 'folio_conflicts', payload: { apply: true } }),
+                                        });
+                                        const j = await r.json();
+                                        if (!r.ok) { showToast(j?.error || 'Clean-up failed.', 'error'); return; }
+                                        setFolioResult(j);
+                                        showToast(`Removed ${j.foliosRemoved} claim(s) from ${j.recordsChanged} client record(s).`, 'success');
+                                    } finally { setFolioBusy(false); }
+                                }}
+                                disabled={folioBusy || !folioResult || !folioResult.claimsToRemove}
+                                className="bg-blue-600 text-white px-5 py-3 rounded-xl font-black uppercase tracking-widest text-[10px] hover:bg-blue-700 transition disabled:opacity-40 flex items-center"
+                            >
+                                <GitBranch className="w-4 h-4 mr-2" /> Clean up
+                            </button>
+                        </div>
+                        {folioResult && (
+                            <div className="mt-5 text-sm text-slate-700 space-y-1">
+                                <p><b>{folioResult.foliosConflicted}</b> of {folioResult.foliosTotal} folios are claimed by more than one client.</p>
+                                <p><b>{folioResult.resolvable}</b> can be settled from the statements &mdash; {folioResult.claimsToRemove} wrong claim(s) to remove.</p>
+                                <p><b>{folioResult.unresolved}</b> need a person to decide.</p>
+                                {folioResult.apply && (
+                                    <p className="text-emerald-700 font-bold">
+                                        Done: {folioResult.foliosRemoved} claim(s) removed from {folioResult.recordsChanged} record(s).
+                                        Run Recalculate above so the reports follow.
+                                    </p>
+                                )}
+                                {!!folioResult.sampleUnresolved?.length && (
+                                    <details className="mt-2">
+                                        <summary className="cursor-pointer text-xs font-black uppercase tracking-widest text-slate-400">
+                                            The ones needing a decision
+                                        </summary>
+                                        <ul className="mt-2 text-xs text-slate-600 space-y-0.5">
+                                            {folioResult.sampleUnresolved.map((u: any) => (
+                                                <li key={u.folio}><span className="font-mono">{u.folio}</span> &mdash; {u.why}{u.investor ? ` (statements say "${u.investor}")` : ''}</li>
+                                            ))}
+                                        </ul>
+                                    </details>
+                                )}
+                            </div>
+                        )}
                     </div>
                     <div className="p-8">
                         <h4 className="font-bold text-slate-900 mb-2">System Reset</h4>
