@@ -1194,6 +1194,37 @@ export function extractBrokerageRowsFromText(rawText, amcName, sourceFile) {
     }
 }
 
+
+/**
+ * The last gate before a name is allowed into the master: is this really a scheme?
+ *
+ * A card's footer ("Mutual Funds are subject to market risks … maximum of Rs.2"), its
+ * SEBI registration line ("… Mutual Fund -SEBI Regn.No:MF…") and similar prose were
+ * landing as schemes, because the parsers key on the word "Fund" and on a rate nearby.
+ * A scheme name has a scheme-type word and no sentence fragments, and the PDF text
+ * layer glues words of a footer together ("subjecttomarketrisks") while a real name
+ * never has a 16-letter lowercase run.
+ */
+const SCHEME_WORD = /\b(fund|funds|etf|fof|elss|plan|scheme|index|fmp|savings|bond|liquid|overnight|arbitrage|gilt)\b/i;
+const FOOTER_PROSE = /\bregn\b|\bregistration\b|\bmutual\s+funds?\s*[-–:]|\bsubject\s*to\b|\bmaximum\b|\bapplication\b|\bmode\b|\bread\s+all\b|\bmarket\s*risks?\b|\bsebi\b|\bamfi\b/i;
+export const looksLikeScheme = (name) => {
+    const s = String(name || "").trim();
+    if (s.length < 8) return false;
+    if (!SCHEME_WORD.test(s)) return false;
+    if (/[a-z]{16,}/.test(s)) return false;                 // glued prose
+    if (FOOTER_PROSE.test(s) || DISCLAIMER.test(s)) return false;
+    if (/\bRs\.?\s*\d/i.test(s) || /\d{4,}/.test(s.replace(/\b(19|20)\d{2}\b/g, ""))) return false;
+    return true;
+};
+const onlyRealSchemes = (rows, label) => {
+    const kept = rows.filter(r => looksLikeScheme(r.schemeName));
+    if (kept.length !== rows.length) {
+        const dropped = [...new Set(rows.filter(r => !looksLikeScheme(r.schemeName)).map(r => r.schemeName))];
+        console.log(`🧹 [Extractor] ${label}: dropped ${dropped.length} non-scheme line(s): ${dropped.map(d => JSON.stringify(String(d).slice(0, 60))).join(", ")}`);
+    }
+    return kept;
+};
+
 /**
  * Reads a PDF buffer, extracts raw text, then delegates to extractBrokerageRowsFromText.
  */
@@ -1243,5 +1274,5 @@ export async function extractBrokerageRowsFromPdfBuffer(buffer, amcName, sourceF
     let [label, winner] = cands[0];
     for (const [l, r] of cands.slice(1)) if (distinct(r) > distinct(winner)) { label = l; winner = r; }
     console.log(`✅ [Extractor] ${amcName}: pdf-parse=${distinct(rowsA)}, pdfjs-rows=${distinct(rowsB)}, columnar=${distinct(rowsC)}, tenure-grid=${distinct(rowsD)} distinct → using ${label} (${distinct(winner)} schemes)`);
-    return winner;
+    return onlyRealSchemes(winner, `${amcName} (${sourceFile})`);
 }

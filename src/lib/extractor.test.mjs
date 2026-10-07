@@ -9,7 +9,7 @@
 // found by reading the PDF by hand. Each case below is a shape that has broken (or
 // could plausibly break) in production — run this before shipping any change to
 // brokerageExtractor.js. A scheme that must parse, and boilerplate that must NOT.
-import { extractBrokerageRowsFromText, extractTenureGridRows } from './brokerageExtractor.js';
+import { extractBrokerageRowsFromText, extractTenureGridRows, looksLikeScheme } from './brokerageExtractor.js';
 
 let pass = 0, fail = 0;
 
@@ -254,5 +254,14 @@ onwards*
   } else pass++;
 }
 
+// A card's footer and SEBI registration line must never be stored as a scheme.
+for (const n of ['THE WEALTH COMPANY Flexi Cap Fund', 'Nippon India ETF Nifty BeES', 'HDFC ELSS Tax Saver', 'Axis Bluechip Fund', 'Kotak Nifty 50 Index Fund', 'SBI Liquid Fund']) {
+  if (looksLikeScheme(n)) pass++; else { console.log('  FAIL  should keep ' + n); fail++; }
+}
+for (const n of ['Mutual Fundsaresubjecttomarketrisks For Mode- oftheamountoft', 'THE WEALTH COMPANY Mutual Fund -SEBI Regn.No:MF', 'Flexi Cap Fund Rs.2 lakh application', 'Fund']) {
+  if (!looksLikeScheme(n)) pass++; else { console.log('  FAIL  should drop ' + n); fail++; }
+}
+
 console.log(`\n${pass} passed, ${fail} failed`);
 process.exit(fail ? 1 : 0);
+

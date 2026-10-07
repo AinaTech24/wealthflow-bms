@@ -13,6 +13,23 @@ interface State {
     error: Error | null;
 }
 
+// A deploy replaces the hashed files under /assets, so a tab opened before it still points at
+// chunks that no longer exist ("Failed to fetch dynamically imported module"). The fix is one
+// reload to pick up the new index.html. Done once per minute at most, so a genuinely broken
+// server cannot put the browser into a reload loop.
+const isStaleChunkError = (err: Error | null) =>
+    /dynamically imported module|Importing a module script failed|ChunkLoadError|error loading dynamically/i.test(err?.message || '');
+
+function reloadOnceForNewDeploy(): boolean {
+    try {
+        const last = Number(sessionStorage.getItem('wf_chunk_reload') || 0);
+        if (Date.now() - last < 60_000) return false;
+        sessionStorage.setItem('wf_chunk_reload', String(Date.now()));
+    } catch { /* storage blocked: reload once anyway */ }
+    window.location.reload();
+    return true;
+}
+
 export class ErrorBoundary extends Component<Props, State> {
     constructor(props: Props) {
         super(props);
@@ -25,6 +42,7 @@ export class ErrorBoundary extends Component<Props, State> {
 
     componentDidCatch(error: Error, errorInfo: React.ErrorInfo) {
         console.error('ErrorBoundary caught:', error, errorInfo);
+        if (isStaleChunkError(error)) reloadOnceForNewDeploy();
     }
 
     componentDidUpdate(prevProps: Props) {
@@ -35,6 +53,7 @@ export class ErrorBoundary extends Component<Props, State> {
     }
 
     handleReset = () => {
+        if (isStaleChunkError(this.state.error)) { window.location.reload(); return; }
         this.setState({ hasError: false, error: null });
     };
 
