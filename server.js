@@ -10,6 +10,7 @@ import cors from 'cors';
 import pool from './src/lib/db.js';
 // Shared with the importer — see src/lib/nameMatch.js for why there is only one copy.
 import { nameTokens, nameContradicts, bestNameMatches } from './src/lib/nameMatch.js';
+import { planBranchRestructure } from './src/lib/branchRestructure.js';
 import bcrypt from 'bcrypt';
 import jwt from 'jsonwebtoken';
 import rateLimit from 'express-rate-limit';
@@ -2969,6 +2970,67 @@ app.all('/api/data', mutationLimiter, async (req, res) => {
           return res.json({ success: true, recorded: accepted.length, total: Math.round(total * 100) / 100, skipped });
         } catch (e) {
           console.error('[settle_bulk]', e);
+          return res.status(500).json({ error: e.message });
+        }
+      }
+
+      // ── Move a whole branch under a new manager ──────────────────────────
+      //
+      //    When a BM is promoted and a new firm is made the BM beneath them (Manish
+      //    Singh to L5, MSA FINANCIAL SERVICES LLP as the new L4), the RMs who
+      //    reported to the old BM and the clients they carry have to follow. The
+      //    app moves a promoted member's clients to the new slot, but nothing puts
+      //    the NEW manager into those clients, so they sit with no BM at all.
+      //
+      //    Preview first (apply=false). Applying fills an EMPTY slot only — it never
+      //    overwrites one — and touches no transaction, payout, invoice or payment.
+      //    It does not recalculate: payouts for past months are a policy decision.
+      if (action === 'branch_restructure') {
+        if (!req.user || req.user.role !== 'ADMIN') return res.status(403).json({ error: 'Admin privileges required' });
+        const fromId = String(payload?.fromId || '').trim(), toId = String(payload?.toId || '').trim();
+        const apply = payload?.apply === true;
+        try {
+          const [teamRows] = await pool.query("SELECT id, name, level, parentId FROM team");
+          const [clientRows] = await pool.query("SELECT id, name, data FROM clients");
+          const dataOf = new Map(), clients = [];
+          for (const c of clientRows) {
+            let d = {}; try { d = JSON.parse(c.data || '{}'); } catch { continue; }
+            dataOf.set(c.id, d);
+            clients.push({ id: c.id, name: (c.name || '').trim(), hierarchy: d.hierarchy || {} });
+          }
+          const plan = planBranchRestructure({ clients, team: teamRows, fromId, toId });
+          if (plan.error) return res.status(400).json({ error: plan.error });
+          const applied = { clients: 0, team: 0 };
+          if (apply) {
+            const stamp = new Date().toISOString();
+            for (const ch of plan.clientChanges) {
+              const d = dataOf.get(ch.id);
+              d.hierarchy = { ...(d.hierarchy || {}), [ch.slot]: ch.toId };
+              d.updatedAt = stamp;
+              await pool.query("UPDATE clients SET data=? WHERE id=?", [JSON.stringify(d), ch.id]);
+              applied.clients++;
+            }
+            for (const t of plan.teamChanges) {
+              await pool.query("UPDATE team SET parentId=? WHERE id=?", [t.toParent, t.id]);
+              applied.team++;
+            }
+            await pool.query(
+              'INSERT INTO activity_log (userId, userName, action, description, createdAt) VALUES (?,?,?,?,NOW())',
+              [req.user.id, req.user.name || req.user.email || 'admin', 'BRANCH_RESTRUCTURE',
+               `Moved ${plan.from}'s branch under ${plan.to}: ${applied.clients} client(s) placed at L${plan.level}, ${applied.team} team member(s) re-parented`]);
+            invalidateSummaryCache();
+          }
+          return res.json({
+            apply, from: plan.from, to: plan.to, level: plan.level,
+            clients: plan.clientChanges.length,
+            teamMembers: plan.teamChanges.map(t => ({ name: t.name, level: t.level })),
+            skipped: plan.skipped.length,
+            sampleClients: plan.clientChanges.slice(0, 60).map(c => c.name),
+            skippedClients: plan.skipped.slice(0, 30).map(x => x.name),
+            applied,
+          });
+        } catch (e) {
+          console.error('[branch_restructure]', e);
           return res.status(500).json({ error: e.message });
         }
       }

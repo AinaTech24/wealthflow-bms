@@ -308,6 +308,11 @@ export const Settings: React.FC<SettingsProps> = ({ currentUser }) => {
     // Folio ownership clean-up — see the panel in the System tab.
     const [folioBusy, setFolioBusy] = useState(false);
     const [folioResult, setFolioResult] = useState<any>(null);
+    // Branch restructure: move everyone under one manager beneath another.
+    const [brFrom, setBrFrom] = useState('');
+    const [brTo, setBrTo] = useState('');
+    const [brBusy, setBrBusy] = useState(false);
+    const [brResult, setBrResult] = useState<any>(null);
 
     const handlePasswordReset = async () => {
         if (!resetPasswordModal) return;
@@ -337,6 +342,37 @@ export const Settings: React.FC<SettingsProps> = ({ currentUser }) => {
         } finally {
             setResetPasswordLoading(false);
         }
+    };
+
+    const runBranch = async (apply: boolean) => {
+        if (!brFrom || !brTo) { showToast('Choose both managers first.', 'error'); return; }
+        if (apply) {
+            const fromName = team.find(t => t.id === brFrom)?.name, toName = team.find(t => t.id === brTo)?.name;
+            const confirmed = await showConfirm({
+                title: 'Move this branch?',
+                message: `Everyone who reports to ${fromName} will report to ${toName}, and ${brResult?.clients ?? 'the'} client(s) with no manager at that level get ${toName} placed there. No slot that is already filled is changed. Transactions, payouts, invoices and payments are not touched, and nothing is recalculated. This applies to EVERY month, not just August.`,
+                confirmText: 'Move branch',
+                variant: 'warning',
+            });
+            if (!confirmed) return;
+        }
+        setBrBusy(true);
+        try {
+            const r = await authFetch('/api/data', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ action: 'branch_restructure', payload: { fromId: brFrom, toId: brTo, apply } }),
+            });
+            const j = await r.json();
+            if (!r.ok) { showToast(j?.error || 'That did not work.', 'error'); return; }
+            setBrResult(j);
+            if (apply) {
+                showToast(`Done: ${j.applied.clients} client(s) and ${j.applied.team} team member(s) moved. Reloading...`, 'success');
+                setTimeout(() => window.location.reload(), 1800);
+            }
+        } catch (e: any) {
+            showToast(`That did not finish (${e?.message || 'no response'}). Run Check first to see where it stands.`, 'error');
+        } finally { setBrBusy(false); }
     };
 
     // Settle one folio whose investor is filed under several RMs. The statements cannot
@@ -1185,6 +1221,59 @@ export const Settings: React.FC<SettingsProps> = ({ currentUser }) => {
                                         </ul>
                                     </details>
                                 )}
+                            </div>
+                        )}
+                    </div>
+                    {/* When a BM is promoted and a new firm is made the BM beneath them, the RMs and
+                        clients that sat under the old BM have to follow. This does it in one go instead
+                        of one client at a time. */}
+                    <div className="p-8 border-b border-slate-100">
+                        <h4 className="font-bold text-slate-900 mb-2">Branch restructure</h4>
+                        <p className="text-sm text-slate-600 mb-4">
+                            Use when a manager is promoted and a new BM is placed beneath them. Everyone who reports to the first person
+                            is moved to report to the second, and clients that sat under the first with <b>no manager at the second&rsquo;s level</b> get
+                            the second placed there. A slot that is already filled is never overwritten. Check first, it changes nothing.
+                        </p>
+                        <div className="grid grid-cols-1 sm:grid-cols-2 gap-3 mb-4">
+                            <div>
+                                <label htmlFor="br-from" className="block text-[10px] font-black uppercase tracking-widest text-slate-400 mb-1">Everyone currently under</label>
+                                <select id="br-from" value={brFrom} onChange={e => { setBrFrom(e.target.value); setBrResult(null); }}
+                                    className="w-full px-3 py-2 rounded-lg border border-slate-200 text-sm font-bold bg-white">
+                                    <option value="">Choose a person</option>
+                                    {[...team].sort((a, b) => a.name.localeCompare(b.name)).map(t => <option key={t.id} value={t.id}>{t.name.trim()} (L{t.level})</option>)}
+                                </select>
+                            </div>
+                            <div>
+                                <label htmlFor="br-to" className="block text-[10px] font-black uppercase tracking-widest text-slate-400 mb-1">Move them under</label>
+                                <select id="br-to" value={brTo} onChange={e => { setBrTo(e.target.value); setBrResult(null); }}
+                                    className="w-full px-3 py-2 rounded-lg border border-slate-200 text-sm font-bold bg-white">
+                                    <option value="">Choose a person</option>
+                                    {[...team].sort((a, b) => a.name.localeCompare(b.name)).map(t => <option key={t.id} value={t.id}>{t.name.trim()} (L{t.level})</option>)}
+                                </select>
+                            </div>
+                        </div>
+                        <div className="flex items-center gap-3 flex-wrap">
+                            <button onClick={() => runBranch(false)} disabled={brBusy || !brFrom || !brTo}
+                                className="bg-slate-800 text-white px-5 py-3 rounded-xl font-black uppercase tracking-widest text-[10px] hover:bg-slate-900 transition disabled:opacity-50 flex items-center">
+                                {brBusy ? <Loader2 className="w-4 h-4 mr-2 animate-spin" /> : <Search className="w-4 h-4 mr-2" />} Check only
+                            </button>
+                            <button onClick={() => runBranch(true)} disabled={brBusy || !brResult || (!brResult.clients && !brResult.teamMembers?.length) || brResult.apply}
+                                className="bg-blue-600 text-white px-5 py-3 rounded-xl font-black uppercase tracking-widest text-[10px] hover:bg-blue-700 transition disabled:opacity-40 flex items-center">
+                                <GitBranch className="w-4 h-4 mr-2" /> Move branch
+                            </button>
+                        </div>
+                        {brResult && (
+                            <div className="mt-5 text-sm text-slate-700 space-y-1">
+                                <p><b>{brResult.clients}</b> client(s) will get <b>{brResult.to}</b> placed at L{brResult.level}.</p>
+                                <p><b>{brResult.teamMembers?.length ?? 0}</b> team member(s) will report to <b>{brResult.to}</b>{brResult.teamMembers?.length ? ': ' + brResult.teamMembers.map((m: any) => `${m.name.trim()} (L${m.level})`).join(', ') : ''}.</p>
+                                {brResult.skipped > 0 && <p className="text-amber-700"><b>{brResult.skipped}</b> client(s) already have someone at that level and are left alone.</p>}
+                                {!!brResult.sampleClients?.length && (
+                                    <details className="mt-2">
+                                        <summary className="cursor-pointer text-xs font-black uppercase tracking-widest text-slate-400">The clients</summary>
+                                        <p className="mt-2 text-xs text-slate-600">{brResult.sampleClients.join(', ')}</p>
+                                    </details>
+                                )}
+                                <p className="text-xs text-slate-500 pt-1">This applies to every month, not only the latest. It does not recalculate payouts; do that yourself once you have looked at the result.</p>
                             </div>
                         )}
                     </div>
