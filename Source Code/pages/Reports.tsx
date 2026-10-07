@@ -300,9 +300,23 @@ export const Reports: React.FC<ReportsProps> = ({ currentUser }) => {
   // here from the 2dp rupee amounts made a true 50% display as 49.96%.
   const [serverPctByUser, setServerPctByUser] = useState<Map<string, number>>(new Map());
   const [isLoadingServerPayouts, setIsLoadingServerPayouts] = useState(false);
+  // Why this exists: the figures below come from the server PER MONTH. Until the new
+  // month's request finished, the maps still held the PREVIOUS month's numbers, so
+  // changing the dropdown showed June's gross under a July label — and exporting in
+  // that window wrote the wrong month into the file. A request that failed (a proxy
+  // timeout is enough) only logged to the console and left the stale figures up with
+  // no warning at all.
+  const [serverPayoutsError, setServerPayoutsError] = useState<string | null>(null);
+  const [payoutsRetry, setPayoutsRetry] = useState(0);
   useEffect(() => {
     let cancelled = false;
     setIsLoadingServerPayouts(true);
+    setServerPayoutsError(null);
+    // Never leave another month's figures on screen while this one loads.
+    setServerGrossByUser(new Map());
+    setServerOwnerGrossByUser(new Map());
+    setServerEarningsByUser(new Map());
+    setServerPctByUser(new Map());
     const url = `/api/data?action=team_payouts&year=${encodeURIComponent(filters.year)}&month=${encodeURIComponent(filters.month)}`;
     authFetch(url)
       .then(r => r.ok ? r.json() : Promise.reject(new Error(`HTTP ${r.status}`)))
@@ -324,11 +338,14 @@ export const Reports: React.FC<ReportsProps> = ({ currentUser }) => {
         setServerPctByUser(pctMap);
       })
       .catch(err => {
-        if (!cancelled) console.warn('[team_payouts] fetch failed, falling back to client compute:', err.message);
+        if (!cancelled) {
+          console.warn('[team_payouts] fetch failed, falling back to client compute:', err.message);
+          setServerPayoutsError(err.message || 'request failed');
+        }
       })
       .finally(() => { if (!cancelled) setIsLoadingServerPayouts(false); });
     return () => { cancelled = true; };
-  }, [filters.year, filters.month, refreshTick]);
+  }, [filters.year, filters.month, refreshTick, payoutsRetry]);
 
   // ── Reconciliation: fetch unmapped (orphan) transactions for the active period.
   type UnmappedGroup = { pan: string | null; folio: string | null; name: string | null; gross: number; n: number };
@@ -694,6 +711,10 @@ export const Reports: React.FC<ReportsProps> = ({ currentUser }) => {
   const [invoiceDraft, setInvoiceDraft] = useState<{ invoice: PayoutInvoice; isEdit: boolean; gross: number } | null>(null);
   const [savingInvoice, setSavingInvoice] = useState(false);
   const handleExportReconciliation = async () => {
+    if (isLoadingServerPayouts || serverPayoutsError) {
+      showToast('This month’s figures have not finished loading, so the export would carry the wrong numbers. Wait for them, or press Retry.', 'warning');
+      return;
+    }
     setReconExporting(true);
     try {
       const periodKnown = filters.year !== 'All' && filters.month !== 'All';
@@ -2060,7 +2081,8 @@ export const Reports: React.FC<ReportsProps> = ({ currentUser }) => {
                   });
                   exportToExcel(rows, `WealthflowTeamPayouts_${filters.year}_${filters.month}`, 'Team Payouts');
                 }}
-                disabled={filteredTeamWithPayouts.length === 0}
+                disabled={filteredTeamWithPayouts.length === 0 || isLoadingServerPayouts || !!serverPayoutsError}
+                title={isLoadingServerPayouts ? 'Wait for this month’s figures to finish loading' : serverPayoutsError ? 'This month’s figures failed to load' : undefined}
                 className="flex items-center gap-1.5 px-3 py-1.5 text-xs font-bold text-emerald-700 bg-emerald-50 hover:bg-emerald-100 border border-emerald-200 rounded-lg transition disabled:opacity-40 disabled:cursor-not-allowed"
               >
                 <Download className="w-3.5 h-3.5" /> Export Excel
@@ -2068,6 +2090,18 @@ export const Reports: React.FC<ReportsProps> = ({ currentUser }) => {
               <span className="text-[10px] bg-blue-100 text-blue-700 font-black px-2 py-1 rounded-full whitespace-nowrap">{filters.month === 'All' ? 'Full Year' : new Date(2000, parseInt(filters.month) - 1).toLocaleString('default', { month: 'long' })} {filters.year}</span>
             </div>
           </div>
+          {(isLoadingServerPayouts || serverPayoutsError) && (
+            <div className={`mx-6 mb-3 px-4 py-2.5 rounded-lg text-xs font-bold flex items-center justify-between gap-3 ${serverPayoutsError ? 'bg-red-50 text-red-700 border border-red-200' : 'bg-amber-50 text-amber-700 border border-amber-200'}`}>
+              <span>
+                {serverPayoutsError
+                  ? `The figures for this month could not be loaded (${serverPayoutsError}). What is shown below is only a partial local estimate — do not export or compare it.`
+                  : 'Loading this month’s figures… the numbers below are not final yet.'}
+              </span>
+              {serverPayoutsError && (
+                <button onClick={() => setPayoutsRetry(n => n + 1)} className="px-3 py-1 rounded-md bg-red-600 text-white text-[10px] font-black uppercase tracking-widest">Retry</button>
+              )}
+            </div>
+          )}
           <table className="w-full text-sm text-left">
             <thead className="bg-white text-slate-400 font-black border-b border-slate-200 uppercase tracking-widest text-[9px]">
               <tr>
