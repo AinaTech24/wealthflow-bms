@@ -308,6 +308,12 @@ export const Settings: React.FC<SettingsProps> = ({ currentUser }) => {
     // Folio ownership clean-up — see the panel in the System tab.
     const [folioBusy, setFolioBusy] = useState(false);
     const [folioResult, setFolioResult] = useState<any>(null);
+    // Assign folios to one RM, optionally moving that month's existing rows with them.
+    const [faFolios, setFaFolios] = useState('');
+    const [faRm, setFaRm] = useState('');
+    const [faMonth, setFaMonth] = useState('');
+    const [faBusy, setFaBusy] = useState(false);
+    const [faResult, setFaResult] = useState<any>(null);
     // Branch restructure: move everyone under one manager beneath another.
     const [brFrom, setBrFrom] = useState('');
     const [brTo, setBrTo] = useState('');
@@ -342,6 +348,33 @@ export const Settings: React.FC<SettingsProps> = ({ currentUser }) => {
         } finally {
             setResetPasswordLoading(false);
         }
+    };
+
+    const runAssignForm = async () => {
+        const folios = faFolios.split(/[\s,;]+/).map(f => f.trim()).filter(Boolean);
+        if (!folios.length || !faRm) { showToast('Enter at least one folio and choose the RM.', 'error'); return; }
+        const rmName = team.find(t => t.id === faRm)?.name?.trim();
+        const confirmed = await showConfirm({
+            title: 'Assign these folios to one RM?',
+            message: `${folios.length} folio(s) will stay only on ${rmName}'s record and be removed from every other record that claims them.${faMonth ? ` Their existing ${faMonth} rows will also be pointed at ${rmName}'s record.` : ' No existing rows are moved.'} Payout earnings follow only after Recalculate.`,
+            confirmText: 'Assign',
+            variant: 'warning',
+        });
+        if (!confirmed) return;
+        setFaBusy(true); setFaResult(null);
+        try {
+            const r = await authFetch('/api/data', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ action: 'folio_assign', payload: { assign: folios.map(f => ({ folio: f, rmId: faRm })), repointPeriod: faMonth } }),
+            });
+            const j = await r.json();
+            if (!r.ok) { showToast(j?.error || 'Could not assign the folios.', 'error'); return; }
+            setFaResult(j);
+            showToast(`${j.assigned} folio(s) assigned${faMonth ? `, ${j.rowsMoved} row(s) moved` : ''}${j.skipped?.length ? `, ${j.skipped.length} skipped` : ''}.`, j.skipped?.length ? 'warning' : 'success');
+        } catch (e: any) {
+            showToast(`Assign did not finish (${e?.message || 'no response'}). Nothing may have changed; run Check only to see.`, 'error');
+        } finally { setFaBusy(false); }
     };
 
     const runBranch = async (apply: boolean) => {
@@ -1170,6 +1203,60 @@ export const Settings: React.FC<SettingsProps> = ({ currentUser }) => {
                             >
                                 <GitBranch className="w-4 h-4 mr-2" /> Clean up
                             </button>
+                        </div>
+                        <div className="mt-6 pt-5 border-t border-slate-100">
+                            <h5 className="text-[10px] font-black uppercase tracking-widest text-slate-400 mb-1">Assign folios to one RM</h5>
+                            <p className="text-xs text-slate-500 mb-3">
+                                When AdvisorKhoj splits one investor between two RMs by folio, say which RM each folio belongs to. The folio stays on that RM&rsquo;s
+                                record and leaves every other. Optionally the chosen month&rsquo;s rows move too, so the report corrects without re-uploading the month.
+                            </p>
+                            <textarea
+                                value={faFolios}
+                                onChange={e => setFaFolios(e.target.value)}
+                                rows={2}
+                                aria-label="Folios to assign"
+                                placeholder="Folios, separated by commas or new lines"
+                                className="w-full px-3 py-2 rounded-lg border border-slate-200 text-sm font-mono bg-white mb-3"
+                            />
+                            <div className="flex items-center gap-3 flex-wrap">
+                                <select value={faRm} onChange={e => setFaRm(e.target.value)} aria-label="RM who owns these folios"
+                                    className="px-3 py-2 rounded-lg border border-slate-200 text-sm font-bold bg-white">
+                                    <option value="">Belongs to&hellip;</option>
+                                    {[...team].sort((a, b) => a.name.localeCompare(b.name)).map(t => <option key={t.id} value={t.id}>{t.name.trim()} (L{t.level})</option>)}
+                                </select>
+                                <select value={faMonth} onChange={e => setFaMonth(e.target.value)} aria-label="Month whose existing rows should move"
+                                    className="px-3 py-2 rounded-lg border border-slate-200 text-sm font-bold bg-white">
+                                    <option value="">Do not move any rows</option>
+                                    {Array.from({ length: 8 }, (_, i) => {
+                                        const d = new Date(new Date().getFullYear(), new Date().getMonth() - i, 1);
+                                        const v = `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}`;
+                                        return <option key={v} value={v}>Also move {v} rows</option>;
+                                    })}
+                                </select>
+                                <button onClick={runAssignForm} disabled={faBusy || !faFolios.trim() || !faRm}
+                                    className="bg-blue-600 text-white px-5 py-2.5 rounded-xl font-black uppercase tracking-widest text-[10px] hover:bg-blue-700 transition disabled:opacity-40 flex items-center">
+                                    {faBusy ? <Loader2 className="w-4 h-4 mr-2 animate-spin" /> : <GitBranch className="w-4 h-4 mr-2" />} Assign
+                                </button>
+                            </div>
+                            {faResult && (
+                                <div className="mt-3 text-xs text-slate-700 space-y-1">
+                                    <p><b>{faResult.assigned}</b> folio(s) assigned, {faResult.foliosRemoved} claim(s) removed from {faResult.recordsChanged} record(s){faMonth ? `, ${faResult.rowsMoved} row(s) moved` : ''}.</p>
+                                    {!!faResult.skipped?.length && (
+                                        <p className="text-amber-700">Skipped: {faResult.skipped.map((x: any) => `${x.folio} (${x.why})`).join('; ')}</p>
+                                    )}
+                                    {!!faResult.movedFrom?.length && (
+                                        <details>
+                                            <summary className="cursor-pointer font-black uppercase tracking-widest text-slate-400 text-[10px]">Where those rows were sitting</summary>
+                                            <ul className="mt-1 list-disc ml-4">
+                                                {faResult.movedFrom.map((m: any, i: number) => (
+                                                    <li key={i}><span className="font-mono">{m.folio}</span>: {m.rows} row(s), &#8377;{Number(m.gross).toLocaleString('en-IN')} were on <b>{m.from}</b></li>
+                                                ))}
+                                            </ul>
+                                        </details>
+                                    )}
+                                    <p className="text-slate-500">Reports update at once. Run Recalculate above for payout earnings.</p>
+                                </div>
+                            )}
                         </div>
                         {folioResult && (
                             <div className="mt-5 text-sm text-slate-700 space-y-1">

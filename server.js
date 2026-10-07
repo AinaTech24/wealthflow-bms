@@ -11,6 +11,7 @@ import pool from './src/lib/db.js';
 // Shared with the importer — see src/lib/nameMatch.js for why there is only one copy.
 import { nameTokens, nameContradicts, bestNameMatches } from './src/lib/nameMatch.js';
 import { planBranchRestructure } from './src/lib/branchRestructure.js';
+import { pickOwnerRecord } from './src/lib/folioOwner.js';
 import bcrypt from 'bcrypt';
 import jwt from 'jsonwebtoken';
 import rateLimit from 'express-rate-limit';
@@ -3074,10 +3075,11 @@ app.all('/api/data', mutationLimiter, async (req, res) => {
           for (const pick of picks) {
             const folio = String(pick?.folio || '').trim(), rmId = String(pick?.rmId || '').trim();
             const ids = claimants.get(folio) || [];
-            const mine = ids.filter(id => (dataOf.get(id)?.hierarchy?.level3Id || '') === rmId);
-            if (!folio || !rmId || !mine.length) { skipped.push({ folio, why: 'no record under that RM claims this folio' }); continue; }
-            mine.sort((x, y) => (dataOf.get(y).folios || []).length - (dataOf.get(x).folios || []).length || x.localeCompare(y));
-            const keep = mine[0];
+            const owner = folio && rmId
+              ? pickOwnerRecord(ids.map(id => ({ id, folios: dataOf.get(id)?.folios, hierarchy: dataOf.get(id)?.hierarchy })), rmId)
+              : null;
+            if (!owner) { skipped.push({ folio, why: 'no record under that RM claims this folio' }); continue; }
+            const keep = owner.id;
             for (const id of ids) {
               if (id === keep) continue;
               if (!strip.has(id)) strip.set(id, new Set());
@@ -3094,12 +3096,41 @@ app.all('/api/data', mutationLimiter, async (req, res) => {
             await pool.query("UPDATE clients SET data=? WHERE id=?", [JSON.stringify(d), cid]);
             recordsChanged++; foliosRemoved += before - d.folios.length;
           }
+          // Optionally point that month's EXISTING rows at the owner too. Fixing the folio
+          // lists only decides where the NEXT import lands; rows already filed under a
+          // House client, or under the other RM's record, stay put until re-imported.
+          // Team Payouts reads each row's mappedClientId and the client's CURRENT
+          // hierarchy, so moving them corrects the report at once, without
+          // deleting and re-uploading the month. mappedClientId lives in the column
+          // AND inside data, and the engines read the JSON, so both are written.
+          // Payout EARNINGS follow only after Recalculate.
+          const period = /^\d{4}-\d{2}$/.test(String(payload?.repointPeriod || '')) ? String(payload.repointPeriod) : '';
+          const nameOf = new Map(clientRows.map(c => [c.id, (c.name || '').trim()]));
+          let rowsMoved = 0; const movedFrom = [];
+          if (period) {
+            for (const d of done) {
+              const [before] = await pool.query(
+                `SELECT mappedClientId cid, COUNT(*) n, ROUND(SUM(grossAmount),2) g FROM transactions
+                  WHERE brokeragePeriod = ? AND TRIM(JSON_UNQUOTE(JSON_EXTRACT(data,'$.folio'))) = ? GROUP BY mappedClientId`,
+                [period, d.folio]);
+              const [r] = await pool.query(
+                `UPDATE transactions SET mappedClientId = ?, data = JSON_SET(data, '$.mappedClientId', ?)
+                  WHERE brokeragePeriod = ? AND TRIM(JSON_UNQUOTE(JSON_EXTRACT(data,'$.folio'))) = ?
+                    AND (mappedClientId IS NULL OR mappedClientId <> ?)`,
+                [d.keptOn, d.keptOn, period, d.folio, d.keptOn]);
+              rowsMoved += r.affectedRows || 0;
+              for (const b of before) {
+                if (b.cid === d.keptOn) continue;
+                movedFrom.push({ folio: d.folio, from: nameOf.get(b.cid) || b.cid || '(no client)', rows: Number(b.n), gross: Number(b.g) });
+              }
+            }
+          }
           await pool.query(
             'INSERT INTO activity_log (userId, userName, action, description, createdAt) VALUES (?,?,?,?,NOW())',
             [req.user.id, req.user.name || req.user.email || 'admin', 'FOLIO_ASSIGN',
-             `Assigned ${done.length} folio(s) to a single RM; removed ${foliosRemoved} claim(s) from ${recordsChanged} record(s)`]);
+             `Assigned ${done.length} folio(s) to a single RM; removed ${foliosRemoved} claim(s) from ${recordsChanged} record(s)${period ? `; moved ${rowsMoved} ${period} row(s)` : ''}`]);
           invalidateSummaryCache();
-          return res.json({ success: true, assigned: done.length, recordsChanged, foliosRemoved, skipped });
+          return res.json({ success: true, assigned: done.length, recordsChanged, foliosRemoved, skipped, rowsMoved, movedFrom });
         } catch (e) {
           console.error('[folio_assign]', e);
           return res.status(500).json({ error: e.message });
