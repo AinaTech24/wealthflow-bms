@@ -1508,6 +1508,33 @@ export const Imports: React.FC<ImportsProps> = ({ currentUser }) => {
       );
     }
 
+    // ── Wrong-order guard ──────────────────────────────────────────────────
+    // A brokerage statement has no PAN, and its AMC / scheme columns are codes. Both
+    // are filled in from the Transactions file (WBR2 / MFSD201) already in the system,
+    // and the transaction ID is a hash that includes them. So the SAME statement
+    // imported before that file gets blank PANs, code-valued names and a different set
+    // of IDs — and new investors, unmatched, are filed under House with no RM.
+    // The Folio Master leaves no trace to check, so only the Transactions file can be
+    // verified here; the message names both.
+    const isBrokerageStatementNow = selectedSource === TransactionSource.CAMS
+                                 || selectedSource === TransactionSource.KARVY
+                                 || selectedSource === TransactionSource.KFINTECH;
+    if (isBrokerageStatementNow) {
+      const periodNow = `${selectedYear}-${selectedMonth}`;
+      const haveTransactionsFile = existingTransactions.some(t =>
+        t.brokeragePeriod === periodNow &&
+        (t.source === TransactionSource.CAMS_WBR2 || t.source === TransactionSource.KARVY_MFSD201));
+      if (!haveTransactionsFile) {
+        const go = await showConfirm({
+          title: 'Transactions file not imported for this month',
+          message: `No Transactions file (WBR2 / MFSD201) has been imported for ${prettyPeriod(periodNow)}. The Brokerage Statement carries codes only; PAN, full investor names and scheme/AMC names come from that file. Imported first, this statement will be stored with blank PANs and code-valued names, will get different row IDs from a correct import, and new investors will land in House with no RM. Import step 1 (WBR2 / MFSD201) and step 2 (WBR9 / MFSD211) first.`,
+          confirmText: 'Import anyway',
+          variant: 'warning',
+        });
+        if (!go) return;
+      }
+    }
+
     if (newClientsFound.length > 0) {
       upsertClients(newClientsFound);
     }
@@ -1702,10 +1729,14 @@ export const Imports: React.FC<ImportsProps> = ({ currentUser }) => {
 
               {/* Source matrix: RTA × file type. Brokerage-only = codes; Transactions/Master = full PAN+names. */}
               <div className="mb-4 space-y-3">
+                {/* The ORDER is part of the data. A brokerage statement carries codes only: its PAN,
+                    full investor name and scheme/AMC names are read from the Transactions file that is
+                    already in the system, and a transaction's ID is built from them. Import the statement
+                    first and the same file gets different IDs, blank PANs and House clients. */}
                 {([
-                  { label: 'Brokerage Statement',  cams: TransactionSource.CAMS,         karvy: TransactionSource.KARVY,         hint: 'Commission file (codes only)' },
-                  { label: 'Transactions (Full)',  cams: TransactionSource.CAMS_WBR2,    karvy: TransactionSource.KARVY_MFSD201, hint: 'WBR2 / MFSD201 — PAN + full names' },
-                  { label: 'Folio Master',         cams: TransactionSource.CAMS_WBR9,    karvy: TransactionSource.KARVY_MFSD211, hint: 'WBR9 / MFSD211 — investor master only' },
+                  { label: '1 · Transactions (Full)', cams: TransactionSource.CAMS_WBR2,    karvy: TransactionSource.KARVY_MFSD201, hint: 'WBR2 / MFSD201 — PAN + full names' },
+                  { label: '2 · Folio Master',        cams: TransactionSource.CAMS_WBR9,    karvy: TransactionSource.KARVY_MFSD211, hint: 'WBR9 / MFSD211 — investor master only' },
+                  { label: '3 · Brokerage Statement', cams: TransactionSource.CAMS,         karvy: TransactionSource.KARVY,         hint: 'CAMS (normal, then SIF), then Karvy' },
                 ] as const).map(row => (
                   <div key={row.label}>
                     <div className="flex items-center justify-between mb-1">
