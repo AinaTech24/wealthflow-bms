@@ -13,6 +13,7 @@ import { Pagination } from '../components/Pagination';
 import { useToast } from '../components/Toast';
 
 import { nameContradicts, bestNameMatches } from '../../src/lib/nameMatch.js';
+import { restoreCamsHeaders } from '../../src/lib/dbfHeaders.js';
 interface ImportsProps {
   currentUser: TeamMember;
 }
@@ -781,6 +782,11 @@ export const Imports: React.FC<ImportsProps> = ({ currentUser }) => {
             break;
           }
         }
+        // A CAMS file saved in the old dBase style carries cut-off UPPERCASE headers
+        // (BRKAGE_AMT, INV_NAME). Restore the real names so the format is recognised —
+        // otherwise every row imports as "Unknown" with ₹0.
+        if (jsonData[detectedIndex]) jsonData[detectedIndex] = restoreCamsHeaders(jsonData[detectedIndex]);
+        setRawFileContent(jsonData);
         setHeaderRowIndex(detectedIndex);
 
         // ── Auto-detect known CAMS / Karvy CSV format ─────────────────────
@@ -818,7 +824,9 @@ export const Imports: React.FC<ImportsProps> = ({ currentUser }) => {
   };
 
   const confirmHeaderRow = () => {
-    const headers = rawFileContent[headerRowIndex].map(h => String(h || '').trim()).filter(h => h);
+    const fixedRow = restoreCamsHeaders(rawFileContent[headerRowIndex]);
+    if (fixedRow !== rawFileContent[headerRowIndex]) setRawFileContent(rawFileContent.map((r, i) => i === headerRowIndex ? fixedRow : r));
+    const headers = fixedRow.map(h => String(h || '').trim()).filter(h => h);
     setFileHeaders(headers);
 
     const initialMapping: Record<string, string> = {};
