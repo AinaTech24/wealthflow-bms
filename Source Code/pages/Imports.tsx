@@ -195,6 +195,20 @@ const prettyPeriod = (p: string): string => {
   return `${names[Number(m[2]) - 1] || m[2]} ${m[1]}`;
 };
 
+/**
+ * Best guess at a batch's month from its FILE NAME — used only when the server has no
+ * rows to read it from (a trashed batch, or an empty one). "Aug-26 KFIN.csv",
+ * "July- 26 WBR2.xls" and "June- 26 R2.csv" all read as month + two-digit year.
+ * A name that carries neither ("201.xlsx") gives '' rather than a wrong month.
+ */
+const guessPeriodFromName = (name: string): string => {
+  const m = /\b(jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)[a-z]*[\s\-_.]*(20\d{2}|\d{2})\b/i.exec(name || '');
+  if (!m) return '';
+  const mm = ['jan', 'feb', 'mar', 'apr', 'may', 'jun', 'jul', 'aug', 'sep', 'oct', 'nov', 'dec'].indexOf(m[1].toLowerCase()) + 1;
+  const yy = m[2].length === 2 ? 2000 + Number(m[2]) : Number(m[2]);
+  return `${yy}-${String(mm).padStart(2, '0')}`;
+};
+
 // ─── Preset column maps for known CSV formats ───────────────────────────────
 const CAMS_PRESET_MAPPING: Record<string, string> = {
   folio:           'folio_no',
@@ -474,6 +488,10 @@ export const Imports: React.FC<ImportsProps> = ({ currentUser }) => {
   // ran. Two batches of the same file look identical on declared figures even
   // when one of them is an empty shell.
   const [batchGross, setBatchGross] = useState<Record<string, number> | null>(null);
+  // Which month each batch belongs to, from the server (the month its rows carry).
+  const [batchPeriods, setBatchPeriods] = useState<Record<string, string>>({});
+  const [historySearch, setHistorySearch] = useState('');
+  const [historyMonth, setHistoryMonth] = useState('');
   const [remapping, setRemapping] = useState(false);
   useEffect(() => {
     if (activeTab !== 'history') return;
@@ -481,11 +499,52 @@ export const Imports: React.FC<ImportsProps> = ({ currentUser }) => {
     (async () => {
       try {
         const r = await authFetch('/api/data?action=batch_counts');
-        if (r.ok && !cancelled) { const d = await r.json(); setBatchCounts(d.counts || {}); setBatchGross(d.gross || {}); }
+        if (r.ok && !cancelled) { const d = await r.json(); setBatchCounts(d.counts || {}); setBatchGross(d.gross || {}); setBatchPeriods(d.periods || {}); }
       } catch (_) { /* leave null → badges default to Live */ }
     })();
     return () => { cancelled = true; };
   }, [activeTab, batches.length]);
+  const periodOfBatch = (b: { id: string; fileName: string }): string =>
+    batchPeriods[b.id] || guessPeriodFromName(b.fileName);
+  const filterBatches = <T extends { id: string; fileName: string }>(list: T[]): T[] => {
+    const q = historySearch.trim().toLowerCase();
+    return list.filter(b =>
+      (!historyMonth || periodOfBatch(b) === historyMonth) &&
+      (!q || b.fileName.toLowerCase().includes(q)));
+  };
+  const renderHistoryFilter = (all: { id: string; fileName: string }[], shown: number) => {
+    const months = Array.from(new Set(all.map(periodOfBatch).filter(Boolean))).sort().reverse();
+    return (
+      <div className="flex items-center gap-3 flex-wrap px-6 py-3 border-b border-slate-100 dark:border-slate-700">
+        <input
+          type="search"
+          value={historySearch}
+          onChange={e => { setHistorySearch(e.target.value); setHistoryPage(1); }}
+          placeholder="Search file name..."
+          aria-label="Search batches by file name"
+          className="px-3 py-2 w-64 rounded-lg border border-slate-200 dark:border-slate-600 dark:bg-slate-900 dark:text-slate-100 text-xs font-bold"
+        />
+        <select
+          value={historyMonth}
+          onChange={e => { setHistoryMonth(e.target.value); setHistoryPage(1); }}
+          aria-label="Filter batches by month"
+          className="px-3 py-2 rounded-lg border border-slate-200 dark:border-slate-600 dark:bg-slate-900 dark:text-slate-100 text-xs font-bold"
+        >
+          <option value="">All months</option>
+          {months.map(m => <option key={m} value={m}>{prettyPeriod(m)}</option>)}
+        </select>
+        <span className="text-[11px] text-slate-500 dark:text-slate-400">Showing {shown} of {all.length}</span>
+        {(historySearch || historyMonth) && (
+          <button
+            onClick={() => { setHistorySearch(''); setHistoryMonth(''); setHistoryPage(1); }}
+            className="text-[10px] font-black uppercase tracking-widest text-blue-600 hover:text-blue-700"
+          >
+            Clear
+          </button>
+        )}
+      </div>
+    );
+  };
   const [isRestoringId, setIsRestoringId] = useState<string | null>(null);
   const [importStage, setImportStage] = useState<'UPLOAD' | 'HEADER_SELECTION' | 'MAPPING' | 'PREVIEW'>('UPLOAD');
 
@@ -2207,7 +2266,8 @@ export const Imports: React.FC<ImportsProps> = ({ currentUser }) => {
       )}
 
       {activeTab === 'history' && (() => {
-        const activeBatches = batches.filter(b => !b.deletedAt);
+        const activeBatchesAll = batches.filter(b => !b.deletedAt);
+        const activeBatches = filterBatches(activeBatchesAll);
         const paginated = activeBatches.slice((historyPage - 1) * pageSize, historyPage * pageSize);
         return (
         <div className="bg-white dark:bg-slate-800 rounded-xl border border-slate-200 dark:border-slate-700 shadow-sm overflow-hidden">
@@ -2223,6 +2283,7 @@ export const Imports: React.FC<ImportsProps> = ({ currentUser }) => {
               {remapping ? 'Re-mapping…' : 'Re-map Unmapped'}
             </button>
           </div>
+          {renderHistoryFilter(activeBatchesAll, activeBatches.length)}
           <table className="w-full text-sm text-left">
             <thead className="bg-slate-50 dark:bg-slate-900/50 text-slate-500 dark:text-slate-400 font-bold border-b border-slate-200 dark:border-slate-700 uppercase tracking-widest text-[10px]">
               <tr>
@@ -2237,7 +2298,12 @@ export const Imports: React.FC<ImportsProps> = ({ currentUser }) => {
             <tbody className="divide-y divide-slate-100 dark:divide-slate-700">
               {paginated.map(batch => (
                 <tr key={batch.id} className="hover:bg-slate-50 dark:hover:bg-slate-700/50 transition">
-                  <td className="px-6 py-4 font-bold text-slate-900 dark:text-slate-100">{batch.fileName}</td>
+                  <td className="px-6 py-4 font-bold text-slate-900 dark:text-slate-100">
+                    {batch.fileName}
+                    {periodOfBatch(batch) && (
+                      <span className="block text-[10px] font-black uppercase tracking-widest text-slate-400">{prettyPeriod(periodOfBatch(batch))}</span>
+                    )}
+                  </td>
                   <td className="px-6 py-4 text-slate-500 dark:text-slate-400 font-medium">{new Date(batch.uploadDate).toLocaleDateString()}</td>
                   {/* What the batch HOLDS now, not what it declared at import time. */}
                   {(() => {
@@ -2326,7 +2392,8 @@ export const Imports: React.FC<ImportsProps> = ({ currentUser }) => {
       })()}
 
       {activeTab === 'trash' && (() => {
-        const deletedBatches = batches.filter(b => b.deletedAt);
+        const deletedBatchesAll = batches.filter(b => b.deletedAt);
+        const deletedBatches = filterBatches(deletedBatchesAll);
         const paginated = deletedBatches.slice((historyPage - 1) * pageSize, historyPage * pageSize);
         return (
           <div className="bg-white dark:bg-slate-800 rounded-xl border border-slate-200 dark:border-slate-700 shadow-sm overflow-hidden">
@@ -2334,7 +2401,7 @@ export const Imports: React.FC<ImportsProps> = ({ currentUser }) => {
               <AlertTriangle className="w-3.5 h-3.5 mr-2 flex-shrink-0" />
               Deleted batches are hidden from reports but kept for restoration. Permanently purge to free space.
             </div>
-            {deletedBatches.length === 0 ? (
+            {deletedBatchesAll.length === 0 ? (
               <EmptyState
                 icon={Trash2}
                 title="Trash is empty"
@@ -2342,6 +2409,7 @@ export const Imports: React.FC<ImportsProps> = ({ currentUser }) => {
               />
             ) : (
               <>
+                {renderHistoryFilter(deletedBatchesAll, deletedBatches.length)}
                 <table className="w-full text-sm text-left">
                   <thead className="bg-slate-50 dark:bg-slate-900/50 text-slate-500 dark:text-slate-400 font-bold border-b border-slate-200 dark:border-slate-700 uppercase tracking-widest text-[10px]">
                     <tr>

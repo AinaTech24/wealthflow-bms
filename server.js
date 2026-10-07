@@ -2287,15 +2287,24 @@ app.all('/api/data', mutationLimiter, async (req, res) => {
       // instead of a misleading "Live". Uses the idx_batch index — cheap.
       if (action === 'batch_counts') {
         try {
-          const [rows] = await pool.query("SELECT batchId, COUNT(*) AS c, ROUND(SUM(grossAmount),2) AS g FROM transactions GROUP BY batchId");
+          const [rows] = await pool.query("SELECT batchId, brokeragePeriod, COUNT(*) AS c, ROUND(SUM(grossAmount),2) AS g FROM transactions GROUP BY batchId, brokeragePeriod");
           // Return the MONEY as well as the row count. Batch History showed the
           // totals declared when the import ran, so a batch whose rows had since
           // moved to a newer batch still displayed its original figures — two rows
           // looking identical, one an empty shell. Deleting the wrong one would
           // have destroyed a live month.
-          const counts = {}, gross = {};
-          for (const r of rows) { counts[r.batchId] = Number(r.c) || 0; gross[r.batchId] = Number(r.g) || 0; }
-          return res.json({ counts, gross });
+          // The month a batch belongs to is the one most of its rows carry. Batch History
+          // had no way to say it, so finding "everything for August" meant reading the
+          // file names of 80-odd batches, and a batch whose name does not say the month
+          // (a bare "201.xlsx") could not be found at all.
+          const counts = {}, gross = {}, periods = {}, best = {};
+          for (const r of rows) {
+            const id = r.batchId, c = Number(r.c) || 0;
+            counts[id] = (counts[id] || 0) + c;
+            gross[id] = Math.round(((gross[id] || 0) + (Number(r.g) || 0)) * 100) / 100;
+            if (r.brokeragePeriod && c > (best[id] || 0)) { best[id] = c; periods[id] = r.brokeragePeriod; }
+          }
+          return res.json({ counts, gross, periods });
         } catch (e) {
           console.error('[batch_counts] failed:', e.message);
           return res.status(500).json({ error: 'batch_counts failed' });
