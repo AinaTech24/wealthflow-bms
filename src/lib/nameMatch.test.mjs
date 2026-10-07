@@ -8,7 +8,7 @@
 // Nathubhai Desai onto Mahek Haresh Chugh; tighten it and real rows stop being
 // attributed and quietly reach nobody. Both failures are money, so every case
 // below is a real name from this book.
-import { nameContradicts, nameTokens } from './nameMatch.js';
+import { nameContradicts, nameTokens, bestNameMatches } from './nameMatch.js';
 
 let pass = 0, fail = 0;
 const ok = (cond, what) => { if (cond) { pass++; } else { fail++; console.log(`  FAIL  ${what}`); } };
@@ -57,6 +57,29 @@ ok(nameTokens('J THILAK (HUF)').has('THILAK'), 'keeps the identifying word');
 ok(!nameTokens('J THILAK (HUF)').has('HUF'), 'drops the suffix');
 ok(!nameTokens('MANASVEE DESAI REP BY FORAM DESAI').has('FORAM'), 'drops the representative');
 ok(nameTokens('MANASVEE DESAI REP BY FORAM DESAI').has('MANASVEE'), 'keeps the investor');
+
+
+console.log('\nnameMatch — choosing BETWEEN several records (bestNameMatches)');
+const pick = (cands, inv) => bestNameMatches(cands, inv).join(',');
+// The regression that cost MSA Financial Services Rs 9.18: every record here
+// contains SINGH, so "anyone who does not contradict" saw five agreeing claimants.
+ok(pick(['Aaradhay Singh','DALBAHADUR SINGH','Dal Bahadur Singh','Manish Singh','Aashvi Singh'], 'Aaradhay Singh') === '0',
+   'Aaradhay Singh must beat four other Singhs');
+ok(pick(['Vinubhai Nathubhai Desai','Girishkumar Ramjibhai Desai','Heyansh Vinubhai Desai'], 'GIRISHKUMAR R DESAI') === '1',
+   'Girishkumar R Desai must pick Girishkumar, not another Desai');
+ok(pick(['Ravindrakumar Deshpande','Vaishali Ravindrakumar Deshpande'], 'Vaishali Ravindrakumar Despande') === '1',
+   'a misspelt surname must still pick the record sharing two words');
+ok(pick(['Dhruvi Pankaj Dhameja','Jaanvi Pankaj Dhameja'], 'Jaanvi Pankaj Dhameja') === '1',
+   'siblings sharing a surname and a parent: the exact first name wins');
+// A genuine tie stays a tie — four records of one investor.
+ok(pick(['Amit Parshotam Menghani 1','AMIT PARSHOTAM MENGHANI 2','Amit Parshotam Menghani','Amit Parshotam Menghani'], 'Amit Parshotam Menghani') === '0,1,2,3',
+   'four records of one investor must tie, not pick one at random');
+ok(pick(['J THILAK HUF','THILAK JANARTHANAN','J THILAK (HUF)'], 'J THILAK (HUF)') === '0,1,2',
+   'one distinctive word shared by all is a three-way tie, left to the caller');
+// Nothing in common, and nothing to go on.
+ok(pick(['Thilak','Poosari Kannan'], 'Amit Parshotam Menghani') === '', 'no shared word gives no match');
+ok(pick(['Thilak','Poosari Kannan'], '') === '0,1', 'a blank investor name cannot discriminate — keep all');
+ok(pick(['Thilak','Poosari Kannan'], 'KUMAR') === '0,1', 'a name of only stop-words cannot discriminate');
 
 console.log(`\n${pass} passed, ${fail} failed\n`);
 process.exit(fail ? 1 : 0);

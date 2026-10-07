@@ -111,6 +111,13 @@ export const ClientsAndHierarchy: React.FC<ClientsAndHierarchyProps> = ({ curren
   };
 
   const filteredClients = useMemo(() => {
+    // Typing a manager's name finds every client under them, so a branch can be
+    // selected and re-assigned in one go — a client's own name and PAN were all the
+    // search looked at, which left no way to gather, say, everyone under one BM.
+    const nameById = new Map(team.map(t => [t.id, String(t.name || '').toLowerCase()]));
+    const term = searchTerm.toLowerCase();
+    const managerText = (c: Client) =>
+      Object.values(c.hierarchy || {}).map(id => nameById.get(id as string) || '').join(' ');
     return clients
       .filter(c => {
         let hasAccess = false;
@@ -136,12 +143,13 @@ export const ClientsAndHierarchy: React.FC<ClientsAndHierarchyProps> = ({ curren
           }
           if (gapFilter === 'noFolios' && (c.folios || []).filter(Boolean).length > 0) return false;
         }
-        return c.name.toLowerCase().includes(searchTerm.toLowerCase()) ||
-          c.pan.toLowerCase().includes(searchTerm.toLowerCase());
+        return c.name.toLowerCase().includes(term) ||
+          c.pan.toLowerCase().includes(term) ||
+          (term.length >= 3 && managerText(c).includes(term));
       })
       // Sort by AUM desc by default — biggest clients first
       .sort((a, b) => aumOf(b).total - aumOf(a).total);
-  }, [clients, searchTerm, currentUser, isAdmin, gapFilter, liveAum]);
+  }, [clients, team, searchTerm, currentUser, isAdmin, gapFilter, liveAum]);
 
   const openTeamModal = (member?: TeamMember) => {
     if (!isAdmin) return;

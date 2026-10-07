@@ -12,7 +12,7 @@ import { runBatchCalculation } from '../services/calculationService';
 import { Pagination } from '../components/Pagination';
 import { useToast } from '../components/Toast';
 
-import { nameContradicts } from '../../src/lib/nameMatch.js';
+import { nameContradicts, bestNameMatches } from '../../src/lib/nameMatch.js';
 interface ImportsProps {
   currentUser: TeamMember;
 }
@@ -1067,17 +1067,24 @@ export const Imports: React.FC<ImportsProps> = ({ currentUser }) => {
         if (folioClaimants.length === 1) {
           folioMatch = nameContradicts(folioClaimants[0].name, investorName) ? undefined : folioClaimants[0];
         } else if (folioClaimants.length > 1) {
-          const agree = folioClaimants.filter(c => !nameContradicts(c.name, investorName));
-          if (agree.length === 1) {
-            folioMatch = agree[0];
-          } else if (agree.length > 1) {
-            // Several records carry this investor's name — the same person filed
-            // more than once. When they all sit under the same RM and BM it does
-            // not matter which one is used, so use the first rather than leave
-            // the row unattached. When their RMs differ, WHICH RM owns this
-            // investor is a business decision this importer must not make.
+          // RANK the claimants rather than ask "does anyone contradict?". Any record
+          // sharing one word passed that test, so a folio claimed by Aaradhay Singh,
+          // Dal Bahadur Singh and Manish Singh saw all three agree with the investor
+          // "Aaradhay Singh" (they all contain SINGH), the importer could not choose,
+          // and the row fell to the house account. The record sharing the MOST
+          // identifying words wins; only a genuine tie is left to the check below.
+          const top = bestNameMatches(folioClaimants.map(c => c.name), investorName).map(i => folioClaimants[i]);
+          if (top.length === 1) {
+            folioMatch = top[0];
+          } else if (top.length > 1) {
+            // Several records carry this investor's name equally well — the same
+            // person filed more than once. When they all sit under the same RM and
+            // BM it does not matter which one is used, so use the first rather than
+            // leave the row unattached. When their RMs differ, WHICH RM owns this
+            // investor is a business decision this importer must not make; settle it
+            // once in Admin Console → System → Folio ownership.
             const sigOf = (c: Client) => `${c.hierarchy?.level3Id || ''}|${c.hierarchy?.level4Id || ''}`;
-            if (new Set(agree.map(sigOf)).size === 1) folioMatch = agree[0];
+            if (new Set(top.map(sigOf)).size === 1) folioMatch = top[0];
           }
         }
 

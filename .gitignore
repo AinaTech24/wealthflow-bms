@@ -112,3 +112,6 @@ invoice_preview.html
 
 # Scratch analysis dumps (e.g. Source Code/_dupes.json)
 _*.json
+
+# Reconciliation working folder (AdvisorKhoj exports, attribution probes — contains client PII)
+.recon/

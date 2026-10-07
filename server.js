@@ -9,7 +9,7 @@ import compression from 'compression';
 import cors from 'cors';
 import pool from './src/lib/db.js';
 // Shared with the importer — see src/lib/nameMatch.js for why there is only one copy.
-import { nameTokens, nameContradicts } from './src/lib/nameMatch.js';
+import { nameTokens, nameContradicts, bestNameMatches } from './src/lib/nameMatch.js';
 import bcrypt from 'bcrypt';
 import jwt from 'jsonwebtoken';
 import rateLimit from 'express-rate-limit';
@@ -1047,6 +1047,30 @@ function accumulatePayoutTotals(txRows, ctx) {
     if (ownerLevel) {
       const ownerUid = h[`level${ownerLevel}Id`];
       if (ownerUid) { if (!totals[ownerUid]) totals[ownerUid] = { userId: ownerUid, grossTotal: 0, earnings: 0, txCount: 0, ownerGross: 0 }; totals[ownerUid].ownerGross += gross; }
+    }
+    // bmOwnerGross — the figure that reconciles with AdvisorKhoj's per-RM column.
+    //
+    // AdvisorKhoj credits each folio to the ARN holder (the "BM") that actually earns
+    // the brokerage, NOT to the servicing RM sitting in a lower hierarchy slot. Measured
+    // against its Transaction-Wise-Brokerage export for July 2026 (Rs 170,939.99): the
+    // lowest-slot rule (ownerGross above) is off by Rs 339,940 across 110 people, while
+    // the ARN-holder slot reproduces 23 of AdvisorKhoj's 25 RM totals to under one rupee
+    // and every one of its 2,543 folios to Rs 16.44 in total.
+    //
+    // The holder sits at L4 for most clients, but not all: every client of MANISH SINGH
+    // carries him at L5 with an empty L4 (Rs 1,165.18 in July — exactly the amount
+    // AdvisorKhoj attributes to him). So walk upward from L4 to L7 before giving up, and
+    // fall back to the lowest assigned slot so no gross is ever left unattributed.
+    //
+    // Kept SEPARATE from ownerGross on purpose: existing reports, invoices and the
+    // payout ledger all read ownerGross, so this is additive and changes nobody's
+    // payouts until a report deliberately switches to it.
+    let bmUid = null;
+    for (let l = 4; l <= 7; l++) { const uid = h[`level${l}Id`]; if (uid) { bmUid = uid; break; } }
+    if (!bmUid && ownerLevel) bmUid = h[`level${ownerLevel}Id`];
+    if (bmUid) {
+      if (!totals[bmUid]) totals[bmUid] = { userId: bmUid, grossTotal: 0, earnings: 0, txCount: 0, ownerGross: 0 };
+      totals[bmUid].bmOwnerGross = (totals[bmUid].bmOwnerGross || 0) + gross;
     }
 
     {   // RESIDUAL is the ONLY payout model (Slices/Cumulative removed 2026-08-18)
@@ -2204,6 +2228,11 @@ app.all('/api/data', mutationLimiter, async (req, res) => {
             // across users equals the period's total gross exactly once — which is
             // what makes the RM-wise total reconcile with the BM-wise total.
             ownerGross: Math.round((p.ownerGross || 0) * 100) / 100,
+            // bmOwnerGross: gross credited to the ARN holder (BM) slot — the figure
+            // that reconciles with AdvisorKhoj's per-RM column. See the comment on
+            // bmOwnerGross in accumulatePayoutTotals(). Additive: ownerGross above is
+            // unchanged, so existing reports and invoices behave exactly as before.
+            bmOwnerGross: Math.round((p.bmOwnerGross || 0) * 100) / 100,
             earnings: Math.round(p.earnings * 100) / 100,
             // Percentage computed from FULL-PRECISION figures, not the 2dp values
             // above. Deriving it in the browser from a rounded rupee amount made a
@@ -2944,6 +2973,68 @@ app.all('/api/data', mutationLimiter, async (req, res) => {
         }
       }
 
+      // ── Settle who owns a folio: the person's decision, applied ───────────
+      //
+      //    Where one investor is filed under several RMs and the same folio sits
+      //    on all of them, nothing in the data says which RM owns it — that is the
+      //    firm's call. This applies the call: for each { folio, rmId } it keeps
+      //    the folio on the record under that RM (the fullest one, if the RM has
+      //    several) and removes it from every other record.
+      //
+      //    It never ADDS a folio: the chosen RM must already hold a record that
+      //    claims it. Nothing else on any record is touched.
+      if (action === 'folio_assign') {
+        if (!req.user || req.user.role !== 'ADMIN') return res.status(403).json({ error: 'Admin privileges required' });
+        const picks = Array.isArray(payload?.assign) ? payload.assign : [];
+        if (!picks.length) return res.status(400).json({ error: 'assign[] is required: [{ folio, rmId }]' });
+        try {
+          const [clientRows] = await pool.query("SELECT id, name, data FROM clients");
+          const dataOf = new Map(), claimants = new Map();
+          for (const c of clientRows) {
+            let d = {}; try { d = JSON.parse(c.data || '{}'); } catch { continue; }
+            dataOf.set(c.id, d);
+            for (const f of (Array.isArray(d.folios) ? d.folios : [])) {
+              const k = String(f).trim(); if (!k) continue;
+              if (!claimants.has(k)) claimants.set(k, []);
+              claimants.get(k).push(c.id);
+            }
+          }
+          const strip = new Map(), done = [], skipped = [];
+          for (const pick of picks) {
+            const folio = String(pick?.folio || '').trim(), rmId = String(pick?.rmId || '').trim();
+            const ids = claimants.get(folio) || [];
+            const mine = ids.filter(id => (dataOf.get(id)?.hierarchy?.level3Id || '') === rmId);
+            if (!folio || !rmId || !mine.length) { skipped.push({ folio, why: 'no record under that RM claims this folio' }); continue; }
+            mine.sort((x, y) => (dataOf.get(y).folios || []).length - (dataOf.get(x).folios || []).length || x.localeCompare(y));
+            const keep = mine[0];
+            for (const id of ids) {
+              if (id === keep) continue;
+              if (!strip.has(id)) strip.set(id, new Set());
+              strip.get(id).add(folio);
+            }
+            done.push({ folio, keptOn: keep, removedFrom: ids.length - 1 });
+          }
+          let recordsChanged = 0, foliosRemoved = 0;
+          for (const [cid, folios] of strip) {
+            const d = dataOf.get(cid); const before = (d.folios || []).length;
+            d.folios = (d.folios || []).filter(f => !folios.has(String(f).trim()));
+            if (d.folios.length === before) continue;
+            d.updatedAt = new Date().toISOString();
+            await pool.query("UPDATE clients SET data=? WHERE id=?", [JSON.stringify(d), cid]);
+            recordsChanged++; foliosRemoved += before - d.folios.length;
+          }
+          await pool.query(
+            'INSERT INTO activity_log (userId, userName, action, description, createdAt) VALUES (?,?,?,?,NOW())',
+            [req.user.id, req.user.name || req.user.email || 'admin', 'FOLIO_ASSIGN',
+             `Assigned ${done.length} folio(s) to a single RM; removed ${foliosRemoved} claim(s) from ${recordsChanged} record(s)`]);
+          invalidateSummaryCache();
+          return res.json({ success: true, assigned: done.length, recordsChanged, foliosRemoved, skipped });
+        } catch (e) {
+          console.error('[folio_assign]', e);
+          return res.status(500).json({ error: e.message });
+        }
+      }
+
       // ── Folio conflicts: one folio claimed by many client records ─────────
       //
       //    A folio belongs to one investor at one fund house, so exactly one
@@ -3012,7 +3103,7 @@ app.all('/api/data', mutationLimiter, async (req, res) => {
           };
           const who = (c) => {
             const h = dataOf.get(c.id)?.hierarchy || {};
-            return { name: c.name, rm: teamName.get(h.level3Id) || '(no RM)', bm: teamName.get(h.level4Id) || '' };
+            return { id: c.id, name: c.name, rmId: h.level3Id || '', rm: teamName.get(h.level3Id) || '(no RM)', bm: teamName.get(h.level4Id) || '' };
           };
           for (const [folio, list] of conflicted) {
             // "477413000000": six digits then zeros is Excel's scientific notation
@@ -3026,7 +3117,9 @@ app.all('/api/data', mutationLimiter, async (req, res) => {
             }
             const investor = topInvestor.get(folio)?.name || '';
             if (!investor) { unresolved.push({ folio, claimants: list.length, why: 'no transactions carry this folio' }); continue; }
-            const agree = list.filter(c => !nameContradicts(c.name, investor));
+            // Rank, do not merely exclude: one shared surname is not agreement. Same
+            // rule as the importer, so the check and the import cannot disagree.
+            const agree = bestNameMatches(list.map(c => c.name), investor).map(i => list[i]);
             if (agree.length === 0) {
               unresolved.push({ folio, investor, claimants: list.length, agreeing: 0, why: 'no claimant matches the investor name' });
               continue;

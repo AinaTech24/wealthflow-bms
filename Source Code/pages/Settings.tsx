@@ -339,6 +339,39 @@ export const Settings: React.FC<SettingsProps> = ({ currentUser }) => {
         }
     };
 
+    // Settle one folio whose investor is filed under several RMs. The statements cannot
+    // say which RM owns it — that is the firm's call — so this applies the call and
+    // removes the folio from every other record. No transaction is touched.
+    const assignFolio = async (folio: string, rmId: string, rmName: string) => {
+        const confirmed = await showConfirm({
+            title: 'Give this folio to one RM?',
+            message: `Folio ${folio} will stay only on ${rmName}'s record, and every other record loses its claim to it. Transactions are not touched. Run Recalculate afterwards.`,
+            confirmText: 'Assign',
+            variant: 'warning',
+        });
+        if (!confirmed) return;
+        setFolioBusy(true);
+        try {
+            const r = await authFetch('/api/data', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ action: 'folio_assign', payload: { assign: [{ folio, rmId }] } }),
+            });
+            const j = await r.json();
+            if (!r.ok) { showToast(j?.error || 'Could not assign the folio.', 'error'); return; }
+            if (j.skipped?.length) { showToast(j.skipped[0].why, 'error'); return; }
+            showToast(`Folio ${folio} now belongs to ${rmName} only.`, 'success');
+            const c = await authFetch('/api/data', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ action: 'folio_conflicts', payload: { apply: false } }),
+            });
+            if (c.ok) setFolioResult(await c.json());
+        } catch (e: any) {
+            showToast(`Assign did not finish (${e?.message || 'no response'}). Run Check only to see where it stands.`, 'error');
+        } finally { setFolioBusy(false); }
+    };
+
     const handleManualRecalculate = async () => {
         const confirmed = await showConfirm({
             title: 'Recalculate All Transactions?',
@@ -1132,6 +1165,20 @@ export const Settings: React.FC<SettingsProps> = ({ currentUser }) => {
                                                                 <li key={i}>{r.name} &rarr; RM <b>{r.rm}</b>{r.bm ? `, BM ${r.bm}` : ''}</li>
                                                             ))}
                                                         </ul>
+                                                    )}
+                                                    {Array.isArray(u.records) && (
+                                                        <div className="ml-4 mt-1 mb-2 flex gap-2 flex-wrap">
+                                                            {[...new Map<string, string>(u.records.filter((r: any) => r.rmId).map((r: any) => [r.rmId, r.rm] as [string, string])).entries()].map(([rmId, rm]) => (
+                                                                <button
+                                                                    key={rmId}
+                                                                    disabled={folioBusy}
+                                                                    onClick={() => assignFolio(u.folio, rmId, rm)}
+                                                                    className="px-2.5 py-1 rounded-lg border border-slate-300 text-[10px] font-black uppercase tracking-widest text-slate-600 hover:border-blue-500 hover:text-blue-600 disabled:opacity-40"
+                                                                >
+                                                                    Folio belongs to {rm}
+                                                                </button>
+                                                            ))}
+                                                        </div>
                                                     )}
                                                 </li>
                                             ))}

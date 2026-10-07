@@ -57,3 +57,38 @@ export function nameContradicts(a, b) {
   for (const t of tb) if (ta.has(t)) return false;
   return true;
 }
+
+/**
+ * Which of several client records is the BEST match for an investor's name?
+ *
+ * `nameContradicts` says only "definitely someone else", which is the right test
+ * for ONE claimant. It is the wrong test for choosing BETWEEN several: it let any
+ * record sharing a single word through, so a folio claimed by "Aaradhay Singh",
+ * "Dal Bahadur Singh" and "Manish Singh" saw all three as agreeing with the
+ * investor "Aaradhay Singh" — they all contain SINGH — and the importer, unable to
+ * pick, left the row unattached. That sent Aaradhay's Rs 9.18 to the house account
+ * and out of MSA Financial Services.
+ *
+ * So rank them. The record sharing the MOST identifying words wins; an exact name
+ * outranks a shared surname. Several records can still TIE — "Amit Parshotam
+ * Menghani" exists four times — and the caller decides what a tie means.
+ *
+ * @param {string[]} candidateNames  the names on the competing client records
+ * @param {string}   investorName    the investor named on the statement row
+ * @returns {number[]} indexes of the best-scoring candidates ([] when none share a word)
+ */
+export function bestNameMatches(candidateNames, investorName) {
+  const wanted = nameTokens(investorName);
+  // A name with nothing identifying in it cannot discriminate — keep everyone, the
+  // caller's same-RM check then decides, exactly as before.
+  if (!wanted.size) return candidateNames.map((_, i) => i);
+  const scores = candidateNames.map(n => {
+    const have = nameTokens(n);
+    let s = 0;
+    for (const t of wanted) if (have.has(t)) s++;
+    return s;
+  });
+  const best = Math.max(0, ...scores);
+  if (best < 1) return [];
+  return scores.map((s, i) => (s === best ? i : -1)).filter(i => i >= 0);
+}
