@@ -1,0 +1,14 @@
+[Unit]
+Description=Follow the RDS password rotation (copy the Secrets Manager password into .env)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=ubuntu
+Environment=HOME=/home/ubuntu
+Environment=AWS_REGION=ap-south-1
+Environment=AWS_DEFAULT_REGION=ap-south-1
+Environment=PATH=/usr/local/bin:/usr/bin:/bin
+ExecStart=/usr/bin/python3 /home/ubuntu/wealthflow/scripts/sync-db-password.py
+TimeoutStartSec=180

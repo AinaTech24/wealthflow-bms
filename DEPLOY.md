@@ -19,6 +19,27 @@ run by hand from the Actions tab.
 accepts the admin IP listed in security group `wealthflow-web-sg`; if your IP
 changes, update that rule.
 
+## The database password rotates every 7 days (handled automatically)
+
+RDS manages the master password and AWS Secrets Manager rotates it weekly. The app
+reads `DB_PASSWORD` from `.env`, so without help every new connection is refused
+after a rotation (this took the site down on 2026-10-09).
+
+`scripts/sync-db-password.py` closes that gap. A systemd timer
+(`wealthflow-db-sync.timer`, every minute) compares the secret with `.env`; if they
+differ it first tests the new password against the database, then rewrites `.env`
+and restarts the app. The server reads the secret through the IAM role
+`wealthflow-ec2-role`, which may read that one secret and nothing else.
+`DB_SECRET_ARN` in the server's `.env` says which secret.
+
+- Watch it: `journalctl -u wealthflow-db-sync.service -n 20` and `systemctl list-timers wealthflow-db-sync.timer`.
+- Run it by hand: `python3 ~/wealthflow/scripts/sync-db-password.py` (add `--dry-run` to only check).
+- New server: copy the two files in `scripts/systemd/` to `/etc/systemd/system/`, then
+  `sudo systemctl daemon-reload && sudo systemctl enable --now wealthflow-db-sync.timer`.
+  The instance needs the role above and the AWS CLI.
+- A rotation costs a few seconds of failed checks while the app restarts, plus up
+  to a minute before the timer notices.
+
 Everything below describes the old Hostinger setup. Its two workflows are now
 manual-only and kept as a fallback.
 
