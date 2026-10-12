@@ -813,6 +813,15 @@ export const ClientsAndHierarchy: React.FC<ClientsAndHierarchyProps> = ({ curren
                         }).length}
                       </span>
                       <span className="text-[9px] font-black text-slate-400 uppercase tracking-widest group-hover:text-slate-600">Direct Clients</span>
+                      {(() => {
+                        // Mentors/upline earn on these clients too, so show how many.
+                        const above = clients.filter(c => {
+                          if (!c.hierarchy) return false;
+                          const ids = [1, 2, 3, 4, 5, 6, 7].map(l => c.hierarchy[`level${l}Id` as keyof typeof c.hierarchy]).filter(Boolean);
+                          return ids.length > 1 && ids[0] !== member.id && ids.includes(member.id);
+                        }).length;
+                        return above > 0 ? <span className="mt-1 text-[10px] font-bold text-slate-500">+ Mentor / upline on {above} clients</span> : null;
+                      })()}
                     </button>
                   </td>
                   <td className="px-6 py-4">
