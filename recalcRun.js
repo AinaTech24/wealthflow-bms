@@ -4,6 +4,8 @@
 //   cd /home/u477139614/domains/nflx.in/nodejs && node recalcRun.js
 import './bootstrap-env.js';
 import pool from './src/lib/db.js';
+import { residualSplit, breakdownFromShares } from './src/lib/payoutEngine.js';
+import { chainAsOf } from './src/lib/hierarchyHistory.js';
 
 (async () => {
   const [cfgRows] = await pool.query("SELECT data FROM config LIMIT 1");
@@ -27,58 +29,25 @@ import pool from './src/lib/db.js';
   console.log(`model=${model} useCum=${useCum} useResidual=${useResidual}`);
 
   const [clients] = await pool.query("SELECT id,data FROM clients");
-  const hier = new Map(), lead = new Map();
-  for (const c of clients) { let d; try { d = JSON.parse(c.data || '{}'); } catch { continue; } if (d.hierarchy) hier.set(c.id, d.hierarchy); if (d.leadSourceLevel) lead.set(c.id, Number(d.leadSourceLevel)); }
+  const hier = new Map(), lead = new Map(), withHistory = new Map();
+  for (const c of clients) {
+    let d; try { d = JSON.parse(c.data || '{}'); } catch { continue; }
+    if (d.hierarchy) hier.set(c.id, d.hierarchy);
+    if (d.leadSourceLevel) lead.set(c.id, Number(d.leadSourceLevel));
+    if (Array.isArray(d.hierarchyHistory) && d.hierarchyHistory.length) withHistory.set(c.id, { hierarchy: d.hierarchy, hierarchyHistory: d.hierarchyHistory, leadSourceLevel: d.leadSourceLevel ? Number(d.leadSourceLevel) : undefined });
+  }
   const [teamRows] = await pool.query("SELECT id,level,data FROM team");
   const teamMap = new Map();
   for (const t of teamRows) { let cl, rh; try { const d = JSON.parse(t.data || '{}'); cl = d.customLevels; rh = d.rateHistory; } catch {} teamMap.set(t.id, { level: Number(t.level), customLevels: cl, rateHistory: rh }); }
 
-  // Effective-dated rates — MUST stay identical to server.js memberAsOf().
-  // A member's level/rate is a timeline; a promotion applies from its effective
-  // month forward and must never restate earlier (often already invoiced) months.
-  const memberAsOf = (info, period) => {
-    if (!info) return info;
-    const hist = info.rateHistory;
-    if (!Array.isArray(hist) || hist.length === 0 || !period) return info;
-    const p = String(period);
-    let inForce = null, earliest = null;
-    for (const h of hist) {
-      if (!h || !h.effectiveFrom) continue;
-      const ef = String(h.effectiveFrom);
-      if (!earliest || ef < String(earliest.effectiveFrom)) earliest = h;
-      if (ef <= p && (!inForce || ef > String(inForce.effectiveFrom))) inForce = h;
-    }
-    const pick = inForce || earliest;
-    if (!pick) return info;
-    return {
-      level: (pick.level !== undefined && pick.level !== null) ? Number(pick.level) : info.level,
-      customLevels: pick.customLevels || info.customLevels,
-      rateHistory: hist,
-    };
-  };
-
-  // RESIDUAL model — mirror of server.js recomputeAllBreakdowns.calcResidual.
-  let overDistributed = 0;   // clients whose L1-L3 rates alone exceed (100 - company%)
-    const calcResidual = (gross, h, lsl, period) => {
-    const lp = {1:0,2:0,3:0,4:0,5:0,6:0,7:0}, up = {};
-    let oCL; for (let l=1;l<=7;l++){ const u=h[`level${l}Id`]; if(u){ oCL=memberAsOf(teamMap.get(u), period)?.customLevels; break; } }
-    const rl = residualLevel; const paid = new Set(); let lowerSum = 0, dist = 0;
-    for (let l=1;l<rl;l++){ const u=h[`level${l}Id`]; if(!u||paid.has(u)) continue; paid.add(u);
-      const info=memberAsOf(teamMap.get(u), period); const cl=info?.customLevels, uL=info?.level;
-      const pct=Math.max(0, cl&&cl[uL]!==undefined?cl[uL]:(cl&&cl[l]!==undefined?cl[l]:(oCL?.[l]!==undefined?oCL[l]:(globalLevels[l]||0))));
-      const p=Math.round(gross*pct/100*10000)/10000; lp[l]=p; if(p!==0)up[u]=(up[u]||0)+p; lowerSum+=pct; dist+=p; }   // p!==0: clawbacks must deduct
-    // Lead-source add-on goes to the LOWER-level owner and must reduce the
-    // residual too — identical to server.js calcResidual.
-    if (leadPct > 0 && lsl && lsl < rl) {
-      const su = h[`level${lsl}Id`];
-      if (su) { const p=Math.round(gross*leadPct/100*10000)/10000; lp[lsl]=(lp[lsl]||0)+p; if(p!==0)up[su]=(up[su]||0)+p; lowerSum+=leadPct; dist+=p; }
-    }
-    let ru=null, ruL=rl; for(let l=rl;l<=7;l++){ if(h[`level${l}Id`]){ ru=h[`level${l}Id`]; ruL=l; break; } }
-    if (lowerSum > 100 - companyExpensePct + 0.0001) overDistributed++;   // config error: levels alone exceed what is available
-      if (ru && !paid.has(ru)) { const surplus=Math.max(0, 100-companyExpensePct-lowerSum);
-      const p=Math.round(gross*surplus/100*10000)/10000; lp[ruL]=(lp[ruL]||0)+p; if(p!==0)up[ru]=(up[ru]||0)+p; dist+=p; }   // p!==0: clawbacks must deduct
-    const exp = Math.round((gross-dist)*100)/100;
-    return { gross, expenseAmount: exp, netPool: Math.round((gross-exp)*100)/100, levelPayouts: lp, userPayouts: up };
+  // The payout maths is src/lib/payoutEngine.js, shared with server.js and the
+  // reports, so this script can never disagree with the app.
+  let overDistributed = 0;   // clients whose lower + upper rates alone exceed (100 - company%)
+  const engineCfg = { globalLevels, leadSourcePct: leadPct, companyExpensePct, residualLevel };
+  const calcResidual = (gross, h, lsl, period) => {
+    const split = residualSplit({ gross, h, lsl, period, teamMap, cfg: engineCfg });
+    if (split.overDistributed) overDistributed++;
+    return breakdownFromShares(gross, split);
   };
 
   // Take the SAME firm-wide lock server.js recomputeAllBreakdowns() uses. Without
@@ -115,10 +84,14 @@ import pool from './src/lib/db.js';
         }
         processed++; continue;
       }
-      const gross = Number(r.grossAmount) || 0; const h = hier.get(d.mappedClientId);
+      const gross = Number(r.grossAmount) || 0;
+      const hc = withHistory.get(d.mappedClientId);
+      const asOf = hc ? chainAsOf(hc, r.brokeragePeriod) : null;
+      const h = asOf ? asOf.hierarchy : hier.get(d.mappedClientId);
+      const leadHere = asOf ? asOf.leadSourceLevel : lead.get(d.mappedClientId);
       const bd = !h ? { gross, expenseAmount: gross, netPool: 0, levelPayouts:{1:0,2:0,3:0,4:0,5:0,6:0,7:0}, userPayouts:{} }
                     // RESIDUAL is the ONLY model (Slices/Cumulative removed 2026-08-18).
-                    : calcResidual(gross, h, lead.get(d.mappedClientId), r.brokeragePeriod);
+                    : calcResidual(gross, h, leadHere, r.brokeragePeriod);
       d.breakdown = bd; upserts.push([r.id, JSON.stringify(d)]);
       for (const [uid, amt] of Object.entries(bd.userPayouts)) if (Math.abs(amt) > 0.0001) ledgerRows.push([r.id, uid, amt, 0]);
       processed++;

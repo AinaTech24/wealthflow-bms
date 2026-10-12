@@ -5,6 +5,7 @@ import { SharingConfig, TeamMember, BankDetails, Role, Address } from '../types'
 import { calculatePayout } from '../services/calculationService';
 import { useData, authFetch } from '../contexts/DataContext';
 import { useToast } from '../components/Toast';
+import { LockMonths } from '../components/LockMonths';
 
 interface SettingsProps {
     currentUser: TeamMember;
@@ -1136,6 +1137,7 @@ export const Settings: React.FC<SettingsProps> = ({ currentUser }) => {
                             {isRecalculating ? 'Recalculating...' : 'Recalculate All Transactions'}
                         </button>
                     </div>
+                    <LockMonths />
                     {/* A folio belongs to one investor at one fund house, so one client
                         record should claim it. Here single folios are claimed by 80+
                         records, which is why a re-import could attach a month's rows to

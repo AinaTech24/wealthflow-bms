@@ -1,8 +1,9 @@
 
-import React, { useState, useMemo } from 'react';
+import React, { useState, useMemo, useEffect } from 'react';
 import { Users, Search, Plus, Edit2, X, UserCheck, Shield, ChevronRight, Tags, Database, Save, Key, Copy, Check, Mail, Trash2, UserPlus, GitMerge, Phone, AlertCircle, Download } from 'lucide-react';
 import { Client, TeamMember, Role } from '../types';
 import { useData, authFetch } from '../contexts/DataContext';
+import { PromotionPanel, PromotionPreview } from '../components/PromotionPanel';
 import { Pagination } from '../components/Pagination';
 import { useToast } from '../components/Toast';
 import { formatCompactINR } from '../utils/formatINR';
@@ -151,8 +152,42 @@ export const ClientsAndHierarchy: React.FC<ClientsAndHierarchyProps> = ({ curren
       .sort((a, b) => aumOf(b).total - aumOf(a).total);
   }, [clients, team, searchTerm, currentUser, isAdmin, gapFilter, liveAum]);
 
+  // ── Promotion: what changing a level will do, shown before anything is saved ──────
+  // Changing the level here moves the person's clients up (or down) by themselves from
+  // the chosen month, and pays the new level's standard rate unless a personal rate is
+  // typed. The preview asks the server what that would do, with the same planner the
+  // save uses, so the two cannot disagree.
+  const [occupiedRule, setOccupiedRule] = useState<'keep' | 'replace'>('keep');
+  const [promoPreview, setPromoPreview] = useState<PromotionPreview | null>(null);
+  const [promoLoading, setPromoLoading] = useState(false);
+  const levelChanging = !!editingMember && memberForm.level !== undefined && Number(memberForm.level) !== Number(editingMember.level);
+  useEffect(() => {
+    if (!isTeamModalOpen || !editingMember || !levelChanging) { setPromoPreview(null); return; }
+    let cancelled = false;
+    setPromoLoading(true);
+    const t = setTimeout(async () => {
+      try {
+        const r = await authFetch('/api/data', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ action: 'promotion_preview', payload: {
+            personId: editingMember.id, to: Number(memberForm.level),
+            effectiveFrom: memberForm.rateEffectiveFrom || thisMonth, occupied: occupiedRule,
+          } }),
+        });
+        const j = await r.json();
+        if (!cancelled && r.ok) setPromoPreview(j);
+      } catch { /* the form still works without a preview */ }
+      finally { if (!cancelled) setPromoLoading(false); }
+    }, 300);
+    return () => { cancelled = true; clearTimeout(t); };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [isTeamModalOpen, editingMember?.id, memberForm.level, memberForm.rateEffectiveFrom, occupiedRule]);
+
   const openTeamModal = (member?: TeamMember) => {
     if (!isAdmin) return;
+    setOccupiedRule('keep');
+    setPromoPreview(null);
     if (member) {
       setEditingMember(member);
       setMemberForm({
@@ -205,7 +240,7 @@ export const ClientsAndHierarchy: React.FC<ClientsAndHierarchyProps> = ({ curren
     }
     // A single RM taking >75% of gross, on top of the +25% lead-source bonus, leaves
     // nothing for the upline or the company — almost always a typo, so confirm it.
-    if (rateNum > 75) {
+    if (rateNum > 75 && !(levelChanging && (memberForm as any).rateAuto !== false)) {
       const ok = await showConfirm({
         title: 'Unusually high sharing rate',
         message: `${rateNum}% of gross is very high — with the ${globalConfig.leadSourcePct ?? 0}% lead-source bonus this RM could receive ${rateNum + (globalConfig.leadSourcePct ?? 0)}% of gross, leaving little or nothing for the upline and the company. Save anyway?`,
@@ -230,6 +265,11 @@ export const ClientsAndHierarchy: React.FC<ClientsAndHierarchyProps> = ({ curren
       address: memberForm.address,
       // Consumed by the server to stamp rateHistory; never stored as profile data.
       rateEffectiveFrom: memberForm.rateEffectiveFrom || thisMonth,
+      // Promotion controls: read by the server, never stored. Set explicitly (even to
+      // undefined) so a copy of the member that still carries them from an earlier
+      // save cannot repeat them.
+      rateAuto: levelChanging && (memberForm as any).rateAuto !== false ? true : undefined,
+      levelMoveOccupied: levelChanging ? occupiedRule : undefined,
       customLevels: {
         ...(editingMember?.customLevels || {}),
         [memberForm.level ?? 6]: Number(memberForm.sharingRate || 0)
@@ -1497,10 +1537,11 @@ export const ClientsAndHierarchy: React.FC<ClientsAndHierarchyProps> = ({ curren
                     <div className="relative">
                       <input
                         type="number"
-                        value={memberForm.sharingRate}
+                        value={levelChanging && (memberForm as any).rateAuto !== false ? '' : memberForm.sharingRate}
                         onChange={e => setMemberForm({ ...memberForm, sharingRate: e.target.value })}
-                        className="w-full border border-slate-200 p-4 rounded-2xl mt-1.5 font-bold outline-none bg-white"
-                        placeholder="0"
+                        disabled={levelChanging && (memberForm as any).rateAuto !== false}
+                        className="w-full border border-slate-200 p-4 rounded-2xl mt-1.5 font-bold outline-none bg-white disabled:bg-slate-50 disabled:text-slate-400"
+                        placeholder={levelChanging && (memberForm as any).rateAuto !== false ? 'Standard rate for the new level' : '0'}
                       />
                       <span className="absolute right-4 top-1/2 -translate-y-1 font-bold text-slate-400 font-mono">%</span>
                     </div>
@@ -1566,6 +1607,24 @@ export const ClientsAndHierarchy: React.FC<ClientsAndHierarchyProps> = ({ curren
                   {editingMember && <p className="text-[10px] text-slate-400 mt-1">Existing passwords are stored encrypted and can never be displayed. Leave this blank unless you want to change it.</p>}
                   </div>
                 </div>
+
+                {levelChanging && editingMember && (
+                  <PromotionPanel
+                    name={editingMember.name}
+                    fromLevel={Number(editingMember.level)}
+                    toLevel={Number(memberForm.level)}
+                    effectiveLabel={(memberForm.rateEffectiveFrom ?? thisMonth) === '0000-01'
+                      ? 'for all months'
+                      : `from ${effectiveMonthOptions.find(m => m.value === (memberForm.rateEffectiveFrom ?? thisMonth))?.label ?? (memberForm.rateEffectiveFrom ?? thisMonth)}`}
+                    cardRate={Number(globalConfig?.levels?.[Number(memberForm.level) as keyof typeof globalConfig.levels] ?? 0)}
+                    useCardRate={(memberForm as any).rateAuto !== false}
+                    onUseCardRate={v => setMemberForm({ ...memberForm, rateAuto: v } as any)}
+                    occupied={occupiedRule}
+                    onOccupied={setOccupiedRule}
+                    preview={promoPreview}
+                    loading={promoLoading}
+                  />
+                )}
 
                 {/* Multi-role: extra levels this user may be assigned to across clients */}
                 <div className="mt-2 bg-slate-50 dark:bg-slate-900/30 border border-slate-200 dark:border-slate-700 rounded-2xl p-4">

@@ -219,6 +219,28 @@ export const DataProvider: React.FC<{ children: React.ReactNode }> = ({ children
         );
       }
 
+      // ── A promotion moved clients on the server ───────────────────────────
+      // The server places the promoted person's clients at their new level by itself
+      // (from the chosen month). Say what it did, name any it had to leave alone, and
+      // reload the clients: this tab still holds the old placements, and saving one
+      // of them again would otherwise write the old chain back.
+      const lm: any[] = Array.isArray(body?.levelMove) ? body.levelMove : [];
+      if (lm.length) {
+        const done = lm.filter(m => m && !m.error);
+        const left = done.reduce((n, m) => n + (Number(m.blocked) || 0), 0);
+        const parts = done.map(m => `Level ${m.from} to ${m.to}: ${(Number(m.moved) || 0) + (Number(m.replaced) || 0)} client${((Number(m.moved) || 0) + (Number(m.replaced) || 0)) === 1 ? '' : 's'} moved`);
+        const failed = lm.some(m => m && m.error);
+        showToast(
+          (parts.length ? parts.join('; ') + '. ' : '') +
+          (left ? `${left} client${left === 1 ? ' was' : 's were'} left alone because that level is already held by someone else on them. ` : '') +
+          (failed ? 'Some clients could not be moved; check the Audit Log. ' : '') +
+          'Payouts are being recalculated.',
+          left || failed ? 'warning' : 'success'
+        );
+        authFetch(`/api/data?type=clients&_=${Date.now()}`, { cache: 'no-store' })
+          .then(r => r.ok ? r.json() : Promise.reject()).then(setClients).catch(() => {});
+      }
+
       // ── Stale base version → rebase and retry ONCE ───────────────────────
       // The server refuses a write whose base version is older than what it
       // holds. For an EXPLICIT single-record edit — the user typed these values

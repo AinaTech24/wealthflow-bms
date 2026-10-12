@@ -13,6 +13,9 @@ import { nameTokens, nameContradicts, bestNameMatches } from './src/lib/nameMatc
 import { planBranchRestructure } from './src/lib/branchRestructure.js';
 import { pickOwnerRecord } from './src/lib/folioOwner.js';
 import { scopePayoutOverview } from './src/lib/payoutScope.js';
+import { memberAsOf, residualSplit, breakdownFromShares } from './src/lib/payoutEngine.js';
+import { chainAsOf, planLevelMove } from './src/lib/hierarchyHistory.js';
+import { monthsToLock, mergeLocks } from './src/lib/lockPeriods.js';
 import bcrypt from 'bcrypt';
 import jwt from 'jsonwebtoken';
 import rateLimit from 'express-rate-limit';
@@ -87,7 +90,8 @@ let teamPayoutsCache = {};
 const CLIENT_AUM_TTL_MS = 10 * 60_000;
 let clientAumCache = null;      // { at, key, body } — see action=client_aum
 let payoutOverviewCache = null; // { at, body } — see action=payout_overview
-const invalidateSummaryCache = () => { summaryCache = null; teamPayoutsCache = {}; memberClientCache = {}; clientAumCache = null; payoutOverviewCache = null; };
+let lockStatusCache = null;     // { at, body } — see action=lock_status (scans every transaction's JSON)
+const invalidateSummaryCache = () => { summaryCache = null; teamPayoutsCache = {}; memberClientCache = {}; clientAumCache = null; payoutOverviewCache = null; lockStatusCache = null; };
 
 // Client ids whose hierarchy names this member at any level — i.e. their own book.
 // Cached because the dashboard and the transactions fetch both ask for it on load.
@@ -811,36 +815,29 @@ async function recomputeAllBreakdowns() {
     if (lockedPeriods.size) console.log('locked (frozen) periods:', [...lockedPeriods].join(', '));
 
     const [clients] = await pool.query("SELECT id,data FROM clients");
-    const hier = new Map(), lead = new Map();
-    for (const c of clients) { let d; try { d = JSON.parse(c.data || '{}'); } catch { continue; } if (d.hierarchy) hier.set(c.id, d.hierarchy); if (d.leadSourceLevel) lead.set(c.id, Number(d.leadSourceLevel)); }
+    const hier = new Map(), lead = new Map(), withHistory = new Map();
+    for (const c of clients) {
+      let d; try { d = JSON.parse(c.data || '{}'); } catch { continue; }
+      if (d.hierarchy) hier.set(c.id, d.hierarchy);
+      if (d.leadSourceLevel) lead.set(c.id, Number(d.leadSourceLevel));
+      // A client whose people were moved from a given month keeps the older chains too,
+      // so earlier months are still calculated with the chain that applied then.
+      if (Array.isArray(d.hierarchyHistory) && d.hierarchyHistory.length) withHistory.set(c.id, { hierarchy: d.hierarchy, hierarchyHistory: d.hierarchyHistory, leadSourceLevel: d.leadSourceLevel ? Number(d.leadSourceLevel) : undefined });
+    }
     const [teamRows] = await pool.query("SELECT id,level,data FROM team");
     const teamMap = new Map();
     for (const t of teamRows) { let cl, rh; try { const d = JSON.parse(t.data || '{}'); cl = d.customLevels; rh = d.rateHistory; } catch {} teamMap.set(t.id, { level: Number(t.level), customLevels: cl, rateHistory: rh }); }
 
     // RESIDUAL model — company keeps companyExpensePct off the top; levels below the
     // residual level keep their per-RM slice; the residual-level user takes the rest.
-    let overDistributed = 0;   // clients whose L1-L3 rates alone exceed (100 - company%)
+    let overDistributed = 0;   // clients whose lower + upper rates alone exceed (100 - company%)
+    // The split itself lives in src/lib/payoutEngine.js and is shared with the report
+    // engine and recalcRun.js, so the ledger and the reports cannot disagree.
+    const engineCfg = { globalLevels, leadSourcePct: leadPct, companyExpensePct, residualLevel };
     const calcResidual = (gross, h, lsl, period) => {
-      const lp = {1:0,2:0,3:0,4:0,5:0,6:0,7:0}, up = {};
-      let oCL; for (let l=1;l<=7;l++){ const u=h[`level${l}Id`]; if(u){ oCL=memberAsOf(teamMap.get(u), period)?.customLevels; break; } }
-      const rl = residualLevel; const paid = new Set(); let lowerSum = 0, dist = 0;
-      for (let l=1;l<rl;l++){ const u=h[`level${l}Id`]; if(!u||paid.has(u)) continue; paid.add(u);
-        const info=memberAsOf(teamMap.get(u), period); const cl=info?.customLevels, uL=info?.level;
-        const pct=Math.max(0, cl&&cl[uL]!==undefined?cl[uL]:(cl&&cl[l]!==undefined?cl[l]:(oCL?.[l]!==undefined?oCL[l]:(globalLevels[l]||0))));
-        const p=Math.round(gross*pct/100*10000)/10000; lp[l]=p; if(p!==0)up[u]=(up[u]||0)+p; lowerSum+=pct; dist+=p; }   // p!==0: clawbacks must deduct
-      // The lead-source add-on belongs to the LOWER levels, so it must also reduce
-      // the residual. If it were paid without adding to lowerSum, the L4 residual
-      // would be overstated by exactly leadPct and the firm would distribute >100%.
-      if (leadPct > 0 && lsl && lsl < rl) {
-        const su = h[`level${lsl}Id`];
-        if (su) { const p=Math.round(gross*leadPct/100*10000)/10000; lp[lsl]=(lp[lsl]||0)+p; if(p!==0)up[su]=(up[su]||0)+p; lowerSum+=leadPct; dist+=p; }
-      }
-      let ru=null, ruL=rl; for(let l=rl;l<=7;l++){ if(h[`level${l}Id`]){ ru=h[`level${l}Id`]; ruL=l; break; } }
-      if (lowerSum > 100 - companyExpensePct + 0.0001) overDistributed++;   // config error: levels alone exceed what is available
-      if (ru && !paid.has(ru)) { const surplus=Math.max(0, 100-companyExpensePct-lowerSum);
-        const p=Math.round(gross*surplus/100*10000)/10000; lp[ruL]=(lp[ruL]||0)+p; if(p!==0)up[ru]=(up[ru]||0)+p; dist+=p; }   // p!==0: clawbacks must deduct
-      const exp = Math.round((gross-dist)*100)/100;
-      return { gross, expenseAmount: exp, netPool: Math.round((gross-exp)*100)/100, levelPayouts: lp, userPayouts: up };
+      const split = residualSplit({ gross, h, lsl, period, teamMap, cfg: engineCfg });
+      if (split.overDistributed) overDistributed++;
+      return breakdownFromShares(gross, split);
     };
 
     const [[{ n: total }]] = await pool.query("SELECT COUNT(*) n FROM transactions");
@@ -874,12 +871,16 @@ async function recomputeAllBreakdowns() {
           }
           recalcState.processed++; continue;
         }
-        const gross = Number(r.grossAmount) || 0; const h = hier.get(d.mappedClientId);
+        const gross = Number(r.grossAmount) || 0;
+        const hc = withHistory.get(d.mappedClientId);
+        const asOf = hc ? chainAsOf(hc, r.brokeragePeriod) : null;
+        const h = asOf ? asOf.hierarchy : hier.get(d.mappedClientId);
+        const leadHere = asOf ? asOf.leadSourceLevel : lead.get(d.mappedClientId);
         const bd = !h ? { gross, expenseAmount: gross, netPool: 0, levelPayouts:{1:0,2:0,3:0,4:0,5:0,6:0,7:0}, userPayouts:{} }
                       // RESIDUAL is the ONLY model now. Slices/Cumulative were removed:
                       // both allow the levels to sum past 100%, which paid out MORE than
                       // the firm received (PRADEEP book ran at 103.46% of gross).
-                      : calcResidual(gross, h, lead.get(d.mappedClientId), r.brokeragePeriod);
+                      : calcResidual(gross, h, leadHere, r.brokeragePeriod);
         d.breakdown = bd; upserts.push([r.id, JSON.stringify(d)]);
         for (const [uid, amt] of Object.entries(bd.userPayouts)) if (Math.abs(amt) > 0.0001) ledgerRows.push([r.id, uid, amt, 0]);
         recalcState.processed++;
@@ -942,11 +943,13 @@ async function buildPayoutContext(pool) {
 
   const hierarchyMap = new Map();
   const leadSourceMap = new Map();
+  const historyClients = new Map();   // only clients whose chain changed from some month
   for (const c of clientRows) {
     try {
       const d = c.data ? JSON.parse(c.data) : {};
       if (d.hierarchy) hierarchyMap.set(c.id, d.hierarchy);
       if (d.leadSourceLevel) leadSourceMap.set(c.id, Number(d.leadSourceLevel));
+      if (Array.isArray(d.hierarchyHistory) && d.hierarchyHistory.length) historyClients.set(c.id, { hierarchy: d.hierarchy, hierarchyHistory: d.hierarchyHistory, leadSourceLevel: d.leadSourceLevel ? Number(d.leadSourceLevel) : undefined });
     } catch (_) {}
   }
   const teamMap = new Map();
@@ -973,7 +976,7 @@ async function buildPayoutContext(pool) {
   // RESIDUAL model: company takes companyExpensePct off the top, levels below the
   // residual level keep their per-RM slice, and the residual-level user absorbs
   // whatever is left (100 − company − Σ lower shares).
-  return { hierarchyMap, leadSourceMap, teamMap, globalLevels, leadSourcePct, companyExpensePct, residualLevel, lockedPeriods };
+  return { hierarchyMap, leadSourceMap, historyClients, teamMap, globalLevels, leadSourcePct, companyExpensePct, residualLevel, lockedPeriods };
 }
 
 // Given transaction rows ({ grossAmount, mcid }) and a context from
@@ -992,46 +995,28 @@ async function buildPayoutContext(pool) {
 // the entry in force during the transaction's brokerage period. A member with no
 // history resolves to their current values, so behaviour is unchanged until the
 // first re-grade — that keeps this safe to deploy against existing data.
-function memberAsOf(info, period) {
-  if (!info) return info;
-  const hist = info.rateHistory;
-  if (!Array.isArray(hist) || hist.length === 0 || !period) return info;
-  const p = String(period);
-  let inForce = null, earliest = null;
-  for (const h of hist) {
-    if (!h || !h.effectiveFrom) continue;
-    const ef = String(h.effectiveFrom);
-    if (!earliest || ef < String(earliest.effectiveFrom)) earliest = h;
-    if (ef <= p && (!inForce || ef > String(inForce.effectiveFrom))) inForce = h;
-  }
-  // A period older than every entry uses the EARLIEST known rate — never the
-  // current one, which is the whole bug this function exists to prevent.
-  const pick = inForce || earliest;
-  if (!pick) return info;
-  return {
-    level: (pick.level !== undefined && pick.level !== null) ? Number(pick.level) : info.level,
-    customLevels: pick.customLevels || info.customLevels,
-    rateHistory: hist,
-  };
-}
+// memberAsOf() lives in src/lib/payoutEngine.js (imported above).
 
 function accumulatePayoutTotals(txRows, ctx) {
   const { hierarchyMap, leadSourceMap, teamMap, globalLevels, leadSourcePct, companyExpensePct, residualLevel } = ctx;
   const totals = Object.create(null);
   for (const tx of txRows) {
-    const h = hierarchyMap.get(tx.mcid);
-    if (!h) continue;
     const gross = Number(tx.grossAmount) || 0;
     // Rates are resolved AS OF the brokerage period, so a later promotion never
-    // restates this month. See memberAsOf().
+    // restates this month. See memberAsOf(). The client's chain is resolved the same
+    // way: a promotion that applies from a month leaves earlier months on the old chain.
     const period = tx.period || tx.brokeragePeriod || null;
+    const hc = ctx.historyClients && ctx.historyClients.get(tx.mcid);
+    const asOf = hc ? chainAsOf(hc, period) : null;
+    const h = asOf ? asOf.hierarchy : hierarchyMap.get(tx.mcid);
+    if (!h) continue;
 
     let ownerCustomLevels, ownerLevel;
     for (let l = 1; l <= 7; l++) {
       const uid = h[`level${l}Id`];
       if (uid) { ownerCustomLevels = memberAsOf(teamMap.get(uid), period)?.customLevels; ownerLevel = l; break; }
     }
-    const lsl = leadSourceMap.get(tx.mcid);
+    const lsl = asOf ? asOf.leadSourceLevel : leadSourceMap.get(tx.mcid);
 
     const grossCredited = new Set();
     for (let l = 1; l <= 7; l++) {
@@ -1077,39 +1062,13 @@ function accumulatePayoutTotals(txRows, ctx) {
     }
 
     {   // RESIDUAL is the ONLY payout model (Slices/Cumulative removed 2026-08-18)
-      // Company keeps companyExpensePct off the top. Each level BELOW the residual
-      // level with a user gets their own slice (own-level-first). The residual-level
-      // user absorbs the remainder: 100 − company − Σ(lower shares actually paid).
-      const paidSet = new Set();
-      let lowerSum = 0;
-      const rl = residualLevel || 4;
-      for (let l = 1; l < rl; l++) {
-        const uid = h[`level${l}Id`];
-        if (!uid || paidSet.has(uid)) continue;
-        paidSet.add(uid);
-        const info = memberAsOf(teamMap.get(uid), period);
-        const cl = info?.customLevels; const uLvl = info?.level;
-        const slicePct = (cl && cl[uLvl] !== undefined ? cl[uLvl]
-                        : cl && cl[l] !== undefined ? cl[l]
-                        : ownerCustomLevels?.[l] !== undefined ? ownerCustomLevels[l]
-                        : (globalLevels[l] || 0));
-        if (slicePct > 0) { totals[uid].earnings += Math.round(gross * slicePct / 100 * 10000) / 10000; lowerSum += slicePct; }
-      }
-      // The lead-source add-on is paid to the LOWER-level owner, so it must also
-      // reduce the residual — otherwise L4 is overstated by exactly leadSourcePct.
-      // Kept byte-identical in meaning to recomputeAllBreakdowns.calcResidual.
-      if (leadSourcePct > 0 && lsl && lsl < rl) {
-        const su = h[`level${lsl}Id`];
-        if (su) { totals[su].earnings += Math.round(gross * leadSourcePct / 100 * 10000) / 10000; lowerSum += leadSourcePct; }
-      }
-      // Surplus flows UP to the RM's nearest superior: the FIRST assigned level at
-      // or above the residual level (L4 → L5 → L6 → L7). If none exists, the surplus
-      // stays with the company.
-      let residualUid = null;
-      for (let l = rl; l <= 7; l++) { if (h[`level${l}Id`]) { residualUid = h[`level${l}Id`]; break; } }
-      if (residualUid && !paidSet.has(residualUid)) {
-        const surplus = Math.max(0, 100 - (companyExpensePct || 0) - lowerSum);
-        if (surplus > 0) { if (!totals[residualUid]) totals[residualUid] = { userId: residualUid, grossTotal: 0, earnings: 0, txCount: 0 }; totals[residualUid].earnings += Math.round(gross * surplus / 100 * 10000) / 10000; }
+      // The split is shared with the ledger recompute (src/lib/payoutEngine.js): company
+      // off the top, lower levels, lead-source bonus, upper levels (L5/L6) at their own
+      // rate, and the residual receiver takes what is left.
+      const split = residualSplit({ gross, h, lsl, period, teamMap, cfg: { globalLevels, leadSourcePct, companyExpensePct, residualLevel } });
+      for (const sh of split.shares) {
+        if (!totals[sh.uid]) totals[sh.uid] = { userId: sh.uid, grossTotal: 0, earnings: 0, txCount: 0, ownerGross: 0 };
+        totals[sh.uid].earnings += sh.amount;
       }
     }
   }
@@ -1560,7 +1519,7 @@ app.all('/api/data', mutationLimiter, async (req, res) => {
           const hier = new Map();
           for (const c of clientRows) {
             let d = {}; try { d = JSON.parse(c.data || '{}'); } catch {}
-            hier.set(c.id, d.hierarchy || {});
+            hier.set(c.id, { hierarchy: d.hierarchy || {}, hierarchyHistory: d.hierarchyHistory });
           }
           const [teamRows] = await pool.query(`SELECT id, name, code, role, level FROM team`);
           const team = new Map(teamRows.map(t => [t.id, t]));
@@ -1576,7 +1535,7 @@ app.all('/api/data', mutationLimiter, async (req, res) => {
           const unattributed = new Map();   // period -> firm share that reached nobody
           const unattributedClients = new Set();
           for (const r of rows) {
-            const h = hier.get(r.cid); if (!h) continue;
+            const h = chainAsOf(hier.get(r.cid), r.period).hierarchy; if (!h) continue;   // the chain that applied in the statement's month
             let claimed = 0;
             for (let lvl = 1; lvl <= 7; lvl++) {
               const p = Number(pct[lvl]) || 0; if (!p) continue;
@@ -1668,6 +1627,35 @@ app.all('/api/data', mutationLimiter, async (req, res) => {
       //    Partner brokerage is folded in through the same flat per-level
       //    percentages the Partner Brokerage page sets, so a person's row is what
       //    they are owed in total, not per revenue stream.
+      // ── Which months are frozen, and is each one safe to freeze? ──────────────────
+      //    A locked month keeps its stored payouts forever. That is only right when
+      //    the payouts exist, so each month reports how many of its rows have a stored
+      //    breakdown. ADMIN only.
+      if (action === 'lock_status') {
+        try {
+          if (!req.user || req.user.role !== 'ADMIN') return res.status(403).json({ error: 'Admin privileges required' });
+          res.set('Cache-Control', 'no-store');
+          if (lockStatusCache && Date.now() - lockStatusCache.at < 60 * 1000) return res.json(lockStatusCache.body);
+          const [[cfgRow]] = await pool.query('SELECT data FROM config LIMIT 1');
+          let cfg = {}; try { cfg = JSON.parse(cfgRow?.data || '{}'); } catch {}
+          const locked = new Set(Array.isArray(cfg.lockedPeriods) ? cfg.lockedPeriods : []);
+          const [rows] = await pool.query(`
+            SELECT brokeragePeriod period, COUNT(*) txs, ROUND(SUM(grossAmount),2) gross,
+                   SUM(JSON_EXTRACT(data,'$.breakdown') IS NULL) missing
+            FROM transactions WHERE brokeragePeriod IS NOT NULL AND brokeragePeriod <> ''
+            GROUP BY brokeragePeriod ORDER BY brokeragePeriod`);
+          const body = {
+            months: rows.map(r => ({ period: r.period, rows: Number(r.txs), gross: Number(r.gross) || 0, missingBreakdown: Number(r.missing) || 0, locked: locked.has(r.period) })),
+            lockedPeriods: [...locked].sort(),
+          };
+          lockStatusCache = { at: Date.now(), body };
+          return res.json(body);
+        } catch (e) {
+          console.error('[lock_status]', e);
+          return res.status(500).json({ error: 'Failed to read the lock status' });
+        }
+      }
+
       if (action === 'payout_overview') {
         try {
           // ADMIN and FINANCE read the whole firm. An RM or BM reads the same table
@@ -1701,7 +1689,7 @@ app.all('/api/data', mutationLimiter, async (req, res) => {
             const [clientRows] = await pool.query(`SELECT id, data FROM clients`);
             for (const c of clientRows) {
               let d = {}; try { d = JSON.parse(c.data || '{}'); } catch {}
-              hier.set(c.id, d.hierarchy || {});
+              hier.set(c.id, { hierarchy: d.hierarchy || {}, hierarchyHistory: d.hierarchyHistory });
             }
           }
 
@@ -1737,7 +1725,7 @@ app.all('/api/data', mutationLimiter, async (req, res) => {
           for (const r of pbRows) {
             const raw = cfg?.partnerSharing?.[r.partner];
             const pct = (typeof raw === 'number') ? { 3: raw } : (raw || {});
-            const h = hier.get(r.cid); if (!h) continue;
+            const h = chainAsOf(hier.get(r.cid), r.period).hierarchy; if (!h) continue;   // the chain that applied in the statement's month
             const key = String(r.partner || '').trim().toUpperCase() || 'PARTNER';
             // A partner with rows but no sharing % yet still has to appear in the
             // product list, or finance cannot tell "nothing earned" from "this
@@ -2119,8 +2107,11 @@ app.all('/api/data', mutationLimiter, async (req, res) => {
           // we process ~their book, not all 450k rows.
           const ctx = await buildPayoutContext(pool);
           const myClientIds = [];
+          const inChain = (h) => { for (let l = 1; l <= 7; l++) { if (h && h[`level${l}Id`] === uid) return true; } return false; };
           for (const [cid, h] of ctx.hierarchyMap) {
-            for (let l = 1; l <= 7; l++) { if (h[`level${l}Id`] === uid) { myClientIds.push(cid); break; } }
+            // Someone moved out of a chain from a month still earned in the months before it.
+            const older = ctx.historyClients.get(cid)?.hierarchyHistory || [];
+            if (inChain(h) || older.some(e => inChain(e.hierarchy))) myClientIds.push(cid);
           }
           if (myClientIds.length === 0) return res.json({ userId: uid, monthly: [] });
           const [txRows] = await pool.query(
@@ -3310,6 +3301,99 @@ app.all('/api/data', mutationLimiter, async (req, res) => {
       // of that report. Every one is audited, refuses to touch a settled period,
       // and writes mappedClientId to BOTH the column and the JSON copy — the
       // payout engines read the JSON, so updating only the column pays nobody.
+      // ── Lock months: freeze everything up to a month ──────────────────────────────
+      //    body: { action:'lock_periods', payload:{ through:'YYYY-MM' } }
+      //    Refuses a month whose payouts were never calculated (nothing to freeze), so
+      //    a half-imported month cannot be locked at zero. ADMIN only (not in the
+      //    Finance allow-list). Unlocking is a separate, deliberate action.
+      if (action === 'lock_periods') {
+        if (!req.user || req.user.role !== 'ADMIN') return res.status(403).json({ error: 'Admin privileges required' });
+        const through = String(payload?.through || '').trim();
+        if (!/^\d{4}-\d{2}$/.test(through)) return res.status(400).json({ error: 'through must be a month like 2026-08' });
+        try {
+          const [cfgRows] = await pool.query('SELECT id, data FROM config LIMIT 1');
+          if (!cfgRows.length) return res.status(400).json({ error: 'No config row to update' });
+          let cfg = {}; try { cfg = JSON.parse(cfgRows[0].data || '{}'); } catch {}
+          const [periodRows] = await pool.query(`
+            SELECT brokeragePeriod period, SUM(JSON_EXTRACT(data,'$.breakdown') IS NULL) missing
+            FROM transactions WHERE brokeragePeriod IS NOT NULL AND brokeragePeriod <> '' AND brokeragePeriod <= ?
+            GROUP BY brokeragePeriod`, [through]);
+          const toAdd = monthsToLock(through, periodRows.map(r => r.period), cfg.lockedPeriods || []);
+          const unsafe = periodRows.filter(r => toAdd.includes(r.period) && Number(r.missing) > 0).map(r => r.period);
+          if (unsafe.length) {
+            return res.status(409).json({ error: `These months have transactions with no stored payout, so freezing them would lock in zeros: ${unsafe.sort().join(', ')}. Recalculate first.`, months: unsafe });
+          }
+          if (!toAdd.length) return res.json({ success: true, added: [], lockedPeriods: mergeLocks(cfg.lockedPeriods, []) });
+          cfg.lockedPeriods = mergeLocks(cfg.lockedPeriods, toAdd);
+          await pool.query('UPDATE config SET data = ? WHERE id = ?', [JSON.stringify(cfg), cfgRows[0].id]);
+          await pool.query('INSERT INTO activity_log (userId, userName, action, description, createdAt) VALUES (?,?,?,?,NOW())',
+            [req.user.id, req.user.name || req.user.email || 'admin', 'LOCK_PERIODS', `Locked ${toAdd.length} month(s): ${toAdd[0]}${toAdd.length > 1 ? ' to ' + toAdd[toAdd.length - 1] : ''}`]);
+          invalidateSummaryCache();
+          return res.json({ success: true, added: toAdd, lockedPeriods: cfg.lockedPeriods });
+        } catch (e) {
+          console.error('[lock_periods]', e);
+          return res.status(500).json({ error: 'Failed to lock the months' });
+        }
+      }
+
+      //    body: { action:'unlock_period', payload:{ period:'YYYY-MM' } }
+      //    Opens one month for recalculation again. Logged. ADMIN only.
+      if (action === 'unlock_period') {
+        if (!req.user || req.user.role !== 'ADMIN') return res.status(403).json({ error: 'Admin privileges required' });
+        const period = String(payload?.period || '').trim();
+        if (!/^\d{4}-\d{2}$/.test(period)) return res.status(400).json({ error: 'period must be a month like 2026-08' });
+        try {
+          const [cfgRows] = await pool.query('SELECT id, data FROM config LIMIT 1');
+          if (!cfgRows.length) return res.status(400).json({ error: 'No config row to update' });
+          let cfg = {}; try { cfg = JSON.parse(cfgRows[0].data || '{}'); } catch {}
+          const before = Array.isArray(cfg.lockedPeriods) ? cfg.lockedPeriods : [];
+          if (!before.includes(period)) return res.json({ success: true, lockedPeriods: before, unlocked: false });
+          cfg.lockedPeriods = before.filter(p => p !== period);
+          await pool.query('UPDATE config SET data = ? WHERE id = ?', [JSON.stringify(cfg), cfgRows[0].id]);
+          await pool.query('INSERT INTO activity_log (userId, userName, action, description, createdAt) VALUES (?,?,?,?,NOW())',
+            [req.user.id, req.user.name || req.user.email || 'admin', 'UNLOCK_PERIOD', `Unlocked ${period}`]);
+          invalidateSummaryCache();
+          return res.json({ success: true, unlocked: true, lockedPeriods: cfg.lockedPeriods });
+        } catch (e) {
+          console.error('[unlock_period]', e);
+          return res.status(500).json({ error: 'Failed to unlock the month' });
+        }
+      }
+
+      // ── Preview a promotion: what would move, and what is in the way ────────────────
+      //    body: { action:'promotion_preview', payload:{ personId, to, effectiveFrom, occupied } }
+      //    Writes nothing. Same planner the save uses, so the preview cannot differ.
+      if (action === 'promotion_preview') {
+        if (!req.user || req.user.role !== 'ADMIN') return res.status(403).json({ error: 'Admin privileges required' });
+        try {
+          const personId = String(payload?.personId || '').trim();
+          const to = Number(payload?.to);
+          const [[person]] = await pool.query('SELECT id, name, level FROM team WHERE id = ?', [personId]);
+          if (!person) return res.status(404).json({ error: 'No such team member' });
+          const from = Number(person.level);
+          if (!Number.isFinite(to) || to < 1 || to > 7 || to === from) return res.json({ from, to, moved: 0, replaced: 0, blocked: 0, blockedClients: [], sample: [] });
+          const [rows] = await pool.query(
+            `SELECT id, name, data FROM clients WHERE JSON_UNQUOTE(JSON_EXTRACT(data,'$.hierarchy.level${from}Id')) = ?`, [personId]);
+          const clients = [];
+          for (const r of rows) {
+            let d; try { d = JSON.parse(r.data || '{}'); } catch { continue; }
+            clients.push({ id: r.id, name: r.name, hierarchy: d.hierarchy || {}, hierarchyHistory: d.hierarchyHistory, leadSourceLevel: d.leadSourceLevel });
+          }
+          const plan = planLevelMove({ clients, personId, from, to, effectiveFrom: String(payload?.effectiveFrom || ''), occupied: payload?.occupied === 'replace' ? 'replace' : 'keep' });
+          const [teamRows] = await pool.query('SELECT id, name FROM team');
+          const nameOf = new Map(teamRows.map(t => [t.id, String(t.name || '').trim()]));
+          return res.json({
+            from, to, person: String(person.name || '').trim(), clientsAtOldLevel: clients.length,
+            moved: plan.counts.moved, replaced: plan.counts.replaced, blocked: plan.counts.blocked,
+            blockedClients: plan.blocked.slice(0, 50).map(b => ({ id: b.id, name: b.name, heldBy: nameOf.get(b.heldBy) || b.heldBy })),
+            sample: plan.moves.slice(0, 8).map(m => m.name),
+          });
+        } catch (e) {
+          console.error('[promotion_preview]', e);
+          return res.status(500).json({ error: 'Failed to preview the promotion' });
+        }
+      }
+
       if (action === 'exception_fix') {
         if (!req.user || !['ADMIN', 'FINANCE'].includes(req.user.role)) {
           return res.status(403).json({ error: 'Admin or Finance privileges required' });
@@ -4011,6 +4095,7 @@ app.all('/api/data', mutationLimiter, async (req, res) => {
       // re-mapped by hand, client by client. Record the before/after level here so
       // the client placements can follow the member automatically after commit.
       const levelMoves = [];
+      const levelMoveSummary = [];   // what the automatic client move did, returned to the form
       if (collection === 'team' && items.length) {
         const ids = items.map(it => it && it.id).filter(Boolean);
         if (ids.length) {
@@ -4023,8 +4108,16 @@ app.all('/api/data', mutationLimiter, async (req, res) => {
           for (const it of items) {
             const before = prevLevel.get(it.id);
             const after = Number(it.level);
+            // Control fields from the member form; never stored as profile data.
+            const occupiedRule = it.levelMoveOccupied === 'replace' ? 'replace' : 'keep';
+            const levelChangedNow = before !== undefined && Number.isFinite(after) && before !== after;
+            const useCardRate = it.rateAuto === true && levelChangedNow;   // a stale flag on an unrelated save must do nothing
+            delete it.levelMoveOccupied; delete it.rateAuto;
+            const askedMonth = String(it.rateEffectiveFrom || '').trim();
             if (before !== undefined && Number.isFinite(after) && before !== after && after >= 1 && after <= 7) {
-              levelMoves.push({ userId: it.id, from: before, to: after });
+              // The month the promotion applies from: the one chosen on the form, else this month.
+              const effectiveFrom = /^d{4}-d{2}$/.test(askedMonth) || askedMonth === '0000-01' ? askedMonth : thisMonth;
+              levelMoves.push({ userId: it.id, from: before, to: after, effectiveFrom, occupied: occupiedRule });
             }
 
             // ── Effective-dated rate change ────────────────────────────────
@@ -4034,7 +4127,10 @@ app.all('/api/data', mutationLimiter, async (req, res) => {
             const prev = prevData.get(it.id);
             if (!prev) continue;                                   // brand-new member: nothing to preserve
             const prevCL = prev.customLevels || {};
-            const nextCL = it.customLevels || {};
+            let nextCL = it.customLevels || {};
+            // "Use the standard rate": the person is paid the rate card for their new level, so
+            // nothing is written for it (an explicit 0 here would pay them 0%).
+            if (useCardRate && Number.isFinite(after)) { nextCL = { ...nextCL }; delete nextCL[after]; it.customLevels = nextCL; }
             const levelChanged = before !== undefined && Number.isFinite(after) && before !== after;
             const rateChanged  = JSON.stringify(prevCL) !== JSON.stringify(nextCL);
             // An explicit effective month is itself a reason to rewrite the timeline,
@@ -4253,6 +4349,17 @@ app.all('/api/data', mutationLimiter, async (req, res) => {
               const [del] = await connection.query('DELETE FROM brokerage_masters WHERE id IN (?)', [toDrop]);
               console.log(`🧹 [Masters] merged ${del.affectedRows} renamed scheme row(s) into their canonical key`);
             }
+          } else if (collection === 'config') {
+            for (const item of items) {
+              const { id, ...rest } = item;
+              // The settings page sends its whole config. A tab opened before a month was
+              // locked would write the older, shorter list back and silently unlock it, so a
+              // save may add locks but never remove one (see unlock_period).
+              const [[stored]] = await connection.query('SELECT data FROM config WHERE id = ?', [id]);
+              let prevLocks = []; try { prevLocks = JSON.parse(stored?.data || '{}').lockedPeriods || []; } catch {}
+              rest.lockedPeriods = mergeLocks(prevLocks, rest.lockedPeriods);
+              await connection.query('INSERT INTO config (id, data) VALUES (?, ?) ON DUPLICATE KEY UPDATE data=VALUES(data)', [id, JSON.stringify(rest)]);
+            }
           } else {
             for (const item of items) {
               const { id, ...rest } = item;
@@ -4275,37 +4382,56 @@ app.all('/api/data', mutationLimiter, async (req, res) => {
         //   • recomputes payouts afterwards so reports reflect it immediately
         if (levelMoves.length) {
           try {
-            let moved = 0, skipped = 0;
+            let anyMoved = false;
             for (const mv of levelMoves) {
               const [rows] = await pool.query(
-                `SELECT id, data FROM clients WHERE JSON_UNQUOTE(JSON_EXTRACT(data,'$.hierarchy.level${mv.from}Id')) = ?`,
+                `SELECT id, name, data FROM clients WHERE JSON_UNQUOTE(JSON_EXTRACT(data,'$.hierarchy.level${mv.from}Id')) = ?`,
                 [mv.userId]);
+              const parsed = new Map();
+              const clients = [];
               for (const r of rows) {
                 let d; try { d = JSON.parse(r.data || '{}'); } catch { continue; }
-                const h = d.hierarchy || {};
-                const target = h[`level${mv.to}Id`];
-                if (target && target !== mv.userId) { skipped++; continue; }  // slot taken by someone else
-                h[`level${mv.from}Id`] = '';
-                h[`level${mv.to}Id`] = mv.userId;
-                d.hierarchy = h;
-                if (Number(d.leadSourceLevel) === mv.from) d.leadSourceLevel = mv.to;
-                d.updatedAt = new Date().toISOString();
-                await pool.query('UPDATE clients SET data=? WHERE id=?', [JSON.stringify(d), r.id]);
-                moved++;
+                parsed.set(r.id, d);
+                clients.push({ id: r.id, name: r.name, hierarchy: d.hierarchy || {}, hierarchyHistory: d.hierarchyHistory, leadSourceLevel: d.leadSourceLevel });
               }
-            }
-            if (moved || skipped) {
-              const desc = levelMoves.map(m => `${m.userId} L${m.from}→L${m.to}`).join(', ')
-                         + ` — ${moved} client(s) re-slotted${skipped ? `, ${skipped} skipped (slot occupied)` : ''}`;
+              // Dated: from `effectiveFrom` the person holds the new slot on every client that
+              // had them at the old one; earlier months keep the chain that applied then.
+              const plan = planLevelMove({ clients, personId: mv.userId, from: mv.from, to: mv.to, effectiveFrom: mv.effectiveFrom, occupied: mv.occupied });
+              if (plan.moves.length) {
+                const stamp = new Date().toISOString();
+                const conn = await pool.getConnection();
+                try {
+                  await conn.beginTransaction();
+                  for (const m of plan.moves) {
+                    const d = parsed.get(m.id);
+                    d.hierarchy = m.hierarchy;
+                    if (m.hierarchyHistory.length) d.hierarchyHistory = m.hierarchyHistory; else delete d.hierarchyHistory;
+                    if (m.leadSourceLevel !== undefined) d.leadSourceLevel = m.leadSourceLevel;
+                    d.updatedAt = stamp;
+                    await conn.query('UPDATE clients SET data=? WHERE id=?', [JSON.stringify(d), m.id]);
+                  }
+                  await conn.commit();
+                } catch (txErr) { await conn.rollback(); throw txErr; } finally { conn.release(); }
+                anyMoved = true;
+              }
+              const summary = { userId: mv.userId, from: mv.from, to: mv.to, effectiveFrom: mv.effectiveFrom, occupied: mv.occupied,
+                moved: plan.counts.moved, replaced: plan.counts.replaced, blocked: plan.counts.blocked,
+                blockedClients: plan.blocked.slice(0, 100) };
+              levelMoveSummary.push(summary);
+              const desc = `${mv.userId} L${mv.from}→L${mv.to} from ${mv.effectiveFrom === '0000-01' ? 'all months' : mv.effectiveFrom}`
+                         + ` — ${plan.counts.moved} client(s) moved`
+                         + (plan.counts.replaced ? `, ${plan.counts.replaced} replaced the previous holder` : '')
+                         + (plan.counts.blocked ? `, ${plan.counts.blocked} left alone (the level was already held by someone else)` : '');
               console.log(`[level-move] ${desc}`);
               try {
                 await pool.query('INSERT INTO activity_log (userId, userName, action, description, createdAt) VALUES (?,?,?,?,NOW())',
                   [req.user?.id || 'system', req.user?.name || 'system', 'LEVEL_MOVE_REMAP', desc]);
               } catch (_) {}
-              if (moved) { invalidateSummaryCache(); recomputeAllBreakdowns(); }
             }
+            if (anyMoved) { invalidateSummaryCache(); recomputeAllBreakdowns(); }
           } catch (mvErr) {
             console.error('[level-move] client re-slot failed:', mvErr.message);
+            levelMoveSummary.push({ error: mvErr.message });
           }
         }
 
@@ -4348,6 +4474,7 @@ app.all('/api/data', mutationLimiter, async (req, res) => {
           success: true, saved: items.length, stamped: nowISO,
           conflicts: staleConflicts, conflictCount: staleConflicts.length,
           superseded: supersededBatches,
+          ...(levelMoveSummary.length ? { levelMove: levelMoveSummary } : {}),
         });
       } catch (e) {
         await connection.rollback();
