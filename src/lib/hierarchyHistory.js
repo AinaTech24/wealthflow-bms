@@ -23,6 +23,16 @@
  * exactly as before.
  */
 
+/**
+ * The month a promotion applies from, as sent by the member form: 'YYYY-MM', or
+ * '0000-01' meaning "all months". Anything else (blank, malformed) falls back to
+ * `fallback`, normally the current month.
+ */
+export function effectiveMonthOr(raw, fallback) {
+  const s = String(raw == null ? '' : raw).trim();
+  return /^\d{4}-\d{2}$/.test(s) ? s : fallback;
+}
+
 /** 'YYYY-MM' one month earlier. */
 export function monthBefore(period) {
   const [y, m] = String(period).split('-').map(Number);

@@ -1,12 +1,20 @@
 // Tests for hierarchyAsOf and planLevelMove.
 //
 //   node src/lib/hierarchyHistory.test.mjs
-import { hierarchyAsOf, chainAsOf, planLevelMove, monthBefore } from './hierarchyHistory.js';
+import { hierarchyAsOf, chainAsOf, planLevelMove, monthBefore, effectiveMonthOr } from './hierarchyHistory.js';
 
 let pass = 0, fail = 0;
 const ok = (cond, what) => { if (cond) pass++; else { fail++; console.log(`  FAIL  ${what}`); } };
 const slot = (h, l) => (h && h[`level${l}Id`]) || '';
 const chainOf = (h) => [1, 2, 3, 4, 5, 6, 7].map(l => slot(h, l)).join('|');
+
+// The month the member form sends. A malformed rule here once made every promotion
+// silently start "this month" instead of the month that was chosen.
+ok(effectiveMonthOr('2026-09', '2026-10') === '2026-09', 'a chosen month is used as it is');
+ok(effectiveMonthOr(' 2026-09 ', '2026-10') === '2026-09', 'surrounding spaces are ignored');
+ok(effectiveMonthOr('0000-01', '2026-10') === '0000-01', '"all months" is kept');
+ok(effectiveMonthOr('', '2026-10') === '2026-10' && effectiveMonthOr(undefined, '2026-10') === '2026-10' && effectiveMonthOr(null, '2026-10') === '2026-10', 'blank falls back to this month');
+ok(effectiveMonthOr('September', '2026-10') === '2026-10' && effectiveMonthOr('2026-9', '2026-10') === '2026-10' && effectiveMonthOr('2026-09-01', '2026-10') === '2026-10', 'malformed values fall back to this month');
 
 ok(monthBefore('2026-09') === '2026-08' && monthBefore('2026-01') === '2025-12', 'monthBefore, including the year boundary');
 

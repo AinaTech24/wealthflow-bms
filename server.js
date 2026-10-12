@@ -14,7 +14,7 @@ import { planBranchRestructure } from './src/lib/branchRestructure.js';
 import { pickOwnerRecord } from './src/lib/folioOwner.js';
 import { scopePayoutOverview } from './src/lib/payoutScope.js';
 import { memberAsOf, residualSplit, breakdownFromShares } from './src/lib/payoutEngine.js';
-import { chainAsOf, planLevelMove } from './src/lib/hierarchyHistory.js';
+import { chainAsOf, planLevelMove, effectiveMonthOr } from './src/lib/hierarchyHistory.js';
 import { monthsToLock, mergeLocks } from './src/lib/lockPeriods.js';
 import bcrypt from 'bcrypt';
 import jwt from 'jsonwebtoken';
@@ -4113,11 +4113,11 @@ app.all('/api/data', mutationLimiter, async (req, res) => {
             const levelChangedNow = before !== undefined && Number.isFinite(after) && before !== after;
             const useCardRate = it.rateAuto === true && levelChangedNow;   // a stale flag on an unrelated save must do nothing
             delete it.levelMoveOccupied; delete it.rateAuto;
-            const askedMonth = String(it.rateEffectiveFrom || '').trim();
             if (before !== undefined && Number.isFinite(after) && before !== after && after >= 1 && after <= 7) {
-              // The month the promotion applies from: the one chosen on the form, else this month.
-              const effectiveFrom = /^d{4}-d{2}$/.test(askedMonth) || askedMonth === '0000-01' ? askedMonth : thisMonth;
-              levelMoves.push({ userId: it.id, from: before, to: after, effectiveFrom, occupied: occupiedRule });
+              // The month the promotion applies from: the one chosen on the form ('0000-01' =
+              // all months), else this month. Parsed in the tested library on purpose: a
+              // mangled pattern here once made every promotion silently start "this month".
+              levelMoves.push({ userId: it.id, from: before, to: after, effectiveFrom: effectiveMonthOr(it.rateEffectiveFrom, thisMonth), occupied: occupiedRule });
             }
 
             // ── Effective-dated rate change ────────────────────────────────

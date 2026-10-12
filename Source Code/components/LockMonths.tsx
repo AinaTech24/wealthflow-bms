@@ -98,7 +98,7 @@ export const LockMonths: React.FC = () => {
           <div className="flex items-center gap-3 flex-wrap mb-3">
             <label htmlFor="lock-through" className="text-[10px] font-black uppercase tracking-widest text-slate-400">Lock every month up to</label>
             <select id="lock-through" value={through} onChange={e => setThrough(e.target.value)}
-              className="px-3 py-2 rounded-lg border border-slate-200 text-sm font-bold bg-white">
+              className="px-3 py-2 rounded-lg border border-slate-200 text-sm font-bold bg-white text-slate-900">
               {openMonths.length === 0 && <option value="">Everything is locked</option>}
               {openMonths.map(m => <option key={m.period} value={m.period}>{pretty(m.period)}</option>)}
             </select>

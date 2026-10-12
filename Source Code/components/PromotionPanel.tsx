@@ -38,7 +38,7 @@ export const PromotionPanel: React.FC<Props> = ({
   const up = toLevel > fromLevel;
   const total = preview ? preview.moved + preview.replaced : 0;
   return (
-    <div className="mt-2 rounded-2xl border-2 border-blue-200 dark:border-blue-800 bg-blue-50/60 dark:bg-blue-900/10 p-4 space-y-3" role="region" aria-label="Level change">
+    <div className="mt-2 rounded-2xl border-2 border-blue-200 dark:border-blue-700 bg-blue-50 dark:bg-slate-800 p-4 space-y-3" role="region" aria-label="Level change">
       <div className="flex items-start gap-2">
         <ArrowUpRight className={`w-4 h-4 mt-0.5 flex-shrink-0 ${up ? 'text-emerald-600' : 'text-amber-600 rotate-90'}`} />
         <div>
@@ -59,7 +59,7 @@ export const PromotionPanel: React.FC<Props> = ({
         </span>
       </label>
 
-      <div className="rounded-xl bg-white dark:bg-slate-800 border border-slate-200 dark:border-slate-700 p-3 text-xs space-y-2">
+      <div className="rounded-xl bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-700 p-3 text-xs space-y-2">
         {loading && !preview && <p className="text-slate-400">Checking this person&rsquo;s clients…</p>}
         {preview && (
           <>
