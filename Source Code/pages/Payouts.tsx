@@ -5,6 +5,7 @@ import { authFetch } from '../contexts/DataContext';
 import { useToast } from '../components/Toast';
 import { formatCompactINR } from '../utils/formatINR';
 import { exportToExcel } from '../utils/excelExport';
+import { labelFor } from '../utils/payoutSources';
 
 interface Props { currentUser: TeamMember }
 
@@ -19,18 +20,8 @@ interface MonthRow {
   bySource: Record<string, { earned: number; paid: number; carriedIn: number; outstanding: number }>;
 }
 
-/**
- * Friendly names for the product codes the server reports.
- *
- * A code with no entry here shows as itself, which is why adding the next broker
- * needs no change on this page: it appears in the dropdown as 'ANGEL' the day its
- * first statement lands, and gets a nicer name here whenever someone bothers.
- */
-const SOURCE_LABEL: Record<string, string> = {
-  MF: 'Mutual fund',
-  MOFSL: 'Motilal Oswal',
-};
-const labelFor = (key: string) => (key === 'all' ? 'All products' : SOURCE_LABEL[key] || key);
+// Product names live in utils/payoutSources.ts, shared with the earnings panel on
+// the dashboard, so the two screens always call a product the same thing.
 interface Person {
   userId: string; name: string; code: string; role: string; level: number | null;
   months: MonthRow[]; totalEarned: number; totalPaid: number; outstanding: number;

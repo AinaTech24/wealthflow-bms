@@ -12,6 +12,7 @@ import pool from './src/lib/db.js';
 import { nameTokens, nameContradicts, bestNameMatches } from './src/lib/nameMatch.js';
 import { planBranchRestructure } from './src/lib/branchRestructure.js';
 import { pickOwnerRecord } from './src/lib/folioOwner.js';
+import { scopePayoutOverview } from './src/lib/payoutScope.js';
 import bcrypt from 'bcrypt';
 import jwt from 'jsonwebtoken';
 import rateLimit from 'express-rate-limit';
@@ -1669,11 +1670,16 @@ app.all('/api/data', mutationLimiter, async (req, res) => {
       //    they are owed in total, not per revenue stream.
       if (action === 'payout_overview') {
         try {
-          if (!isWriter(req)) return res.status(403).json({ error: 'Forbidden' });
+          // ADMIN and FINANCE read the whole firm. An RM or BM reads the same table
+          // cut down to their OWN row, so they can see their earnings month by month
+          // and product by product without anyone else's figures being sent to them.
+          if (!req.user) return res.status(401).json({ error: 'Not authenticated' });
+          const writer = isWriter(req);
           const now = Date.now();
           if (payoutOverviewCache && now - payoutOverviewCache.at < SUMMARY_TTL_MS) {
             res.set('X-Cache', 'HIT');
-            return res.json(payoutOverviewCache.body);
+            res.set('Cache-Control', 'no-store');
+            return res.json(scopePayoutOverview(payoutOverviewCache.body, req.user, writer));
           }
 
           // 1. Mutual fund earnings, per person per month.
@@ -1882,7 +1888,8 @@ app.all('/api/data', mutationLimiter, async (req, res) => {
           const body = { generatedAt: new Date().toISOString(), periods, people, sources };
           payoutOverviewCache = { at: now, body };
           res.set('X-Cache', 'MISS');
-          return res.json(body);
+          res.set('Cache-Control', 'no-store');
+          return res.json(scopePayoutOverview(body, req.user, writer));
         } catch (e) {
           console.error('[payout_overview]', e);
           return res.status(500).json({ error: 'Failed to build the payout overview' });

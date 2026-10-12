@@ -10,6 +10,7 @@ import { useData } from '../contexts/DataContext';
 import { calculateUserShare } from '../services/calculationService';
 import { ComplianceAlerts } from '../components/ComplianceAlerts';
 import { TopClientsWidget } from '../components/TopClientsWidget';
+import { EarningsByMonth } from '../components/EarningsByMonth';
 import { RedemptionAlerts } from '../components/RedemptionAlerts';
 import { formatCurrencyINR, formatCompactINR, formatINR } from '../utils/formatINR';
 
@@ -57,6 +58,7 @@ export const Dashboard: React.FC<DashboardProps> = ({ currentUser }) => {
   const { transactions, clients, globalConfig, team, serverSummary } = useData();
 
   const isAdmin = currentUser.role === Role.ADMIN;
+  const isFinance = currentUser.role === Role.FINANCE;
   const isSuperUser = isAdmin;
   const txLoaded = transactions.length > 0;
 
@@ -66,6 +68,20 @@ export const Dashboard: React.FC<DashboardProps> = ({ currentUser }) => {
   const [filterMonth, setFilterMonth] = useState(now.getMonth()); // 0-indexed
   const [filterYear, setFilterYear] = useState(now.getFullYear());
   const [drillDown, setDrillDown] = useState<{ label: string; transactions: typeof transactions } | null>(null);
+
+  // Open the filters on the newest month that has data. Defaulting to today showed
+  // an empty screen whenever the latest statement had not been imported yet.
+  const latestPeriod = useMemo(() => {
+    let best = '';
+    for (const tx of transactions) { const p = tx.brokeragePeriod; if (p && p > best) best = p; }
+    return best;
+  }, [transactions]);
+  const filterTouched = React.useRef(false);
+  React.useEffect(() => {
+    if (filterTouched.current || !latestPeriod) return;
+    const [y, m] = latestPeriod.split('-').map(Number);
+    if (y && m) { setFilterYear(y); setFilterMonth(m - 1); }
+  }, [latestPeriod]);
 
   React.useEffect(() => {
     const onKey = (e: KeyboardEvent) => { if (e.key === 'Escape') setDrillDown(null); };
@@ -265,8 +281,25 @@ export const Dashboard: React.FC<DashboardProps> = ({ currentUser }) => {
   const displayMonthlyData = txLoaded ? stats.monthlyData : summaryMonthlyData;
   const isLiveData = txLoaded; // true = computed from full tx data, false = from server summary
 
+  // Finance is an accounts desk: it owns no clients, so "my net receivable" and
+  // "portfolio count" were always zero. It sees the team's payout figures instead,
+  // straight from the server, by product and by month.
+  if (isFinance) {
+    return (
+      <div className="space-y-6 animate-in fade-in duration-500">
+        <div>
+          <h1 className="text-2xl font-bold text-slate-900 dark:text-slate-100 tracking-tight">Payout Summary</h1>
+          <p className="text-slate-500 dark:text-slate-400 text-sm mt-1 font-medium">What the team earned, what has been paid and what is still owed.</p>
+        </div>
+        <EarningsByMonth firmWide />
+        <ComplianceAlerts currentUser={currentUser} />
+      </div>
+    );
+  }
+
   return (
     <div className="space-y-6 animate-in fade-in duration-500">
+      {!isAdmin && <EarningsByMonth firmWide={false} />}
       {txTruncated && !useServerTotals && (
         <div className="rounded-lg border border-amber-200 dark:border-amber-800 bg-amber-50 dark:bg-amber-900/20 px-4 py-2.5 text-[12px] font-semibold text-amber-800 dark:text-amber-300">
           Showing the most recent {transactions.length.toLocaleString()} of {serverSummary!.totalTx.toLocaleString()} transactions. Figures for this filtered view are based on that subset — switch to “All time” for server-authoritative totals, or use Reports → Team Payouts.
@@ -287,7 +320,7 @@ export const Dashboard: React.FC<DashboardProps> = ({ currentUser }) => {
             {(['all', 'month', 'quarter', 'year'] as const).map(mode => (
               <button
                 key={mode}
-                onClick={() => setFilterMode(mode)}
+                onClick={() => { filterTouched.current = true; setFilterMode(mode); }}
                 className={`px-3 py-2 text-[10px] font-black uppercase tracking-widest transition ${filterMode === mode
                     ? 'bg-blue-600 text-white'
                     : 'text-slate-500 dark:text-slate-400 hover:bg-slate-50 dark:hover:bg-slate-700'
