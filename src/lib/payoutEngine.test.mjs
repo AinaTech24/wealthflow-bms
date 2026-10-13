@@ -135,7 +135,7 @@ for (let n = 0; n < 20000; n++) {
 }
 ok(mismatches === 0, `shared engine == production code on ${cases} random clients (mismatches: ${mismatches})`);
 
-// ── Part 2: the upper-level rule ──────────────────────────────────────────────────
+// ── Part 2: the upper-level rule (L5 / L6 are paid from the COMPANY's share) ─────────
 const team = new Map([
   ['rm',  { level: 3, customLevels: undefined }],
   ['bm',  { level: 4, customLevels: undefined }],
@@ -149,22 +149,21 @@ const total = (s) => s.shares.reduce((a, x) => a + x.amount, 0);
 const by = (s) => Object.fromEntries(s.shares.map(x => [x.uid, x.amount]));
 const chain = { level3Id: 'rm', level4Id: 'bm', level5Id: 'p5', level6Id: 'p6', level7Id: 'hq' };
 
-// L5 and L6 rates set on the firm-wide card: they start earning, L4 keeps the rest.
-let s = residualSplit({ gross: 1000, h: chain, period: '2026-09', teamMap: team, cfg: G({ 5: 5, 6: 3 }) });
-ok(near(by(s).rm, 250) && near(by(s).p5, 50) && near(by(s).p6, 30), 'L3 25%, L5 5%, L6 3% of 1000');
-ok(near(by(s).bm, 520), 'L4 keeps the rest: 100 - 15 - 25 - 5 - 3 = 52% = 520');
-ok(near(total(s), 850) && near(1000 - total(s), 150), 'company retains exactly its 15%');
-ok(!by(s).hq, 'L7 with no rate earns nothing');
-ok(s.shares.find(x => x.uid === 'p5').kind === 'upper' && s.upperSum === 8, 'upper shares are tagged and summed');
+// L5 and L6 at 5% each: they are paid out of the company's 15%, L4 keeps its remainder.
+let s = residualSplit({ gross: 1000, h: chain, period: '2026-09', teamMap: team, cfg: G({ 5: 5, 6: 5 }) });
+ok(near(by(s).rm, 250) && near(by(s).p5, 50) && near(by(s).p6, 50), 'L3 25%, L5 5%, L6 5% of 1000');
+ok(near(by(s).bm, 600), 'L4 is not reduced by L5/L6: it still keeps 60%');
+ok(near(total(s), 950) && near(1000 - total(s), 50), 'the company keeps 5% (its 15% less the 10% paid to L5 and L6)');
+ok(s.shares.find(x => x.uid === 'p5').kind === 'upper' && s.upperSum === 10, 'upper shares are tagged and summed');
 
-// With today's configuration (L5-L7 = 0) the upper levels earn nothing and L4 takes it all.
+// With today's configuration (L5-L7 = 0) nothing changes: L4 takes the whole remainder.
 s = residualSplit({ gross: 1000, h: chain, period: '2026-09', teamMap: team, cfg: G({}) });
-ok(near(by(s).bm, 600) && !by(s).p5 && !by(s).p6, 'with L5/L6 at 0 the L4 takes the whole 60% as before');
+ok(near(by(s).bm, 600) && !by(s).p5 && !by(s).p6 && near(1000 - total(s), 150), 'with L5/L6 at 0: L4 gets 60%, company 15%, as before');
 
-// A personal rate beats the firm-wide one; an explicit 0 stays 0.
+// A personal rate beats the firm-wide one; an explicit 0 stays 0 and the company keeps that share.
 const team2 = new Map(team); team2.set('p5', { level: 5, customLevels: { 5: 12 } }); team2.set('p6', { level: 6, customLevels: { 6: 0 } });
-s = residualSplit({ gross: 1000, h: chain, period: '2026-09', teamMap: team2, cfg: G({ 5: 5, 6: 3 }) });
-ok(near(by(s).p5, 120) && !by(s).p6, 'personal 12% beats the card; personal 0 beats the card');
+s = residualSplit({ gross: 1000, h: chain, period: '2026-09', teamMap: team2, cfg: G({ 5: 5, 6: 5 }) });
+ok(near(by(s).p5, 120) && !by(s).p6 && near(by(s).bm, 600), 'personal 12% beats the card; personal 0 beats the card');
 
 // The client owner's legacy card must NOT feed upper levels (Akash-style 5:70, 6:15, 7:15).
 const team3 = new Map(team); team3.set('rm', { level: 3, customLevels: { 3: 45, 5: 70, 6: 15, 7: 15 } });
@@ -172,28 +171,54 @@ s = residualSplit({ gross: 1000, h: chain, period: '2026-09', teamMap: team3, cf
 ok(near(by(s).rm, 450) && !by(s).p5 && !by(s).p6 && !by(s).hq, "owner's legacy L5/L6/L7 numbers are ignored");
 ok(near(by(s).bm, 400), 'L4 still gets 100 - 15 - 45 = 40%');
 
-// No L4 on the client: the L5 becomes the receiver and the L6 above it takes its own rate.
+// A person who owns the client at L5 / L6 gets 90% / 95% (L1-L4 shares collapse into them).
+s = residualSplit({ gross: 1000, h: { level5Id: 'p5', level7Id: 'hq' }, period: '2026-09', teamMap: team, cfg: G({ 5: 5, 6: 5 }) });
+ok(near(by(s).p5, 900) && near(1000 - total(s), 100), 'owner at L5: 90%, company 10%');
+s = residualSplit({ gross: 1000, h: { level6Id: 'p6', level7Id: 'hq' }, period: '2026-09', teamMap: team, cfg: G({ 5: 5, 6: 5 }) });
+ok(near(by(s).p6, 950) && near(1000 - total(s), 50), 'owner at L6: 95%, company 5%');
+s = residualSplit({ gross: 1000, h: { level4Id: 'bm', level7Id: 'hq' }, period: '2026-09', teamMap: team, cfg: G({ 5: 5, 6: 5 }) });
+ok(near(by(s).bm, 850) && near(1000 - total(s), 150), 'owner at L4: 85%, company 15%');
+
+// An empty L5 rolls its share up to the L6 above; with nobody above it stays with the company.
+s = residualSplit({ gross: 1000, h: { level3Id: 'rm', level4Id: 'bm', level6Id: 'p6' }, period: '2026-09', teamMap: team, cfg: G({ 5: 5, 6: 5 }) });
+ok(near(by(s).p6, 100) && near(by(s).bm, 600) && near(1000 - total(s), 50), 'empty L5 rolls up to L6 (5% + 5%)');
+s = residualSplit({ gross: 1000, h: { level3Id: 'rm', level4Id: 'bm', level5Id: 'p5' }, period: '2026-09', teamMap: team, cfg: G({ 5: 5, 6: 5 }) });
+ok(near(by(s).p5, 50) && near(by(s).bm, 600) && near(1000 - total(s), 100), 'empty L6 stays with the company');
+
+// No L4 on the client: the L5 becomes the receiver, the L6 above it takes its 5%.
 const noL4 = { level3Id: 'rm', level5Id: 'p5', level6Id: 'p6' };
-s = residualSplit({ gross: 1000, h: noL4, period: '2026-09', teamMap: team, cfg: G({ 6: 4 }) });
-ok(near(by(s).p6, 40) && near(by(s).p5, 1000 * (100 - 15 - 25 - 4) / 100), 'with no L4, L5 is the receiver and L6 takes 4% above it');
+s = residualSplit({ gross: 1000, h: noL4, period: '2026-09', teamMap: team, cfg: G({ 5: 5, 6: 5 }) });
+ok(near(by(s).p6, 50) && near(by(s).p5, 650) && near(1000 - total(s), 50), 'with no L4, L5 is the receiver and L6 takes 5%');
+
+// The worked example from the business: three RMs under one BM, 450 of brokerage.
+const t4 = new Map([['a', { level: 1, customLevels: { 1: 25 } }], ['b', { level: 2, customLevels: { 2: 50 } }], ['c', { level: 3, customLevels: { 3: 75 } }],
+  ['bm', { level: 4 }], ['p5', { level: 5 }], ['p6', { level: 6 }], ['hq', { level: 7 }]]);
+const top = { level4Id: 'bm', level5Id: 'p5', level6Id: 'p6', level7Id: 'hq' };
+const parts = [[{ ...top, level1Id: 'a' }, 100], [{ ...top, level2Id: 'b' }, 150], [{ ...top, level3Id: 'c' }, 200]]
+  .map(([h, g]) => residualSplit({ gross: g, h, period: '2026-09', teamMap: t4, cfg: G({ 5: 5, 6: 5 }) }));
+const sum = (u) => parts.reduce((x, r) => x + (by(r)[u] || 0), 0);
+ok(near(sum('a'), 25) && near(sum('b'), 75) && near(sum('c'), 150), 'RMs earn 25 + 75 + 150');
+ok(near(sum('p5'), 22.5) && near(sum('p6'), 22.5), 'L5 and L6 each get 22.5');
+ok(near(sum('bm'), 132.5), 'the BM gets what is left: 132.5');
+ok(near(450 - parts.reduce((x, r) => x + total(r), 0), 22.5), 'the company keeps 22.5');
 
 // Over-allocation: the receiver is clamped at zero and the client is flagged.
 s = residualSplit({ gross: 1000, h: chain, period: '2026-09', teamMap: team, cfg: G({ 5: 40, 6: 40 }) });
-ok(s.overDistributed === true && !by(s).bm, 'rates beyond 100% are flagged and the receiver is clamped to 0');
+ok(s.overDistributed === true && !by(s).bm, 'rates beyond what is available are flagged and the receiver is clamped to 0');
 
 // A clawback reverses every share, including the upper ones.
-s = residualSplit({ gross: -1000, h: chain, period: '2026-09', teamMap: team, cfg: G({ 5: 5, 6: 3 }) });
-ok(near(by(s).p5, -50) && near(by(s).p6, -30) && near(by(s).bm, -520), 'a clawback deducts from upper levels too');
+s = residualSplit({ gross: -1000, h: chain, period: '2026-09', teamMap: team, cfg: G({ 5: 5, 6: 5 }) });
+ok(near(by(s).p5, -50) && near(by(s).p6, -50) && near(by(s).bm, -600), 'a clawback deducts from upper levels too');
 
 // The same person in two upper slots is paid once.
 const dup = { level3Id: 'rm', level4Id: 'bm', level5Id: 'p5', level6Id: 'p5' };
-s = residualSplit({ gross: 1000, h: dup, period: '2026-09', teamMap: team, cfg: G({ 5: 5, 6: 3 }) });
+s = residualSplit({ gross: 1000, h: dup, period: '2026-09', teamMap: team, cfg: G({ 5: 5, 6: 5 }) });
 ok(near(by(s).p5, 50), 'one person in two upper slots earns once, at the first slot');
 
 // breakdown shape the ledger stores
-const bd = breakdownFromShares(1000, residualSplit({ gross: 1000, h: chain, period: '2026-09', teamMap: team, cfg: G({ 5: 5, 6: 3 }) }));
-ok(near(bd.levelPayouts[5], 50) && near(bd.levelPayouts[6], 30) && near(bd.levelPayouts[4], 520), 'levelPayouts carry L5 and L6');
-ok(near(bd.expenseAmount, 150) && near(bd.netPool, 850), 'expense and net pool add up');
+const bd = breakdownFromShares(1000, residualSplit({ gross: 1000, h: chain, period: '2026-09', teamMap: team, cfg: G({ 5: 5, 6: 5 }) }));
+ok(near(bd.levelPayouts[5], 50) && near(bd.levelPayouts[6], 50) && near(bd.levelPayouts[4], 600), 'levelPayouts carry L5 and L6');
+ok(near(bd.expenseAmount, 50) && near(bd.netPool, 950), 'expense and net pool add up');
 
 console.log(`${pass} passed, ${fail} failed`);
 process.exit(fail ? 1 : 0);

@@ -16,15 +16,15 @@
  *      their personal rate for the slot, else the client owner's rate for the slot,
  *      else the firm-wide rate for the level. Each person is paid once.
  *   3. The lead-source bonus goes to the person at the lead-source level.
- *   4. UPPER LEVELS (new): a person ABOVE the residual receiver, say an L5 or L6
- *      sitting over the L4, takes their own % of gross, the same way a lower level
- *      does. The rate is their personal rate at their own level, else the firm-wide
- *      rate for that level, so promoting someone to L5 or L6 starts that level's
- *      rate by itself. The owner's rate card is deliberately NOT consulted here: it
- *      still holds legacy "slice" numbers for L5-L7 that were never meant to be paid
- *      under this model (one adds up to 170%).
+ *   4. UPPER LEVELS (L5, L6): paid OUT OF THE COMPANY'S SHARE, never out of the
+ *      receiver's. Each slot has a rate (a person's own, else the firm-wide rate for
+ *      the level; the owner's legacy rate card is deliberately NOT consulted). A slot
+ *      with nobody in it rolls its rate up to the next person above, and stays with
+ *      the company if nobody is above. Example, L5 = L6 = 5%, company 15%: a client
+ *      with an L5 and an L6 leaves the company 5%; an L5 alone leaves it 10%.
  *   5. The RESIDUAL RECEIVER (the first person at the residual level or above, so
- *      L4, else L5, ...) takes whatever is left: 100 - company - lower - upper.
+ *      L4, else L5, ...) takes whatever is left: 100 - company(after rule 4) - lower
+ *      - upper. So a client owned directly by an L5 pays that L5 90%, an L6 95%.
  *
  * With no upper-level rate set (today's configuration: L5, L6, L7 = 0) rule 4 pays
  * nothing and the result is identical to the model before it existed. That is
@@ -126,28 +126,54 @@ export function residualSplit({ gross, h, lsl, period, teamMap, cfg }) {
     if (h[`level${l}Id`]) { receiver = h[`level${l}Id`]; receiverLevel = l; break; }
   }
 
-  // Upper levels: people sitting above the receiver take their own rate.
+  // Upper levels. L5 and L6 are paid OUT OF THE COMPANY'S SHARE, never out of the
+  // receiver's. Each slot has a rate (a person's own, else the firm-wide one). A slot
+  // with nobody in it rolls its rate up to the next person above; if nobody is above,
+  // it stays with the company. A receiver at L5/L6 takes the slots up to and including
+  // their own through the remainder (so L5 alone = 90%, L6 alone = 95%).
+  // L7 is the company itself; a rate set on an L7 person is still paid from the
+  // receiver's remainder, exactly as before.
+  const slotRate = (u, l) => {
+    if (!u) return Math.max(0, globalLevels[l] || 0);
+    const info = memberAsOf(teamMap.get(u), period);
+    const cl = info?.customLevels, uL = info?.level;
+    return Math.max(0,
+      cl && cl[uL] !== undefined ? cl[uL]
+      : cl && cl[l] !== undefined ? cl[l]
+      : (globalLevels[l] || 0));
+  };
+  let fundedSum = 0;
   if (receiver) {
-    for (let l = receiverLevel + 1; l <= 7; l++) {
+    let pending = 0;
+    for (let l = rl + 1; l <= 6; l++) {
       const u = h[`level${l}Id`];
-      if (!u || u === receiver || paid.has(u)) continue;
-      const info = memberAsOf(teamMap.get(u), period);
-      const cl = info?.customLevels, uL = info?.level;
-      const pct = Math.max(0,
-        cl && cl[uL] !== undefined ? cl[uL]
-        : cl && cl[l] !== undefined ? cl[l]
-        : (globalLevels[l] || 0));
+      if (!u) { pending += slotRate(null, l); continue; }
+      if (u === receiver) { fundedSum += slotRate(u, l) + pending; pending = 0; continue; }
+      if (paid.has(u)) continue;
+      const pct = slotRate(u, l);
       if (pct <= 0) continue;
+      const take = pct + pending;
+      pending = 0;
       paid.add(u);
-      shares.push({ uid: u, level: l, amount: round4(gross * pct / 100), kind: 'upper' });
-      upperSum += pct;
+      shares.push({ uid: u, level: l, amount: round4(gross * take / 100), kind: 'upper' });
+      upperSum += take; fundedSum += take;
+    }
+    const u7 = h.level7Id;
+    if (u7 && u7 !== receiver && !paid.has(u7)) {
+      const pct = slotRate(u7, 7);
+      if (pct > 0) {
+        paid.add(u7);
+        shares.push({ uid: u7, level: 7, amount: round4(gross * pct / 100), kind: 'upper' });
+        upperSum += pct;
+      }
     }
   }
+  const companyEff = Math.max(0, companyPct - fundedSum);
 
-  const overDistributed = (lowerSum + upperSum) > 100 - companyPct + 0.0001;
+  const overDistributed = (lowerSum + upperSum) > 100 - companyEff + 0.0001;
 
   if (receiver && !paid.has(receiver)) {
-    const surplus = Math.max(0, 100 - companyPct - lowerSum - upperSum);
+    const surplus = Math.max(0, 100 - companyEff - lowerSum - upperSum);
     shares.push({ uid: receiver, level: receiverLevel, amount: round4(gross * surplus / 100), kind: 'residual' });
   }
 

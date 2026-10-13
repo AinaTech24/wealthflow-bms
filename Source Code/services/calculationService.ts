@@ -288,24 +288,38 @@ export const calculatePayout = (
     }
     let ru: string | undefined, ruL = rl;
     for (let l = rl; l <= 7; l++) { const u = hierarchy[`level${l}Id` as keyof typeof hierarchy]; if (u && u.trim()) { ru = u; ruL = l; break; } }
-    // Upper levels: a person ABOVE the residual receiver (an L5 or L6 over the L4) takes
-    // their own % of gross, like a lower level does. Their own rate at their own level,
-    // else the firm-wide rate for the level; the owner's rate card is not consulted (it
-    // still holds legacy L5-L7 "slice" numbers). With no upper-level rate set this pays
-    // nothing. Identical to src/lib/payoutEngine.js residualSplit().
-    let upperSum = 0;
+    // Upper levels. L5 and L6 are paid OUT OF THE COMPANY'S share, not the receiver's.
+    // A slot with nobody in it rolls its rate up to the next person above; with nobody
+    // above it stays with the company. A receiver at L5/L6 takes the slots up to their
+    // own through the remainder (L5 owner = 90%, L6 owner = 95%). Identical to
+    // src/lib/payoutEngine.js residualSplit().
+    const slotRate = (u: string | undefined, l: number): number => {
+      if (!u || !u.trim()) return Math.max(0, (config.levels as any)[l] || 0);
+      const info = teamGet(u); const clAny = info?.customLevels as any; const uL = info?.level;
+      return Math.max(0, (clAny && uL !== undefined && clAny[uL] !== undefined) ? clAny[uL] : (clAny && clAny[l] !== undefined) ? clAny[l] : ((config.levels as any)[l] || 0));
+    };
+    let upperSum = 0, fundedSum = 0;
     if (ru) {
-      for (let l = ruL + 1; l <= 7; l++) {
+      let pending = 0;
+      for (let l = rl + 1; l <= 6; l++) {
         const u = hierarchy[`level${l}Id` as keyof typeof hierarchy];
-        if (!u || !u.trim() || u === ru || paid.has(u)) continue;
-        const info = teamGet(u); const clAny = info?.customLevels as any; const uL = info?.level;
-        const pct = Math.max(0, (clAny && uL !== undefined && clAny[uL] !== undefined) ? clAny[uL] : (clAny && clAny[l] !== undefined) ? clAny[l] : ((config.levels as any)[l] || 0));
+        if (!u || !u.trim()) { pending += slotRate(undefined, l); continue; }
+        if (u === ru) { fundedSum += slotRate(u, l) + pending; pending = 0; continue; }
+        if (paid.has(u)) continue;
+        const pct = slotRate(u, l);
         if (pct <= 0) continue;
+        const take = pct + pending; pending = 0;
         paid.add(u);
-        const p = Math.round(gross * pct / 100 * 10000) / 10000; levelPayouts[l] = (levelPayouts[l] || 0) + p; if (p !== 0) up[u] = (up[u] || 0) + p; upperSum += pct; dist += p;
+        const p = Math.round(gross * take / 100 * 10000) / 10000; levelPayouts[l] = (levelPayouts[l] || 0) + p; if (p !== 0) up[u] = (up[u] || 0) + p; upperSum += take; fundedSum += take; dist += p;
+      }
+      const u7 = hierarchy.level7Id;
+      if (u7 && u7.trim() && u7 !== ru && !paid.has(u7)) {
+        const pct = slotRate(u7, 7);
+        if (pct > 0) { paid.add(u7); const p = Math.round(gross * pct / 100 * 10000) / 10000; levelPayouts[7] = (levelPayouts[7] || 0) + p; if (p !== 0) up[u7] = (up[u7] || 0) + p; upperSum += pct; dist += p; }
       }
     }
-    if (ru && !paid.has(ru)) { const surplus = Math.max(0, 100 - companyPct - lowerSum - upperSum); const p = Math.round(gross * surplus / 100 * 10000) / 10000; levelPayouts[ruL] = (levelPayouts[ruL] || 0) + p; if (p !== 0) up[ru] = (up[ru] || 0) + p; dist += p; }
+    const companyEff = Math.max(0, companyPct - fundedSum);
+    if (ru && !paid.has(ru)) { const surplus = Math.max(0, 100 - companyEff - lowerSum - upperSum); const p = Math.round(gross * surplus / 100 * 10000) / 10000; levelPayouts[ruL] = (levelPayouts[ruL] || 0) + p; if (p !== 0) up[ru] = (up[ru] || 0) + p; dist += p; }
     const exp = Math.round((gross - dist) * 100) / 100;
     return { gross, expenseAmount: exp, netPool: Math.round((gross - exp) * 100) / 100, levelPayouts: levelPayouts as any, userPayouts: up };
   }

@@ -70,16 +70,18 @@ already**. Save & Recalculate. Then:
 - His 5 clients now sit at L3; the 2 under Yash are untouched.
 - Admin Console > Activity Log shows the move "from 2026-09".
 
-**5. Higher rate by level, and L5.** In Global Rules set Level 3 to 30% and Level 5 to 5%,
-save, Recalculate. September: Gamma Senior (L5) **₹6,033.75** (5% of ₹1,20,675); Shakeel
-**₹10,865.25** (₹1,426.50 more than before); everyone's August unchanged because it is locked;
-September still pays out exactly **85%** of the brokerage.
+**5. L5 and L6 (paid from the company's share).** In Global Rules set Level 5 to 5% and
+Level 6 to 5%, save, Recalculate. September: Gamma Senior (L5) **₹6,033.75** and System Corp
+(L6) **₹6,033.75** (5% of ₹1,20,675 each); every RM and BM figure is exactly as before
+(Alpha BM ₹39,743.70); the total paid out goes from 85% to **95%**, because the 10% came
+out of the company's 15%, not out of anyone's share. Set both back to 0 and Recalculate to
+return to 85%.
 
 **6. Undo.** Edit Shakeel again, Level 2, "September 2026 onward". His clients return to L2,
 his September goes back to ₹9,438.75 and no history is left behind.
 
 **7. Replace.** Edit Bhavna RM to Level 4, September, choose "Put Bhavna at Level 4 on those
-clients too". With L5 at 5%, her September is **₹22,334.40** (80% of her clients); Beta BM's
+clients too". Her September now includes the L4 remainder on those clients; Beta BM's
 drops; August stays as it was.
 
 ## Reset to a clean state
@@ -91,6 +93,6 @@ then restart `node server.js` (it keeps some figures in memory).
 
 ## When it all looks right
 
-`npm test` (14 suites) and `cd "Source Code" && npx tsc --noEmit` must pass, then push. The
+`npm test` (24 suites) and `cd "Source Code" && npx tsc --noEmit` must pass, then push. The
 GitHub workflow repeats both and deploys; if the new version cannot reach the database the
 server puts the previous one back by itself.
