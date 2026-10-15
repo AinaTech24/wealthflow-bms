@@ -312,11 +312,6 @@ export const calculatePayout = (
         paid.add(u);
         const p = Math.round(gross * take / 100 * 10000) / 10000; levelPayouts[l] = (levelPayouts[l] || 0) + p; if (p !== 0) up[u] = (up[u] || 0) + p; upperSum += take; fundedSum += take; dist += p;
       }
-      const u7 = hierarchy.level7Id;
-      if (u7 && u7.trim() && u7 !== ru && !paid.has(u7)) {
-        const pct = slotRate(u7, 7);
-        if (pct > 0) { paid.add(u7); const p = Math.round(gross * pct / 100 * 10000) / 10000; levelPayouts[7] = (levelPayouts[7] || 0) + p; if (p !== 0) up[u7] = (up[u7] || 0) + p; upperSum += pct; dist += p; }
-      }
     }
     const companyEff = Math.max(0, companyPct - fundedSum);
     if (ru && !paid.has(ru)) { const surplus = Math.max(0, 100 - companyEff - lowerSum - upperSum); const p = Math.round(gross * surplus / 100 * 10000) / 10000; levelPayouts[ruL] = (levelPayouts[ruL] || 0) + p; if (p !== 0) up[ru] = (up[ru] || 0) + p; dist += p; }

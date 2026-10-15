@@ -131,8 +131,8 @@ export function residualSplit({ gross, h, lsl, period, teamMap, cfg }) {
   // with nobody in it rolls its rate up to the next person above; if nobody is above,
   // it stays with the company. A receiver at L5/L6 takes the slots up to and including
   // their own through the remainder (so L5 alone = 90%, L6 alone = 95%).
-  // L7 is the company itself; a rate set on an L7 person is still paid from the
-  // receiver's remainder, exactly as before.
+  // L7 is the company itself: whatever rate is typed on the L7 row is NOT paid to a
+  // person. The company's own cut is companyExpensePct (less what L5/L6 take).
   const slotRate = (u, l) => {
     if (!u) return Math.max(0, globalLevels[l] || 0);
     const info = memberAsOf(teamMap.get(u), period);
@@ -157,15 +157,6 @@ export function residualSplit({ gross, h, lsl, period, teamMap, cfg }) {
       paid.add(u);
       shares.push({ uid: u, level: l, amount: round4(gross * take / 100), kind: 'upper' });
       upperSum += take; fundedSum += take;
-    }
-    const u7 = h.level7Id;
-    if (u7 && u7 !== receiver && !paid.has(u7)) {
-      const pct = slotRate(u7, 7);
-      if (pct > 0) {
-        paid.add(u7);
-        shares.push({ uid: u7, level: 7, amount: round4(gross * pct / 100), kind: 'upper' });
-        upperSum += pct;
-      }
     }
   }
   const companyEff = Math.max(0, companyPct - fundedSum);

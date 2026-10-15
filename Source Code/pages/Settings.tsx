@@ -129,7 +129,7 @@ export const Settings: React.FC<SettingsProps> = ({ currentUser }) => {
     useEffect(() => {
         // Include 0 in the sum
         // Fix: Explicitly cast Object.values to number[] to resolve 'unknown' arithmetic error on line 51
-        const sum = (Object.values(editConfig.levels) as number[]).reduce((a: number, b: number) => a + b, 0);
+        const sum = ([1, 2, 3, 4, 5, 6, 7] as number[]).reduce((a: number, l: number) => a + (Number((editConfig.levels as any)[l]) || 0), 0);
         setTotalShare(Math.round(sum * 100) / 100);
     }, [editConfig]);
 

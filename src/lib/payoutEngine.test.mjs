@@ -202,6 +202,10 @@ ok(near(sum('p5'), 22.5) && near(sum('p6'), 22.5), 'L5 and L6 each get 22.5');
 ok(near(sum('bm'), 132.5), 'the BM gets what is left: 132.5');
 ok(near(450 - parts.reduce((x, r) => x + total(r), 0), 22.5), 'the company keeps 22.5');
 
+// L7 is the company: a rate typed on the L7 row changes nothing and pays no one.
+s = residualSplit({ gross: 1000, h: chain, period: '2026-09', teamMap: team, cfg: G({ 5: 5, 6: 5, 7: 5 }) });
+ok(!by(s).hq && near(by(s).bm, 600) && near(1000 - total(s), 50), 'L7 = 5 in Global Rules is ignored (company is paid via company expense)');
+
 // Over-allocation: the receiver is clamped at zero and the client is flagged.
 s = residualSplit({ gross: 1000, h: chain, period: '2026-09', teamMap: team, cfg: G({ 5: 40, 6: 40 }) });
 ok(s.overDistributed === true && !by(s).bm, 'rates beyond what is available are flagged and the receiver is clamped to 0');
