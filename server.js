@@ -1466,16 +1466,23 @@ app.all('/api/data', mutationLimiter, async (req, res) => {
       if (action === 'partner_codes') {
         try {
           if (!isWriter(req)) return res.status(403).json({ error: 'Forbidden' });
+          // Codes with statement rows, then the codes the partner's client sheet added that
+          // have not traded yet (rows_ = 0), so the whole sheet can be attached in one place.
           const [rows] = await pool.query(
-            `SELECT b.partner, b.clientCode,
-                    COUNT(*) rows_, MIN(b.period) firstPeriod, MAX(b.period) lastPeriod,
-                    ROUND(SUM(b.ourShare),2) ourShare,
-                    MAX(b.mappedClientId) mappedClientId,
-                    MAX(m.label) label
-             FROM partner_brokerage b
-             LEFT JOIN partner_client_map m ON m.partner = b.partner AND m.clientCode = b.clientCode
-             GROUP BY b.partner, b.clientCode
-             ORDER BY ourShare DESC`);
+            `SELECT * FROM (
+               SELECT b.partner, b.clientCode,
+                      COUNT(*) rows_, MIN(b.period) firstPeriod, MAX(b.period) lastPeriod,
+                      ROUND(SUM(b.ourShare),2) ourShare,
+                      MAX(b.mappedClientId) mappedClientId,
+                      MAX(m.label) label
+               FROM partner_brokerage b
+               LEFT JOIN partner_client_map m ON m.partner = b.partner AND m.clientCode = b.clientCode
+               GROUP BY b.partner, b.clientCode
+               UNION ALL
+               SELECT m2.partner, m2.clientCode, 0, NULL, NULL, 0, m2.clientId, m2.label
+               FROM partner_client_map m2
+               WHERE NOT EXISTS (SELECT 1 FROM partner_brokerage b2 WHERE b2.partner = m2.partner AND b2.clientCode = m2.clientCode)
+             ) t ORDER BY ourShare DESC, label, clientCode`);
           res.set('Cache-Control', 'no-store');
           return res.json(rows);
         } catch (e) {

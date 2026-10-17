@@ -87,7 +87,7 @@ const prettyMonth = (p: string) => {
 
 interface CodeRow {
   partner: string; clientCode: string; rows_: number;
-  firstPeriod: string; lastPeriod: string; ourShare: number;
+  firstPeriod: string | null; lastPeriod: string | null; ourShare: number;
   mappedClientId: string | null; label: string | null;
 }
 
@@ -277,7 +277,17 @@ export const PartnerBrokerage: React.FC<Props> = ({ currentUser }) => {
       (c.label || '').toLowerCase().includes(q));
   }, [codes, codeSearch]);
 
-  const unmappedCount = codes.filter(c => !c.mappedClientId).length;
+  const unmappedCount = codes.filter(c => !c.mappedClientId && c.rows_ > 0).length;
+
+  // Motilal's client sheet gives each code a name. When exactly one of our clients has
+  // that name (case, spaces and punctuation ignored) it is pre-selected in the dropdown;
+  // nothing is saved until Save is pressed.
+  const suggestionFor = useMemo(() => {
+    const norm = (v: string) => String(v || '').toUpperCase().replace(/[^A-Z0-9]+/g, '');
+    const byName = new Map<string, string[]>();
+    for (const cl of clients) { const k = norm(cl.name); if (!k) continue; byName.set(k, [...(byName.get(k) || []), cl.id]); }
+    return (label: string | null) => { const ids = label ? byName.get(norm(label)) : null; return ids && ids.length === 1 ? ids[0] : ''; };
+  }, [clients]);
 
   return (
     <div className="space-y-6">
@@ -669,26 +679,32 @@ export const PartnerBrokerage: React.FC<Props> = ({ currentUser }) => {
                   <tbody>
                     {filteredCodes.map(c => (
                       <tr key={`${c.partner}-${c.clientCode}`} className="border-b border-slate-100 dark:border-slate-700/50">
-                        <Td mono bold>{c.clientCode}</Td>
+                        <td className="py-2 pr-4">
+                          <div className="font-mono font-bold text-slate-900 dark:text-slate-100">{c.clientCode}</div>
+                          {c.label && <div className="text-[11px] text-slate-500 dark:text-slate-400">{c.label}</div>}
+                        </td>
                         <Td mono right>{c.rows_}</Td>
-                        <Td mono>{c.firstPeriod === c.lastPeriod ? c.firstPeriod : `${c.firstPeriod} → ${c.lastPeriod}`}</Td>
+                        <Td mono>{!c.firstPeriod ? 'no trade yet' : c.firstPeriod === c.lastPeriod ? c.firstPeriod : `${c.firstPeriod} → ${c.lastPeriod}`}</Td>
                         <Td mono right bold>₹{Number(c.ourShare).toLocaleString('en-IN')}</Td>
                         <td className="py-2 pr-4">
                           <div className="flex items-center gap-2">
                             <select
                               id={`map-${c.clientCode}`}
-                              value={pick[c.clientCode] ?? c.mappedClientId ?? ''}
+                              value={pick[c.clientCode] ?? c.mappedClientId ?? suggestionFor(c.label)}
                               onChange={e => setPick(p => ({ ...p, [c.clientCode]: e.target.value }))}
                               className="text-xs rounded-lg border border-slate-200 dark:border-slate-600 dark:bg-slate-900 dark:text-slate-100 px-2 py-1.5 max-w-[260px]"
                             >
                               <option value="">— not attached —</option>
+                              {c.mappedClientId && !clients.some(cl => cl.id === c.mappedClientId) && (
+                                <option value={c.mappedClientId}>{c.label || c.mappedClientId} (attached)</option>
+                              )}
                               {clients.map(cl => (
                                 <option key={cl.id} value={cl.id}>{cl.name}{cl.pan ? ` · ${cl.pan}` : ''}</option>
                               ))}
                             </select>
-                            {(pick[c.clientCode] ?? c.mappedClientId ?? '') !== (c.mappedClientId ?? '') && (
+                            {(pick[c.clientCode] ?? c.mappedClientId ?? suggestionFor(c.label)) !== (c.mappedClientId ?? '') && (
                               <button
-                                onClick={() => saveMapping(c.clientCode, pick[c.clientCode] ?? '')}
+                                onClick={() => saveMapping(c.clientCode, pick[c.clientCode] ?? suggestionFor(c.label))}
                                 className="px-2.5 py-1.5 rounded-lg bg-emerald-600 text-white text-[10px] font-black uppercase tracking-widest hover:bg-emerald-700 transition flex items-center gap-1"
                               >
                                 <Check className="w-3 h-3" /> Save
