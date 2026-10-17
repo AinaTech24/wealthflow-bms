@@ -1,5 +1,6 @@
 import React, { useState, useEffect, useMemo, useRef } from 'react';
-import { Upload, Link2, AlertTriangle, Landmark, Search, Check, RefreshCw } from 'lucide-react';
+import { Upload, Link2, AlertTriangle, Landmark, Search, Check, RefreshCw, Download } from 'lucide-react';
+import { exportSheetsToExcel } from '../utils/excelExport';
 import { TeamMember, Role } from '../types';
 import { useData, authFetch } from '../contexts/DataContext';
 import { useToast } from '../components/Toast';
@@ -164,6 +165,52 @@ export const PartnerBrokerage: React.FC<Props> = ({ currentUser }) => {
   // more than one month of statements is in.
   useEffect(() => { if (allPeriods.length) load(period); /* eslint-disable-next-line */ }, [period]);
 
+  // ── Export: every month on its own sheet, plus the RM / BM wise figures ─────────────
+  const [exporting, setExporting] = useState(false);
+  const handleExport = async () => {
+    setExporting(true);
+    try {
+      const res = await authFetch(`/api/data?action=partner_export&partner=${partner}&_=${Date.now()}`, { cache: 'no-store' });
+      if (!res.ok) { showToast('Could not build the export.', 'error'); return; }
+      const d = await res.json();
+      const lines: any[] = d.lines || [];
+      if (!lines.length) { showToast('Nothing to export yet.', 'error'); return; }
+      const monthLabel = (p: string) => { const dt = new Date(`${p}-01T00:00:00`); return Number.isNaN(dt.getTime()) ? p : dt.toLocaleString('en-IN', { month: 'short', year: 'numeric' }); };
+      const round2 = (n: number) => Math.round(n * 100) / 100;
+      const months = [...new Set(lines.map(l => l.period))].sort();
+      const sheets: { name: string; rows: object[] }[] = [];
+      sheets.push({
+        name: 'Summary',
+        rows: months.map(m => {
+          const ls = lines.filter(l => l.period === m);
+          const pay = (d.people || []).filter((x: any) => x.period === m).reduce((a: number, x: any) => a + x.payout, 0);
+          return { Month: monthLabel(m), 'Client codes': new Set(ls.map(l => l.clientCode)).size, 'Total brokerage': round2(ls.reduce((a, l) => a + l.total, 0)), 'Our share': round2(ls.reduce((a, l) => a + l.ourShare, 0)), 'Paid to RM/BM (at the set %)': round2(pay) };
+        }),
+      });
+      for (const m of months) {
+        sheets.push({
+          name: monthLabel(m),
+          rows: lines.filter(l => l.period === m).map(l => ({
+            'Client code': l.clientCode, 'Name (Motilal)': l.motilalName, 'WealthFlow client': l.client || '(not attached)',
+            'L1 RM': l.l1, 'L2 RM': l.l2, 'L3 RM': l.l3, 'L4 BM': l.l4, L5: l.l5, L6: l.l6, L7: l.l7,
+            Type: l.category === 'TRD' ? 'Trading' : l.category === 'DEL' ? 'Delivery' : l.category,
+            'Total brokerage': round2(l.total), 'Our share': round2(l.ourShare),
+          })),
+        });
+      }
+      sheets.push({
+        name: 'RM-BM wise',
+        // Upline (L5 and above) with no payout only repeats every client, so leave them out.
+        rows: (d.people || []).filter((x: any) => x.payout !== 0 || (x.level != null && x.level <= 4)).map((x: any) => ({
+          Month: monthLabel(x.period), Person: x.name, Level: x.level == null ? '' : `L${x.level}`, Clients: x.clients,
+          'Our share on their clients': x.ourShare, 'Payout (at the set %)': x.payout,
+        })),
+      });
+      await exportSheetsToExcel(sheets, `motilal-brokerage-${new Date().toISOString().slice(0, 10)}`);
+      showToast(`Exported ${months.length} month${months.length !== 1 ? 's' : ''}.`, 'success');
+    } catch { showToast('Could not build the export.', 'error'); } finally { setExporting(false); }
+  };
+
   // ── Upload ────────────────────────────────────────────────────────────────
   const handleFile = async (file: File) => {
     setUploading(true);
@@ -306,6 +353,14 @@ export const PartnerBrokerage: React.FC<Props> = ({ currentUser }) => {
             className="px-3 py-2 rounded-lg border border-slate-200 dark:border-slate-600 text-slate-600 dark:text-slate-300 text-xs font-bold flex items-center gap-1.5 hover:border-blue-400 transition"
           >
             <RefreshCw className={`w-3.5 h-3.5 ${busy ? 'animate-spin' : ''}`} /> Refresh
+          </button>
+          <button
+            onClick={handleExport}
+            disabled={exporting}
+            className="px-3 py-2 rounded-lg border border-slate-200 dark:border-slate-600 text-slate-600 dark:text-slate-300 text-xs font-bold flex items-center gap-1.5 hover:border-emerald-400 hover:text-emerald-600 transition disabled:opacity-60"
+            title="Download every month, one sheet per month"
+          >
+            <Download className="w-3.5 h-3.5" /> {exporting ? 'Preparing…' : 'Export'}
           </button>
           {canWrite && (
             <>

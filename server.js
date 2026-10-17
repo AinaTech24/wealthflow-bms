@@ -1460,6 +1460,75 @@ app.all('/api/data', mutationLimiter, async (req, res) => {
         }
       }
 
+      // Month-wise export of a partner's brokerage: every statement line with its client and the
+      // RM/BM chain that applied in that month, plus what each person earns from their own clients
+      // (the same per-level sharing and the same chain-by-month as the ledger). ADMIN/FINANCE get the
+      // whole book; anyone else gets only the lines of their own clients and only their own row.
+      if (action === 'partner_export') {
+        try {
+          if (!req.user) return res.status(401).json({ error: 'Not authenticated' });
+          const partner = String(query.partner || 'MOFSL').toUpperCase();
+          const writer = isWriter(req);
+          const [[cfgRow]] = await pool.query(`SELECT data FROM config WHERE id IN ('global_config','global') ORDER BY id = 'global_config' DESC LIMIT 1`);
+          let cfg = {}; try { cfg = JSON.parse(cfgRow?.data || '{}'); } catch {}
+          const raw = cfg?.partnerSharing?.[partner];
+          const pct = (typeof raw === 'number') ? { 3: raw }
+            : Object.fromEntries(Object.entries(raw || {}).map(([k, v]) => [k, Number(v) || 0]));
+          const [rows] = await pool.query(
+            `SELECT b.period, b.clientCode, b.tradeCategory cat, b.mappedClientId cid,
+                    ROUND(SUM(b.totalBrokerage),4) tot, ROUND(SUM(b.ourShare),4) ours,
+                    MAX(m.label) label, MAX(b.data) d
+             FROM partner_brokerage b
+             LEFT JOIN partner_client_map m ON m.partner = b.partner AND m.clientCode = b.clientCode
+             WHERE b.partner = ?
+             GROUP BY b.period, b.clientCode, b.tradeCategory, b.mappedClientId
+             ORDER BY b.period, b.clientCode`, [partner]);
+          const [clientRows] = await pool.query('SELECT id, name, data FROM clients');
+          const hier = new Map();
+          for (const c of clientRows) {
+            let d = {}; try { d = JSON.parse(c.data || '{}'); } catch {}
+            hier.set(c.id, { name: c.name, hierarchy: d.hierarchy || {}, hierarchyHistory: d.hierarchyHistory });
+          }
+          const [teamRows] = await pool.query('SELECT id, name, level FROM team');
+          const team = new Map(teamRows.map(t => [t.id, t]));
+          const nameOf = (id) => (id ? (team.get(id)?.name || id) : '');
+
+          const lines = [], peopleMap = new Map();
+          for (const r of rows) {
+            const ch = r.cid ? chainAsOf(hier.get(r.cid), r.period) : null;
+            const h = ch ? (ch.hierarchy || {}) : {};
+            const ids = [1, 2, 3, 4, 5, 6, 7].map(l => h['level' + l + 'Id'] || '');
+            if (!writer && !ids.includes(req.user.id)) continue;
+            let motilalName = ''; try { motilalName = JSON.parse(r.d || '{}').clientName || ''; } catch {}
+            lines.push({
+              period: r.period, clientCode: r.clientCode, motilalName: motilalName || r.label || '',
+              client: r.cid ? (hier.get(r.cid)?.name || '') : '', category: r.cat || '',
+              l1: nameOf(ids[0]), l2: nameOf(ids[1]), l3: nameOf(ids[2]), l4: nameOf(ids[3]),
+              l5: nameOf(ids[4]), l6: nameOf(ids[5]), l7: nameOf(ids[6]),
+              total: Number(r.tot) || 0, ourShare: Number(r.ours) || 0,
+            });
+            for (let lvl = 1; lvl <= 7; lvl++) {
+              const uid = ids[lvl - 1]; if (!uid) continue;
+              if (!writer && uid !== req.user.id) continue;
+              const key = r.period + '|' + uid;
+              const e = peopleMap.get(key) || { period: r.period, userId: uid, name: nameOf(uid), level: team.get(uid)?.level ?? null, clients: new Set(), ourShare: 0, payout: 0 };
+              e.clients.add(r.cid); e.ourShare += Number(r.ours) || 0;
+              e.payout += (Number(r.ours) || 0) * (Number(pct[lvl]) || 0) / 100;
+              peopleMap.set(key, e);
+            }
+          }
+          const people = [...peopleMap.values()].map(e => ({
+            period: e.period, name: e.name, level: e.level, clients: e.clients.size,
+            ourShare: Math.round(e.ourShare * 100) / 100, payout: Math.round(e.payout * 100) / 100,
+          })).sort((a, b) => a.period.localeCompare(b.period) || b.payout - a.payout || b.ourShare - a.ourShare);
+          res.set('Cache-Control', 'no-store');
+          return res.json({ partner, configured: Object.values(pct).some(v => v > 0), pct, lines, people });
+        } catch (e) {
+          console.error('[partner_export]', e);
+          return res.status(500).json({ error: 'Failed to build the export' });
+        }
+      }
+
       // Client codes seen in imports, with whatever they are mapped to. This is the
       // worklist for the mapping screen — ADMIN/FINANCE only, since it exposes every
       // code in the book.
@@ -1506,7 +1575,7 @@ app.all('/api/data', mutationLimiter, async (req, res) => {
           if (!req.user) return res.status(401).json({ error: 'Not authenticated' });
           const partner = String(query.partner || 'MOFSL').toUpperCase();
 
-          const [[cfgRow]] = await pool.query(`SELECT data FROM config WHERE id = 'global' LIMIT 1`);
+          const [[cfgRow]] = await pool.query(`SELECT data FROM config WHERE id IN ('global_config','global') ORDER BY id = 'global_config' DESC LIMIT 1`);
           let cfg = {}; try { cfg = JSON.parse(cfgRow?.data || '{}'); } catch {}
           const raw = cfg?.partnerSharing?.[partner];
           // A bare number means "all of it to the RM level"; an object is per level.
@@ -1685,7 +1754,7 @@ app.all('/api/data', mutationLimiter, async (req, res) => {
             GROUP BY t.brokeragePeriod, l.userId`);
 
           // 2. Partner earnings, split by the configured per-level percentages.
-          const [[cfgRow]] = await pool.query(`SELECT data FROM config WHERE id = 'global' LIMIT 1`);
+          const [[cfgRow]] = await pool.query(`SELECT data FROM config WHERE id IN ('global_config','global') ORDER BY id = 'global_config' DESC LIMIT 1`);
           let cfg = {}; try { cfg = JSON.parse(cfgRow?.data || '{}'); } catch {}
           const [pbRows] = await pool.query(
             `SELECT partner, period, mappedClientId cid, ROUND(SUM(ourShare),4) ours
