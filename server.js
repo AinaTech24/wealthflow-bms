@@ -538,6 +538,7 @@ async function initDB() {
     //    "their" rows. Same shape as the folio -> client mapping on the fund side:
     //    map once, and every later import of that code attaches itself.
     "CREATE TABLE IF NOT EXISTS partner_client_map (partner VARCHAR(40) NOT NULL, clientCode VARCHAR(60) NOT NULL, clientId VARCHAR(120), label VARCHAR(255), updatedAt DATETIME DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP, PRIMARY KEY (partner, clientCode), INDEX idx_pcm_client (clientId))",
+    "CREATE TABLE IF NOT EXISTS partner_client_info (partner VARCHAR(40) NOT NULL, clientCode VARCHAR(60) NOT NULL, clientName VARCHAR(255), branch VARCHAR(80), products VARCHAR(500), source VARCHAR(255), updatedAt DATETIME DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP, PRIMARY KEY (partner, clientCode))",
     // ── What has actually been PAID to a person, for any revenue source ───────
     //    `payout_ledger` says what each person EARNED; nothing said what left the
     //    bank. Finance tracked that outside the system, so "how much is still
@@ -1460,6 +1461,125 @@ app.all('/api/data', mutationLimiter, async (req, res) => {
         }
       }
 
+      // -- Partner overview (Dashboard header card) ---------------------------
+      //    One call for the Motilal card at the top of the Dashboard: the month's brokerage,
+      //    how many of the partner's clients are ACTIVE (a statement row in the period) and
+      //    how many are INACTIVE (on the partner's client sheet, nothing traded), and what
+      //    each RM / BM earns from their own clients. ADMIN/FINANCE see the firm; everyone
+      //    else sees only their own row and their own clients. Earned is derived from the
+      //    same per-level percentages as partner_ledger, so the two can never disagree.
+      if (action === 'partner_overview') {
+        try {
+          if (!req.user) return res.status(401).json({ error: 'Not authenticated' });
+          const partner = String(query.partner || 'MOFSL').toUpperCase();
+          const period = String(query.period || '').slice(0, 7);
+          const writer = isWriter(req);
+
+          const [[cfgRow]] = await pool.query(`SELECT data FROM config WHERE id IN ('global_config','global') ORDER BY id = 'global_config' DESC LIMIT 1`);
+          let cfg = {}; try { cfg = JSON.parse(cfgRow?.data || '{}'); } catch {}
+          const raw = cfg?.partnerSharing?.[partner];
+          const pct = (typeof raw === 'number')
+            ? { 3: raw }
+            : Object.fromEntries(Object.entries(raw || {}).map(([k, v]) => [k, Number(v) || 0]));
+          const totalPct = Object.values(pct).reduce((a, b) => a + b, 0);
+
+          const [periodRows] = await pool.query(
+            `SELECT DISTINCT period FROM partner_brokerage WHERE partner = ? AND period IS NOT NULL AND period <> '' ORDER BY period DESC`, [partner]);
+          const periods = periodRows.map(r => r.period);
+          const args = [partner]; let where = ' WHERE partner = ?';
+          if (period) { where += ' AND period = ?'; args.push(period); }
+          const [rows] = await pool.query(
+            `SELECT period, clientCode, mappedClientId cid, ROUND(SUM(ourShare),4) ours, ROUND(SUM(totalBrokerage),4) tot
+             FROM partner_brokerage${where} GROUP BY period, clientCode, mappedClientId`, args);
+
+          const [clientRows] = await pool.query('SELECT id, data FROM clients');
+          const hier = new Map();
+          for (const c of clientRows) {
+            let d = {}; try { d = JSON.parse(c.data || '{}'); } catch {}
+            hier.set(c.id, { hierarchy: d.hierarchy || {}, hierarchyHistory: d.hierarchyHistory });
+          }
+          const [teamRows] = await pool.query('SELECT id, name, code, role, level FROM team');
+          const team = new Map(teamRows.map(t => [t.id, t]));
+          const [info] = await pool.query(
+            `SELECT i.clientCode, i.clientName, i.branch, m.clientId
+             FROM partner_client_info i
+             LEFT JOIN partner_client_map m ON m.partner = i.partner AND m.clientCode = i.clientCode
+             WHERE i.partner = ?`, [partner]);
+
+          const people = new Map();
+          const person = (uid) => {
+            if (!people.has(uid)) {
+              const t = team.get(uid);
+              people.set(uid, { userId: uid, name: t?.name || uid, level: t?.level ?? null, role: t?.role || '',
+                                active: new Set(), inactive: new Set(), brokerage: 0, earned: 0 });
+            }
+            return people.get(uid);
+          };
+          const mine = (uid) => writer || uid === req.user.id;
+
+          const activeCodes = new Set();
+          let brokerage = 0, ourShare = 0, earnedAll = 0, unmappedOurs = 0; const unmappedCodes = new Set();
+          for (const r of rows) {
+            const ours = Number(r.ours) || 0, tot = Number(r.tot) || 0;
+            const h = r.cid ? chainAsOf(hier.get(r.cid), r.period).hierarchy : null;
+            const chainIds = h ? [1, 2, 3, 4, 5, 6, 7].map(l => h['level' + l + 'Id']).filter(Boolean) : [];
+            if (!writer && !chainIds.includes(req.user.id)) continue;
+            brokerage += tot; ourShare += ours;
+            activeCodes.add(r.clientCode);
+            if (!h) { unmappedOurs += ours; unmappedCodes.add(r.clientCode); continue; }
+            for (let lvl = 1; lvl <= 7; lvl++) {
+              const uid = h['level' + lvl + 'Id']; if (!uid || !mine(uid)) continue;
+              const p = person(uid);
+              p.active.add(r.clientCode); p.brokerage += ours;
+              const share = ours * (Number(pct[lvl]) || 0) / 100;
+              p.earned += share; earnedAll += share;
+            }
+          }
+
+          // Inactive: on the partner's client sheet, with no statement row in this period.
+          let sheetCount = 0, inactive = 0;
+          for (const i of info) {
+            const code = i.clientCode;
+            const h = i.clientId ? chainAsOf(hier.get(i.clientId), period || '9999-12').hierarchy : null;
+            const chainIds = h ? [1, 2, 3, 4, 5, 6, 7].map(l => h['level' + l + 'Id']).filter(Boolean) : [];
+            if (!writer && !chainIds.includes(req.user.id)) continue;
+            sheetCount++;
+            if (activeCodes.has(code)) continue;
+            inactive++;
+            for (const uid of new Set(chainIds)) if (mine(uid)) person(uid).inactive.add(code);
+          }
+          // Statement codes that are not on the sheet still count as clients.
+          const sheetCodes = new Set(info.map(i => i.clientCode));
+          const activeNotOnSheet = [...activeCodes].filter(c => !sheetCodes.has(c)).length;
+
+          const out = [...people.values()].map(p => ({
+            userId: p.userId, name: p.name, level: p.level, role: p.role,
+            activeClients: p.active.size, inactiveClients: p.inactive.size,
+            brokerage: Math.round(p.brokerage * 100) / 100, earned: Math.round(p.earned * 100) / 100,
+          })).filter(p => p.activeClients || p.inactiveClients || p.earned)
+            .sort((a, b) => b.earned - a.earned || b.brokerage - a.brokerage);
+
+          res.set('Cache-Control', 'no-store');
+          return res.json({
+            partner, period, periods, configured: totalPct > 0, pct,
+            totals: {
+              brokerage: Math.round(brokerage * 100) / 100,
+              ourShare: Math.round(ourShare * 100) / 100,
+              payout: Math.round(earnedAll * 100) / 100,
+              companyKeeps: writer ? Math.round((ourShare - earnedAll) * 100) / 100 : null,
+              activeClients: activeCodes.size,
+              inactiveClients: inactive,
+              sheetClients: sheetCount + activeNotOnSheet,
+            },
+            unmapped: writer ? { codes: unmappedCodes.size, ourShare: Math.round(unmappedOurs * 100) / 100 } : null,
+            people: out,
+          });
+        } catch (e) {
+          console.error('[partner_overview]', e);
+          return res.status(500).json({ error: 'Failed to build partner overview' });
+        }
+      }
+
       // Client codes seen in imports, with whatever they are mapped to. This is the
       // worklist for the mapping screen — ADMIN/FINANCE only, since it exposes every
       // code in the book.
@@ -1499,7 +1619,7 @@ app.all('/api/data', mutationLimiter, async (req, res) => {
           if (!req.user) return res.status(401).json({ error: 'Not authenticated' });
           const partner = String(query.partner || 'MOFSL').toUpperCase();
 
-          const [[cfgRow]] = await pool.query(`SELECT data FROM config WHERE id = 'global' LIMIT 1`);
+          const [[cfgRow]] = await pool.query(`SELECT data FROM config WHERE id IN ('global_config','global') ORDER BY id = 'global_config' DESC LIMIT 1`);
           let cfg = {}; try { cfg = JSON.parse(cfgRow?.data || '{}'); } catch {}
           const raw = cfg?.partnerSharing?.[partner];
           // A bare number means "all of it to the RM level"; an object is per level.
@@ -1678,7 +1798,7 @@ app.all('/api/data', mutationLimiter, async (req, res) => {
             GROUP BY t.brokeragePeriod, l.userId`);
 
           // 2. Partner earnings, split by the configured per-level percentages.
-          const [[cfgRow]] = await pool.query(`SELECT data FROM config WHERE id = 'global' LIMIT 1`);
+          const [[cfgRow]] = await pool.query(`SELECT data FROM config WHERE id IN ('global_config','global') ORDER BY id = 'global_config' DESC LIMIT 1`);
           let cfg = {}; try { cfg = JSON.parse(cfgRow?.data || '{}'); } catch {}
           const [pbRows] = await pool.query(
             `SELECT partner, period, mappedClientId cid, ROUND(SUM(ourShare),4) ours
@@ -2819,6 +2939,37 @@ app.all('/api/data', mutationLimiter, async (req, res) => {
           return res.json({ success: true, batchId, written, ...after });
         } catch (e) {
           console.error('[partner_import]', e);
+          return res.status(500).json({ error: e.message });
+        }
+      }
+
+      // The partner's own client sheet (client code, name, branch, products). It does not
+      // change any money: it records who each code is, so inactive clients (nothing traded
+      // yet) are known by name and an unmapped statement code can be recognised.
+      if (action === 'partner_info_import') {
+        if (!canMutate(req, action)) return res.status(403).json({ error: 'Admin privileges required' });
+        try {
+          const partner = String(payload?.partner || '').trim().toUpperCase();
+          const source = String(payload?.fileName || '').slice(0, 255);
+          const list = Array.isArray(payload?.rows) ? payload.rows : [];
+          if (!partner || !list.length) return res.status(400).json({ error: 'partner and rows are required' });
+          let written = 0;
+          for (const r of list) {
+            const code = String(r.code || '').replace(/^'/, '').trim().toUpperCase();
+            if (!code) continue;
+            await pool.query(
+              `INSERT INTO partner_client_info (partner, clientCode, clientName, branch, products, source)
+               VALUES (?,?,?,?,?,?)
+               ON DUPLICATE KEY UPDATE clientName = VALUES(clientName), branch = VALUES(branch), products = VALUES(products), source = VALUES(source)`,
+              [partner, code, String(r.name || '').slice(0, 255), String(r.branch || '').slice(0, 80),
+               Array.isArray(r.products) ? r.products.join(', ').slice(0, 500) : String(r.products || '').slice(0, 500), source]);
+            written++;
+          }
+          await pool.query('INSERT INTO activity_log (userId, userName, action, description, createdAt) VALUES (?,?,?,?,NOW())',
+            [req.user?.id || '', req.user?.name || '', 'partner_info_import', `${partner}: ${written} client code(s) from ${source || 'sheet'}`]);
+          return res.json({ success: true, written });
+        } catch (e) {
+          console.error('[partner_info_import]', e);
           return res.status(500).json({ error: e.message });
         }
       }
