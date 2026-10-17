@@ -115,6 +115,3 @@ _*.json
 
 # Reconciliation working folder (AdvisorKhoj exports, attribution probes — contains client PII)
 .recon/
-
-# local exports contain real client names
-exports/

@@ -11,7 +11,6 @@ import { calculateUserShare } from '../services/calculationService';
 import { ComplianceAlerts } from '../components/ComplianceAlerts';
 import { TopClientsWidget } from '../components/TopClientsWidget';
 import { EarningsByMonth } from '../components/EarningsByMonth';
-import { MotilalSummary } from '../components/MotilalSummary';
 import { RedemptionAlerts } from '../components/RedemptionAlerts';
 import { formatCurrencyINR, formatCompactINR, formatINR } from '../utils/formatINR';
 
@@ -292,7 +291,6 @@ export const Dashboard: React.FC<DashboardProps> = ({ currentUser }) => {
           <h1 className="text-2xl font-bold text-slate-900 dark:text-slate-100 tracking-tight">Payout Summary</h1>
           <p className="text-slate-500 dark:text-slate-400 text-sm mt-1 font-medium">What the team earned, what has been paid and what is still owed.</p>
         </div>
-        <MotilalSummary firmWide />
         <EarningsByMonth firmWide />
         <ComplianceAlerts currentUser={currentUser} />
       </div>
@@ -301,7 +299,6 @@ export const Dashboard: React.FC<DashboardProps> = ({ currentUser }) => {
 
   return (
     <div className="space-y-6 animate-in fade-in duration-500">
-      <MotilalSummary firmWide={isAdmin} />
       {!isAdmin && <EarningsByMonth firmWide={false} />}
       {txTruncated && !useServerTotals && (
         <div className="rounded-lg border border-amber-200 dark:border-amber-800 bg-amber-50 dark:bg-amber-900/20 px-4 py-2.5 text-[12px] font-semibold text-amber-800 dark:text-amber-300">
