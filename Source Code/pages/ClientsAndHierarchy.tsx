@@ -814,13 +814,21 @@ export const ClientsAndHierarchy: React.FC<ClientsAndHierarchyProps> = ({ curren
                       </span>
                       <span className="text-[9px] font-black text-slate-400 uppercase tracking-widest group-hover:text-slate-600">Direct Clients</span>
                       {(() => {
-                        // Mentors/upline earn on these clients too, so show how many.
-                        const above = clients.filter(c => {
-                          if (!c.hierarchy) return false;
-                          const ids = [1, 2, 3, 4, 5, 6, 7].map(l => c.hierarchy[`level${l}Id` as keyof typeof c.hierarchy]).filter(Boolean);
-                          return ids.length > 1 && ids[0] !== member.id && ids.includes(member.id);
-                        }).length;
-                        return above > 0 ? <span className="mt-1 text-[10px] font-bold text-slate-500">+ Mentor / upline on {above} clients</span> : null;
+                        // Mentors/upline earn on these clients too, so show how many, and at which level.
+                        const perLevel: Record<number, number> = {};
+                        let above = 0;
+                        for (const c of clients) {
+                          if (!c.hierarchy) continue;
+                          const slots = [1, 2, 3, 4, 5, 6, 7].map(l => c.hierarchy[`level${l}Id` as keyof typeof c.hierarchy]);
+                          const first = slots.find(Boolean);
+                          if (first === member.id) continue;                       // their own (direct) client
+                          slots.forEach((id, i) => { if (id === member.id) { perLevel[i + 1] = (perLevel[i + 1] || 0) + 1; } });
+                          if (slots.includes(member.id)) above++;
+                        }
+                        const parts = Object.keys(perLevel).map(Number).sort((x, y) => x - y).map(l => `L${l}: ${perLevel[l]}`);
+                        return above > 0
+                          ? <span className="mt-1 text-[10px] font-bold text-slate-500">+ Mentor / upline on {above} clients{parts.length > 0 ? ` (${parts.join(' · ')})` : ''}</span>
+                          : null;
                       })()}
                     </button>
                   </td>
