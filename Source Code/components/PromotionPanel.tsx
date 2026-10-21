@@ -76,12 +76,12 @@ export const PromotionPanel: React.FC<Props> = ({
                 </p>
                 <div className="space-y-1.5 text-slate-700 dark:text-slate-300">
                   <label className="flex items-start gap-2 cursor-pointer">
-                    <input type="radio" name="occupied-rule" className="mt-0.5" checked={occupied === 'keep'} onChange={() => onOccupied('keep')} />
-                    <span>Leave those clients as they are. Nothing is lost; you can decide for them later.</span>
+                    <input type="radio" name="occupied-rule" className="mt-0.5" checked={occupied === 'replace'} onChange={() => onOccupied('replace')} />
+                    <span><b>Move them too (recommended).</b> {name} takes Level {toLevel} on those clients and the person there now leaves that client&rsquo;s chain from this month (their past months stay as paid).</span>
                   </label>
                   <label className="flex items-start gap-2 cursor-pointer">
-                    <input type="radio" name="occupied-rule" className="mt-0.5" checked={occupied === 'replace'} onChange={() => onOccupied('replace')} />
-                    <span>Put {name} at Level {toLevel} on those clients too. The person there now leaves that client&rsquo;s chain from this month (their past months stay as paid).</span>
+                    <input type="radio" name="occupied-rule" className="mt-0.5" checked={occupied === 'keep'} onChange={() => onOccupied('keep')} />
+                    <span>Leave those clients as they are. They stay at the old level and you will have to change them by hand.</span>
                   </label>
                 </div>
                 {preview.blockedClients.length > 0 && (

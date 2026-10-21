@@ -157,7 +157,7 @@ export const ClientsAndHierarchy: React.FC<ClientsAndHierarchyProps> = ({ curren
   // the chosen month, and pays the new level's standard rate unless a personal rate is
   // typed. The preview asks the server what that would do, with the same planner the
   // save uses, so the two cannot disagree.
-  const [occupiedRule, setOccupiedRule] = useState<'keep' | 'replace'>('keep');
+  const [occupiedRule, setOccupiedRule] = useState<'keep' | 'replace'>('replace');
   const [promoPreview, setPromoPreview] = useState<PromotionPreview | null>(null);
   const [promoLoading, setPromoLoading] = useState(false);
   const levelChanging = !!editingMember && memberForm.level !== undefined && Number(memberForm.level) !== Number(editingMember.level);
@@ -186,7 +186,7 @@ export const ClientsAndHierarchy: React.FC<ClientsAndHierarchyProps> = ({ curren
 
   const openTeamModal = (member?: TeamMember) => {
     if (!isAdmin) return;
-    setOccupiedRule('keep');
+    setOccupiedRule('replace');
     setPromoPreview(null);
     if (member) {
       setEditingMember(member);

@@ -3455,7 +3455,7 @@ app.all('/api/data', mutationLimiter, async (req, res) => {
             let d; try { d = JSON.parse(r.data || '{}'); } catch { continue; }
             clients.push({ id: r.id, name: r.name, hierarchy: d.hierarchy || {}, hierarchyHistory: d.hierarchyHistory, leadSourceLevel: d.leadSourceLevel });
           }
-          const plan = planLevelMove({ clients, personId, from, to, effectiveFrom: String(payload?.effectiveFrom || ''), occupied: payload?.occupied === 'replace' ? 'replace' : 'keep' });
+          const plan = planLevelMove({ clients, personId, from, to, effectiveFrom: String(payload?.effectiveFrom || ''), occupied: payload?.occupied === 'keep' ? 'keep' : 'replace' });
           const [teamRows] = await pool.query('SELECT id, name FROM team');
           const nameOf = new Map(teamRows.map(t => [t.id, String(t.name || '').trim()]));
           return res.json({
@@ -4185,7 +4185,10 @@ app.all('/api/data', mutationLimiter, async (req, res) => {
             const before = prevLevel.get(it.id);
             const after = Number(it.level);
             // Control fields from the member form; never stored as profile data.
-            const occupiedRule = it.levelMoveOccupied === 'replace' ? 'replace' : 'keep';
+            // A promotion moves the person's clients on its own. Where the new level is already held by someone
+            // else, that person leaves the client's chain from the chosen month (their past months stay as paid),
+            // unless the form explicitly asked to leave those clients alone.
+            const occupiedRule = it.levelMoveOccupied === 'keep' ? 'keep' : 'replace';
             const levelChangedNow = before !== undefined && Number.isFinite(after) && before !== after;
             const useCardRate = it.rateAuto === true && levelChangedNow;   // a stale flag on an unrelated save must do nothing
             delete it.levelMoveOccupied; delete it.rateAuto;
