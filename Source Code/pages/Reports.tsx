@@ -290,6 +290,8 @@ export const Reports: React.FC<ReportsProps> = ({ currentUser }) => {
   //    AND bypasses the stale stored tx.breakdown blobs (which reflect whatever
   //    sharing rules were in effect at the moment each tx was last calculated).
   const [serverGrossByUser, setServerGrossByUser] = useState<Map<string, number>>(new Map());
+  // Gross credited to the ARN holder (the BM): the basis AdvisorKhoj uses, so the BM rows can be compared directly.
+  const [serverBmGrossByUser, setServerBmGrossByUser] = useState<Map<string, number>>(new Map());
   // Gross of the clients a user PRIMARILY owns (their RM book), regardless of the
   // hierarchy slot they sit in. Defining "RM gross" by ownership rather than by
   // level3Id is what keeps the RM-wise total equal to the BM-wise total — RMs are
@@ -315,25 +317,29 @@ export const Reports: React.FC<ReportsProps> = ({ currentUser }) => {
     // Never leave another month's figures on screen while this one loads.
     setServerGrossByUser(new Map());
     setServerOwnerGrossByUser(new Map());
+    setServerBmGrossByUser(new Map());
     setServerEarningsByUser(new Map());
     setServerPctByUser(new Map());
     const url = `/api/data?action=team_payouts&year=${encodeURIComponent(filters.year)}&month=${encodeURIComponent(filters.month)}`;
     authFetch(url)
       .then(r => r.ok ? r.json() : Promise.reject(new Error(`HTTP ${r.status}`)))
-      .then((body: { payouts?: Array<{ userId: string; grossTotal: number; ownerGross?: number; earnings?: number; pctOfGross?: number }> }) => {
+      .then((body: { payouts?: Array<{ userId: string; grossTotal: number; ownerGross?: number; bmOwnerGross?: number; earnings?: number; pctOfGross?: number }> }) => {
         if (cancelled) return;
         const grossMap = new Map<string, number>();
         const ownerMap = new Map<string, number>();
+        const bmMap = new Map<string, number>();
         const earnMap = new Map<string, number>();
         const pctMap = new Map<string, number>();
         for (const p of body.payouts || []) {
           grossMap.set(p.userId, p.grossTotal);
           if (typeof p.ownerGross === 'number') ownerMap.set(p.userId, p.ownerGross);
+          if (typeof p.bmOwnerGross === 'number') bmMap.set(p.userId, p.bmOwnerGross);
           if (typeof p.earnings === 'number') earnMap.set(p.userId, p.earnings);
           if (typeof p.pctOfGross === 'number') pctMap.set(p.userId, p.pctOfGross);
         }
         setServerGrossByUser(grossMap);
         setServerOwnerGrossByUser(ownerMap);
+        setServerBmGrossByUser(bmMap);
         setServerEarningsByUser(earnMap);
         setServerPctByUser(pctMap);
       })
@@ -750,6 +756,7 @@ export const Reports: React.FC<ReportsProps> = ({ currentUser }) => {
           'Level': `L${member.level}`,
           'Role': ownBook > 0 ? 'RM (own clients)' : 'BM / Upline',
           'Own Book Gross (Rs.)': Math.round(ownBook * 100) / 100,
+          'BM Gross - AdvisorKhoj basis (Rs.)': Math.round((serverBmGrossByUser.get(member.id) || 0) * 100) / 100,
           'Sharing % (set)': typeof rate === 'number' ? rate : '',
           'Gross Brokerage (Rs.)': Math.round(grossTotal * 100) / 100,
           'Their Earnings (Rs.)': Math.round(userOwnTotal * 100) / 100,

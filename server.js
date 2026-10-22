@@ -2300,9 +2300,13 @@ app.all('/api/data', mutationLimiter, async (req, res) => {
               const frozenUsers = new Set(frozen.map(f => f.userId));
               const lockedTotals = accumulatePayoutTotals(txRows.filter(r => lockedSet.has(r.period)), ctx);
               for (const lt of Object.values(lockedTotals)) {
-                if (frozenUsers.has(lt.userId)) continue;
                 const t = totals[lt.userId] || (totals[lt.userId] = { userId: lt.userId, grossTotal: 0, earnings: 0, txCount: 0, ownerGross: 0 });
-                t.grossTotal += lt.grossTotal || 0; t.txCount += lt.txCount || 0; t.ownerGross += lt.ownerGross || 0;
+                // gross and count: the ledger already supplied them for anyone who has a ledger row.
+                if (!frozenUsers.has(lt.userId)) { t.grossTotal += lt.grossTotal || 0; t.txCount += lt.txCount || 0; }
+                // own-book gross and BM gross (the columns the AdvisorKhoj comparison uses) are not in
+                // the ledger for ANYONE, so a locked month read 0 for all of them. They depend on the
+                // client's chain, not on rates, so they are taken from the chain as it applied that month.
+                t.ownerGross = (t.ownerGross || 0) + (lt.ownerGross || 0);
                 if (lt.bmOwnerGross) t.bmOwnerGross = (t.bmOwnerGross || 0) + lt.bmOwnerGross;
               }
             }
