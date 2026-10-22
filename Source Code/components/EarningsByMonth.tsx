@@ -126,6 +126,18 @@ export const EarningsByMonth: React.FC<{ firmWide: boolean }> = ({ firmWide }) =
     : `${year}`;
   const sources = data?.sources?.length ? data.sources : ['MF'];
 
+  // Switching product opens on the newest month that has that product's money.
+  const pickSource = (next: string) => {
+    setSource(next);
+    let latest = '';
+    for (const p of data?.people || []) for (const m of p.months || []) {
+      const v = next === 'all' ? m : (m.bySource?.[next] || { earned: 0, paid: 0, carriedIn: 0 });
+      if ((v.earned !== 0 || v.paid !== 0 || v.carriedIn !== 0) && m.period > latest) latest = m.period;
+    }
+    const [y, mo] = latest.split('-').map(Number);
+    if (y && mo) { setYear(y); setMonth(mo - 1); }
+  };
+
   return (
     <div className="bg-white dark:bg-slate-800 rounded-xl border border-slate-200 dark:border-slate-700 shadow-sm overflow-hidden">
       <div className="px-5 py-4 border-b border-slate-200 dark:border-slate-700 flex items-start justify-between gap-4 flex-wrap">
@@ -140,7 +152,7 @@ export const EarningsByMonth: React.FC<{ firmWide: boolean }> = ({ firmWide }) =
           </p>
         </div>
         <div className="flex items-center gap-2 flex-wrap">
-          <select id="earn-product" aria-label="Product" value={source} onChange={e => setSource(e.target.value)} className={selectCls}>
+          <select id="earn-product" aria-label="Product" value={source} onChange={e => pickSource(e.target.value)} className={selectCls}>
             <option value="all">{labelFor('all')}</option>
             {sources.map(s => <option key={s} value={s}>{labelFor(s)}</option>)}
           </select>

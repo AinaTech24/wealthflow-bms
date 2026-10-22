@@ -77,6 +77,19 @@ export const Payouts: React.FC<Props> = ({ currentUser }) => {
 
   useEffect(() => { load(); /* eslint-disable-next-line */ }, []);
 
+  // Switching product jumps to the newest month that actually has that product's money, so a
+  // partner whose statements are in Jul-Sep does not open on an empty October.
+  const pickSource = (next: string) => {
+    setSource(next);
+    if (!data) return;
+    let latest = '';
+    for (const p of data.people) for (const m of p.months) {
+      const v = next === 'all' ? m : (m.bySource?.[next] || { earned: 0, paid: 0, carriedIn: 0 });
+      if ((v.earned !== 0 || v.paid !== 0 || v.carriedIn !== 0) && m.period > latest) latest = m.period;
+    }
+    if (latest) setPeriod(latest);
+  };
+
   // Attribution health is per MONTH, so it reloads when the month changes.
   useEffect(() => {
     if (!period) return;
@@ -245,7 +258,7 @@ export const Payouts: React.FC<Props> = ({ currentUser }) => {
           <select
             id="payout-source"
             value={source}
-            onChange={e => setSource(e.target.value)}
+            onChange={e => pickSource(e.target.value)}
             className="px-3 py-2 rounded-lg border border-slate-200 dark:border-slate-600 dark:bg-slate-800 dark:text-slate-100 text-sm font-bold"
             title="Which product to show"
           >
@@ -367,9 +380,8 @@ export const Payouts: React.FC<Props> = ({ currentUser }) => {
                   anybody, and neither of them happens on this page. */}
               {!busy && !onlyOwed && source !== 'all' && source !== 'MF' && (
                 <p className="text-xs text-slate-500 dark:text-slate-400 mt-2 max-w-xl mx-auto leading-relaxed">
-                  {labelFor(source)} has statements imported, but none of it reaches a person yet. A partner
-                  statement pays somebody only once <b>a sharing %</b> is set for it <i>and</i> its <b>client codes
-                  are attached to clients</b> — both on the Partner Brokerage page, which an administrator runs.
+                  {labelFor(source)} has no payout in this month. Pick another month, or check on the Partner Brokerage page that
+                  the statement's client codes are attached to clients &mdash; a code that is not attached reaches nobody.
                 </p>
               )}
             </div>
