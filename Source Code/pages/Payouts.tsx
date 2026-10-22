@@ -17,7 +17,7 @@ interface MonthRow {
   gst: number; tds: number; payable: number; invoiced: boolean; invoiceStatus?: string;
   /** The same figures per product — 'MF' for fund trail, then each partner by
    *  its own code — so one product reads on its own and carries its own arrears. */
-  bySource: Record<string, { earned: number; paid: number; carriedIn: number; outstanding: number }>;
+  bySource: Record<string, { earned: number; paid: number; carriedIn: number; outstanding: number; gst?: number; tds?: number; payable?: number }>;
 }
 
 // Product names live in utils/payoutSources.ts, shared with the earnings panel on
@@ -116,6 +116,13 @@ export const Payouts: React.FC<Props> = ({ currentUser }) => {
     ? { carriedIn: m.carriedIn, earned: m.earned, paid: m.paid, outstanding: m.outstanding }
     : (m.bySource?.[source] || { carriedIn: 0, earned: 0, paid: 0, outstanding: 0 });
 
+  // GST, TDS and the cheque for the month. On the combined view they are the RM's invoice figures
+  // (or the rate estimate when none is raised). On a single product they are estimates on that
+  // product's earnings, because an invoice covers the whole month and is not split by product.
+  const taxFor = (m: MonthRow) => source === 'all'
+    ? { gst: m.gst, tds: m.tds, payable: m.payable, invoiced: m.invoiced, invoiceStatus: m.invoiceStatus }
+    : { gst: m.bySource?.[source]?.gst || 0, tds: m.bySource?.[source]?.tds || 0, payable: m.bySource?.[source]?.payable || 0, invoiced: false, invoiceStatus: '' };
+
   // One row per person FOR THE CHOSEN MONTH, carrying their prior balance in.
   const rows = useMemo(() => {
     if (!data || !period) return [];
@@ -123,7 +130,7 @@ export const Payouts: React.FC<Props> = ({ currentUser }) => {
     return data.people
       .map(p => ({ p, m: p.months.find(m => m.period === period) }))
       .filter((x): x is { p: Person; m: MonthRow } => !!x.m)
-      .map(x => ({ ...x, v: view(x.m) }))
+      .map(x => ({ ...x, v: view(x.m), t: taxFor(x.m) }))
       .filter(x => !q || x.p.name.toLowerCase().includes(q) || (x.p.code || '').toLowerCase().includes(q))
       // A person with nothing at all in this stream is noise, not a zero worth reading.
       .filter(x => source === 'all' || x.v.earned !== 0 || x.v.paid !== 0 || x.v.carriedIn !== 0)
@@ -137,13 +144,11 @@ export const Payouts: React.FC<Props> = ({ currentUser }) => {
     paid: a.paid + x.v.paid,
     carriedIn: a.carriedIn + x.v.carriedIn,
     outstanding: a.outstanding + x.v.outstanding,
-    gst: a.gst + x.m.gst,
-    payable: a.payable + x.m.payable,
+    gst: a.gst + x.t.gst,
+    payable: a.payable + x.t.payable,
   }), { earned: 0, paid: 0, carriedIn: 0, outstanding: 0, gst: 0, payable: 0 }), [rows]);
 
-  // GST, TDS and the cheque are month-level facts off the RM's invoice — they are
-  // not split by product, so they are only shown when nothing is filtered out.
-  const showTax = source === 'all';
+  const showTax = true;
   const anyPartner = source === 'all' && rows.some(x => x.m.partner !== 0);
   /**
    * Which product a payment recorded from this page is booked against.
@@ -155,6 +160,7 @@ export const Payouts: React.FC<Props> = ({ currentUser }) => {
   const paySource = source === 'all' ? 'MF' : source;
   /** The dialog's figures follow the same product the table is showing. */
   const payView = payFor ? view(payFor.m) : null;
+  const payTax = payFor ? taxFor(payFor.m) : null;
 
   // ── Bulk import ───────────────────────────────────────────────────────────
   // Export the month, fill the "Pay now" column, upload it back. Settling 121
@@ -288,14 +294,14 @@ export const Payouts: React.FC<Props> = ({ currentUser }) => {
               // "Pay now" ships empty on purpose: fill it in, upload the same
               // sheet back, and those become the month's payments. Leaving the
               // already-Paid column to be re-read would double every payment.
-              exportToExcel(rows.map(({ p, m, v }) => ({
+              exportToExcel(rows.map(({ p, m, v, t }) => ({
                 Name: p.name, Code: p.code, Level: p.level ?? '',
                 Product: labelFor(source),
                 'Brought forward': v.carriedIn,
-                ...(showTax ? { 'Mutual fund': m.mf, 'Partner': m.partner } : {}),
+                ...(source === 'all' ? { 'Mutual fund': m.mf, 'Partner': m.partner } : {}),
                 'Earned this month': v.earned,
-                ...(showTax ? { GST: m.gst, TDS: m.tds, 'Payable': m.payable,
-                                'Invoice raised': m.invoiced ? (m.invoiceStatus || 'YES') : 'no' } : {}),
+                ...{ GST: t.gst, TDS: t.tds, 'Payable': t.payable,
+                     'Invoice raised': t.invoiced ? (t.invoiceStatus || 'YES') : 'no' },
                 'Already paid': v.paid,
                 'Still owed': v.outstanding,
                 'Pay now': '',
@@ -337,16 +343,15 @@ export const Payouts: React.FC<Props> = ({ currentUser }) => {
         <Tile label="Still owed" value={totals.outstanding} accent={totals.outstanding > 0 ? 'red' : 'emerald'} hint="carries into next month" />
       </div>
 
-      {!showTax && (
+      {source !== 'all' && (
         <p className="text-[11px] text-slate-500 dark:text-slate-400 -mt-2">
-          Showing <b>{labelFor(source).toLowerCase()}</b> only. GST, TDS and the cheque amount come from the RM&rsquo;s
-          invoice for the whole month and are not split by product, so they are hidden here — switch to{' '}
-          <b>All products</b> to see them.
+          Showing <b>{labelFor(source)}</b> only. GST, TDS and the cheque here are <span className="text-amber-600 font-black">estimates</span> on this
+          product&rsquo;s earnings at the configured rates (an RM&rsquo;s invoice covers the whole month, so see <b>All products</b> for the invoice figures).
           {' '}A payment recorded here is booked against <b>{labelFor(source)}</b>, so it clears this balance and no other.
         </p>
       )}
 
-      {health && <AttributionHealth h={health} open={openCheck} setOpen={setOpenCheck} />}
+      {health && (source === 'all' || source === 'MF') && <AttributionHealth h={health} open={openCheck} setOpen={setOpenCheck} />}
 
       <div className="bg-white dark:bg-slate-800 rounded-xl border border-slate-200 dark:border-slate-700 overflow-hidden">
         <div className="px-4 py-3 border-b border-slate-200 dark:border-slate-700 flex items-center justify-between gap-3 flex-wrap">
@@ -404,7 +409,7 @@ export const Payouts: React.FC<Props> = ({ currentUser }) => {
                   </tr>
                 </thead>
                 <tbody>
-                  {rows.map(({ p, m, v }) => (
+                  {rows.map(({ p, m, v, t }) => (
                     <tr key={p.userId} className="border-b border-slate-100 dark:border-slate-700/50">
                       <td className="py-2 pr-4">
                         <div className="font-bold text-slate-900 dark:text-slate-100">{p.name}</div>
@@ -416,12 +421,12 @@ export const Payouts: React.FC<Props> = ({ currentUser }) => {
                       {anyPartner && <Num v={m.mf} muted />}
                       {anyPartner && <Num v={m.partner} muted />}
                       <Num v={v.earned} bold />
-                      {showTax && <Num v={m.gst} muted />}
-                      {showTax && <Num v={m.tds} muted />}
+                      {showTax && <Num v={t.gst} muted />}
+                      {showTax && <Num v={t.tds} muted />}
                       {showTax && (
                         <td className="py-2 pr-4 text-right font-mono text-xs tabular-nums font-bold text-slate-900 dark:text-slate-100 whitespace-nowrap">
-                          {inr(m.payable)}
-                          {!m.invoiced && <span className="ml-1 text-[9px] font-black uppercase tracking-widest text-amber-600" title="No invoice raised for this month — estimated from the configured GST and TDS rates">est</span>}
+                          {inr(t.payable)}
+                          {!t.invoiced && <span className="ml-1 text-[9px] font-black uppercase tracking-widest text-amber-600" title="No invoice raised for this month — estimated from the configured GST and TDS rates">est</span>}
                         </td>
                       )}
                       <Num v={v.paid} tone="emerald" />
@@ -464,7 +469,7 @@ export const Payouts: React.FC<Props> = ({ currentUser }) => {
         </div>
       )}
 
-      {payFor && payView && (
+      {payFor && payView && payTax && (
         <div className="fixed inset-0 z-50 bg-slate-900/50 flex items-center justify-center p-4" onClick={() => setPayFor(null)}>
           <div className="bg-white dark:bg-slate-800 rounded-2xl border border-slate-200 dark:border-slate-700 p-5 w-full max-w-sm" onClick={e => e.stopPropagation()}>
             <h3 className="font-bold text-slate-900 dark:text-slate-100">Record a payment</h3>
@@ -474,9 +479,9 @@ export const Payouts: React.FC<Props> = ({ currentUser }) => {
             <dl className="mt-3 text-xs space-y-1">
               <Line k="Brought forward" v={payView.carriedIn} />
               <Line k="Earned this month" v={payView.earned} />
-              {showTax && payFor.m.gst > 0 && <Line k="GST" v={payFor.m.gst} />}
-              {showTax && payFor.m.tds > 0 && <Line k="Less TDS" v={-payFor.m.tds} />}
-              {showTax && <Line k={payFor.m.invoiced ? "Payable (invoice)" : "Payable (estimated)"} v={payFor.m.payable} />}
+              {payTax.gst > 0 && <Line k="GST" v={payTax.gst} />}
+              {payTax.tds > 0 && <Line k="Less TDS" v={-payTax.tds} />}
+              <Line k={payTax.invoiced ? "Payable (invoice)" : "Payable (estimated)"} v={payTax.payable} />
               <Line k="Already paid" v={payView.paid} />
               <Line k="Still owed" v={payView.outstanding} strong />
             </dl>
@@ -495,7 +500,7 @@ export const Payouts: React.FC<Props> = ({ currentUser }) => {
             {Number(amount) > payView.outstanding + 0.5 && (
               <p className="text-[11px] text-amber-700 dark:text-amber-400 mt-1.5 leading-relaxed">
                 That is more than the {inr(payView.outstanding)} outstanding
-                {showTax && Math.abs(Number(amount) - payFor.m.payable) < 1 && <> — it looks like the payable {inr(payFor.m.payable)}, which includes GST</>}.
+                {Math.abs(Number(amount) - payTax.payable) < 1 && <> — it looks like the payable {inr(payTax.payable)}, which includes GST</>}.
                 Recording it leaves a credit that carries into next month.
               </p>
             )}

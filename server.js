@@ -13,7 +13,7 @@ import { nameTokens, nameContradicts, bestNameMatches } from './src/lib/nameMatc
 import { planBranchRestructure } from './src/lib/branchRestructure.js';
 import { pickOwnerRecord } from './src/lib/folioOwner.js';
 import { scopePayoutOverview } from './src/lib/payoutScope.js';
-import { recomputePartnerLedger, PARTNER_LEDGER_DDL } from './src/lib/partnerPayout.js';
+import { recomputePartnerLedger, PARTNER_LEDGER_DDL, estimateTax } from './src/lib/partnerPayout.js';
 import { memberAsOf, residualSplit, breakdownFromShares } from './src/lib/payoutEngine.js';
 import { chainAsOf, planLevelMove, effectiveMonthOr } from './src/lib/hierarchyHistory.js';
 import { monthsToLock, mergeLocks } from './src/lib/lockPeriods.js';
@@ -1586,8 +1586,12 @@ app.all('/api/data', mutationLimiter, async (req, res) => {
           await pool.query(PARTNER_LEDGER_DDL);
           const [earnRows] = await pool.query(
             `SELECT userId, period, ROUND(SUM(amount),4) amt FROM partner_payout_ledger WHERE partner = ? GROUP BY userId, period`, [partner]);
-          const [teamRows] = await pool.query('SELECT id, name, code, role, level FROM team');
+          const [teamRows] = await pool.query('SELECT id, name, code, role, level, data FROM team');
           const team = new Map(teamRows.map(t => [t.id, t]));
+          const [[pcfgRow]] = await pool.query("SELECT data FROM config WHERE id IN ('global_config','global') ORDER BY id = 'global_config' DESC LIMIT 1");
+          let pcfg = {}; try { pcfg = JSON.parse(pcfgRow?.data || '{}'); } catch { /* keep {} */ }
+          const pGst = Number(pcfg.defaultGstRate) || 18, pTds = Number(pcfg.defaultTdsRate) || 2;
+          const hasGstin = (uid) => { try { return !!String(JSON.parse(team.get(uid)?.data || '{}').gstNumber || '').trim(); } catch { return false; } };
           const earned = new Map();
           for (const r of earnRows) { if (!earned.has(r.userId)) earned.set(r.userId, new Map()); earned.get(r.userId).set(r.period, Number(r.amt) || 0); }
           // Whatever a statement paid the firm that reached nobody (a code not attached to a client, or a client with no chain).
@@ -1607,8 +1611,10 @@ app.all('/api/data', mutationLimiter, async (req, res) => {
             let running = 0;
             const months = [...periods].sort().map(p => {
               const e = Number(earned.get(uid)?.get(p) || 0), pd = Number(paid.get(uid)?.get(p) || 0);
+              const carriedIn = running;
               running += e - pd;
-              return { period: p, earned: Math.round(e * 100) / 100, paid: Math.round(pd * 100) / 100, carried: Math.round(running * 100) / 100 };
+              return { period: p, carriedIn: Math.round(carriedIn * 100) / 100, earned: Math.round(e * 100) / 100, paid: Math.round(pd * 100) / 100, carried: Math.round(running * 100) / 100,
+                ...estimateTax(Math.round(e * 100) / 100, { hasGst: hasGstin(uid), gstRate: pGst, tdsRate: pTds }) };
             });
             const t = team.get(uid);
             out.push({ userId: uid, name: t?.name || uid, code: t?.code || '', level: t?.level ?? null, months,
@@ -1833,6 +1839,7 @@ app.all('/api/data', mutationLimiter, async (req, res) => {
                 const se = e[s] || 0, sp = pdSplit[s] || 0;
                 tot += se; pd += sp;
                 bySource[s] = {
+                  ...estimateTax(r2(se), { hasGst: !!taxOf.get(uid)?.hasGst, gstRate, tdsRate }),
                   earned: r2(se),
                   paid: r2(sp),
                   carriedIn: r2(runBy[s]),
@@ -2770,7 +2777,23 @@ app.all('/api/data', mutationLimiter, async (req, res) => {
           if (!rows.length) return res.status(400).json({ error: 'No rows to import' });
 
           const batchId = `PB_${partner}_${Date.now()}`;
-          await pool.query(
+          // The same partner and month imported again REPLACES the earlier rows (a corrected statement,
+          // or the real statement after a derived one) instead of stacking a second copy on top.
+          const filePeriods = [...new Set(rows.map(r => String(r.period || '').slice(0, 7)).filter(p => /^[0-9]{4}-[0-9]{2}$/.test(p)))];
+          const conn = await pool.getConnection();
+          let replaced = 0, written = 0;
+          try {
+          await conn.beginTransaction();
+          if (filePeriods.length) {
+            const [oldB] = await conn.query('SELECT DISTINCT batchId FROM partner_brokerage WHERE partner = ? AND period IN (?)', [partner, filePeriods]);
+            const [del] = await conn.query('DELETE FROM partner_brokerage WHERE partner = ? AND period IN (?)', [partner, filePeriods]);
+            replaced = del.affectedRows || 0;
+            for (const b of oldB) {
+              const [[left]] = await conn.query('SELECT COUNT(*) n FROM partner_brokerage WHERE batchId = ?', [b.batchId]);
+              if (!left.n) await conn.query('DELETE FROM batches WHERE id = ?', [b.batchId]);
+            }
+          }
+          await conn.query(
             `INSERT INTO batches (id, fileName, data) VALUES (?, ?, ?)
              ON DUPLICATE KEY UPDATE fileName = VALUES(fileName), data = VALUES(data)`,
             [batchId, fileName || `${partner} import`, JSON.stringify({ partner, kind: 'partner_brokerage', rowCount: rows.length })]);
@@ -2778,7 +2801,7 @@ app.all('/api/data', mutationLimiter, async (req, res) => {
           // Codes already mapped attach themselves on the way in, so a second
           // month's file lands pre-attributed and the mapping screen only ever
           // shows what is genuinely new.
-          const [mapRows] = await pool.query(
+          const [mapRows] = await conn.query(
             `SELECT clientCode, clientId FROM partner_client_map WHERE partner = ?`, [partner]);
           const codeToClient = new Map(mapRows.map(r => [String(r.clientCode), r.clientId]));
 
@@ -2788,7 +2811,7 @@ app.all('/api/data', mutationLimiter, async (req, res) => {
           // silently. Counting occurrences keeps them apart while a re-import of
           // the same statement still lands on the same ids.
           const seen = new Map();
-          let written = 0;
+          
           for (let i = 0; i < rows.length; i += 400) {
             const chunk = rows.slice(i, i + 400);
             const values = [];
@@ -2810,7 +2833,7 @@ app.all('/api/data', mutationLimiter, async (req, res) => {
                 codeToClient.get(clientCode) || null,
                 JSON.stringify(r.extra || {}));
             }
-            const [res2] = await pool.query(
+            const [res2] = await conn.query(
               `INSERT INTO partner_brokerage
                  (id, partner, batchId, tradeDate, period, clientCode, segment, tradeCategory,
                   totalBrokerage, ourShare, partnerShare, mappedClientId, data)
@@ -2822,6 +2845,8 @@ app.all('/api/data', mutationLimiter, async (req, res) => {
                  partnerShare = VALUES(partnerShare), data = VALUES(data)`, params);
             written += chunk.length;
           }
+          await conn.commit();
+          } catch (txe) { await conn.rollback(); throw txe; } finally { conn.release(); }
           const [[after]] = await pool.query(
             `SELECT COUNT(*) rows_, COUNT(DISTINCT clientCode) codes,
                     ROUND(SUM(ourShare),2) ourShare,
@@ -2831,7 +2856,7 @@ app.all('/api/data', mutationLimiter, async (req, res) => {
             [req.user?.id || '', req.user?.name || '', 'partner_import',
              `${partner}: ${written} row(s) from ${fileName || 'upload'} — our share Rs ${after.ourShare}`]);
           try { await recomputePartnerLedger(pool, { partner }); invalidateSummaryCache(); payoutOverviewCache = null; } catch (pe) { console.error('[partner_import] ledger:', pe.message); }
-          return res.json({ success: true, batchId, written, ...after });
+          return res.json({ success: true, batchId, written, replaced, ...after });
         } catch (e) {
           console.error('[partner_import]', e);
           return res.status(500).json({ error: e.message });

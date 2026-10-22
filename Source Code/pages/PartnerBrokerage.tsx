@@ -269,6 +269,7 @@ export const PartnerBrokerage: React.FC<Props> = ({ currentUser }) => {
       showToast(
         `${fmt.label}: ${sj.written} row${sj.written !== 1 ? 's' : ''} imported` +
         (skipped ? `, ${skipped} skipped (no date or client code)` : '') +
+        (sj.replaced ? `. Replaced ${sj.replaced} earlier row${sj.replaced !== 1 ? 's' : ''} for the same month` : '') +
         `. ${sj.unmapped} row${sj.unmapped !== 1 ? 's' : ''} await client mapping.`,
         'success');
       await load();
@@ -309,6 +310,28 @@ export const PartnerBrokerage: React.FC<Props> = ({ currentUser }) => {
     return t;
   }, [ledger, period]);
   const myEarning = canWrite ? null : ledgerTotal;
+
+  const inr2 = (n: number) => '₹' + (Number(n) || 0).toLocaleString('en-IN', { maximumFractionDigits: 2 });
+  // One row per person: the selected month, or every month added up when none is selected.
+  const ledgerRows = useMemo(() => {
+    const out: any[] = [];
+    for (const person of (ledger?.people || [])) {
+      const ms = (person.months || []).filter((x: any) => !period || x.period === period);
+      if (!ms.length) continue;
+      const sum = (k: string) => ms.reduce((a: number, x: any) => a + (Number(x[k]) || 0), 0);
+      out.push({
+        userId: person.userId, name: person.name, level: person.level,
+        carriedIn: Number(ms[0].carriedIn) || 0, earned: sum('earned'), gst: sum('gst'), tds: sum('tds'), payable: sum('payable'), paid: sum('paid'),
+        carried: Number(ms[ms.length - 1].carried) || 0, lastPeriod: ms[ms.length - 1].period,
+      });
+    }
+    return out.filter(r => r.earned !== 0 || r.paid !== 0 || r.carriedIn !== 0).sort((x, y) => y.carried - x.carried || y.earned - x.earned);
+  }, [ledger, period]);
+  const ledgerSum = useMemo(() => ledgerRows.reduce((a: any, r: any) => ({
+    carriedIn: a.carriedIn + r.carriedIn, earned: a.earned + r.earned, gst: a.gst + r.gst, tds: a.tds + r.tds,
+    payable: a.payable + r.payable, paid: a.paid + r.paid, carried: a.carried + r.carried,
+  }), { carriedIn: 0, earned: 0, gst: 0, tds: 0, payable: 0, paid: 0, carried: 0 }), [ledgerRows]);
+
 
   const filteredCodes = useMemo(() => {
     const q = codeSearch.trim().toLowerCase();
@@ -523,80 +546,70 @@ export const PartnerBrokerage: React.FC<Props> = ({ currentUser }) => {
 
       {/* ── Payout ledger ─────────────────────────────────────────────────── */}
       <Panel title={canWrite ? 'Payout ledger' : 'Your payout ledger'}>
-        {!ledger?.people?.length
+        {!ledgerRows.length
           ? (
             <Empty>
-              {!ledger?.configured
-                ? 'Set a sharing % above and the ledger fills in.'
-                : canWrite
-                  ? 'Nothing owed yet — attach client codes to clients and the earnings appear here.'
-                  : 'Nothing owed to you from this partner yet.'}
+              {canWrite
+                ? (period ? 'Nothing owed for this month — attach client codes to clients and the earnings appear here.' : 'Nothing owed yet — attach client codes to clients and the earnings appear here.')
+                : 'Nothing owed to you from this partner for this period.'}
             </Empty>
           )
           : (
             <>
               <p className="text-[11px] text-slate-500 dark:text-slate-400 mb-3 max-w-3xl">
-                <b>Carried</b> is what is still owed once that month closes — an unpaid balance from July is still
-                owed in August, so each month opens with the one before it built in. Pay a month in parts and the
-                ledger adds the parts up.
+                {period ? <>Showing <b>{period}</b>.</> : <>Showing <b>all months</b> added up per person — pick a month above to see just that month.</>}
+                {' '}<b>Brought fwd</b> is what was still owed when {period ? 'the month' : 'the first month'} opened and <b>Still owed</b> is what is
+                owed after it. GST, TDS and the cheque are <span className="text-amber-600 font-black">estimates</span> on {partner}&rsquo;s earnings at the
+                configured rates. Pay a month in parts and the ledger adds the parts up.
               </p>
               <div className="overflow-x-auto">
                 <table className="w-full text-sm">
-                  <Head cols={canWrite
-                    ? ['Person', 'Month', 'Earned', 'Paid', 'Carried', '']
-                    : ['Month', 'Earned', 'Paid', 'Carried']} />
+                  <Head cols={[...(canWrite ? ['Person'] : []), 'Month', 'Brought fwd', 'Earned', 'GST', 'TDS', 'Payable', 'Paid', 'Still owed', ...(canWrite ? [''] : [])]} />
                   <tbody>
-                    {ledger.people.map((p: any) => (
-                      <React.Fragment key={p.userId}>
-                        {p.months.map((m: any, i: number) => (
-                          <tr key={`${p.userId}-${m.period}`} className="border-b border-slate-100 dark:border-slate-700/50">
-                            {canWrite && (
-                              <Td bold={i === 0}>
-                                {i === 0
-                                  ? <>{p.name}{p.level != null && <span className="text-slate-400 font-normal"> · L{p.level}</span>}</>
-                                  : ''}
-                              </Td>
-                            )}
-                            <Td mono>{m.period}</Td>
-                            <Td mono right>₹{m.earned.toLocaleString('en-IN', { maximumFractionDigits: 2 })}</Td>
-                            <Td mono right>₹{m.paid.toLocaleString('en-IN', { maximumFractionDigits: 2 })}</Td>
-                            <Td mono right bold>
-                              <span className={m.carried > 0 ? 'text-red-600 dark:text-red-400' : 'text-emerald-600 dark:text-emerald-400'}>
-                                ₹{m.carried.toLocaleString('en-IN', { maximumFractionDigits: 2 })}
-                              </span>
-                            </Td>
-                            {canWrite && (
-                              <td className="py-2 pr-4 text-right">
-                                <button
-                                  onClick={() => {
-                                    setPayFor({ userId: p.userId, name: p.name, period: m.period, suggested: m.carried });
-                                    setPayAmount(m.carried > 0 ? String(Math.round(m.carried * 100) / 100) : '');
-                                    setPayRef('');
-                                  }}
-                                  className="px-2.5 py-1 rounded-lg border border-slate-200 dark:border-slate-600 text-[10px] font-black uppercase tracking-widest text-slate-600 dark:text-slate-300 hover:border-emerald-400 hover:text-emerald-600 transition"
-                                >
-                                  Record payment
-                                </button>
-                              </td>
-                            )}
-                          </tr>
-                        ))}
+                    {ledgerRows.map((r: any) => (
+                      <tr key={r.userId} className="border-b border-slate-100 dark:border-slate-700/50">
                         {canWrite && (
-                          <tr className="border-b-2 border-slate-200 dark:border-slate-700 bg-slate-50 dark:bg-slate-900/40">
-                            <Td bold>{p.name} — total</Td>
-                            <Td />
-                            <Td mono right bold>₹{p.totalEarned.toLocaleString('en-IN', { maximumFractionDigits: 2 })}</Td>
-                            <Td mono right bold>₹{p.totalPaid.toLocaleString('en-IN', { maximumFractionDigits: 2 })}</Td>
-                            <Td mono right bold>
-                              <span className={p.outstanding > 0 ? 'text-red-600 dark:text-red-400' : 'text-emerald-600 dark:text-emerald-400'}>
-                                ₹{p.outstanding.toLocaleString('en-IN', { maximumFractionDigits: 2 })}
-                              </span>
-                            </Td>
-                            <Td />
-                          </tr>
+                          <Td bold>{r.name}{r.level != null && <span className="text-slate-400 font-normal"> · L{r.level}</span>}</Td>
                         )}
-                      </React.Fragment>
+                        <Td mono>{period || 'All months'}</Td>
+                        <Td mono right><span className="text-slate-400">{inr2(r.carriedIn)}</span></Td>
+                        <Td mono right bold>{inr2(r.earned)}</Td>
+                        <Td mono right><span className="text-slate-400">{inr2(r.gst)}</span></Td>
+                        <Td mono right><span className="text-slate-400">{inr2(r.tds)}</span></Td>
+                        <Td mono right bold>{inr2(r.payable)} <span className="text-[9px] font-black uppercase tracking-widest text-amber-600">est</span></Td>
+                        <Td mono right><span className="text-emerald-600 dark:text-emerald-400">{inr2(r.paid)}</span></Td>
+                        <Td mono right bold>
+                          <span className={r.carried > 0.005 ? 'text-red-600 dark:text-red-400' : 'text-emerald-600 dark:text-emerald-400'}>{inr2(r.carried)}</span>
+                        </Td>
+                        {canWrite && (
+                          <td className="py-2 pr-4 text-right">
+                            <button
+                              title={period ? undefined : `Recorded against ${r.lastPeriod}, the latest month`}
+                              onClick={() => {
+                                setPayFor({ userId: r.userId, name: r.name, period: r.lastPeriod, suggested: r.carried });
+                                setPayAmount(r.carried > 0 ? String(Math.round(r.carried * 100) / 100) : '');
+                                setPayRef('');
+                              }}
+                              className="px-2.5 py-1 rounded-lg border border-slate-200 dark:border-slate-600 text-[10px] font-black uppercase tracking-widest text-slate-600 dark:text-slate-300 hover:border-emerald-400 hover:text-emerald-600 transition whitespace-nowrap"
+                            >
+                              Record payment
+                            </button>
+                          </td>
+                        )}
+                      </tr>
                     ))}
+                    <tr className="bg-slate-50 dark:bg-slate-900/40">
+                      <Td bold>Total</Td>
+                      {canWrite && <Td />}
+                      <Td mono right>{inr2(ledgerSum.carriedIn)}</Td>
+                      <Td mono right bold>{inr2(ledgerSum.earned)}</Td>
+                      <Td mono right>{inr2(ledgerSum.gst)}</Td>
+                      <Td mono right>{inr2(ledgerSum.tds)}</Td>
+                      <Td mono right bold>{inr2(ledgerSum.payable)}</Td>
+                      <Td mono right>{inr2(ledgerSum.paid)}</Td>
+                      <Td mono right bold>{inr2(ledgerSum.carried)}</Td>
+                      {canWrite && <Td />}
+                    </tr>
                   </tbody>
                 </table>
               </div>

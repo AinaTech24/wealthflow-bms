@@ -94,3 +94,14 @@ export async function recomputePartnerLedger(pool, { partner } = {}) {
   } catch (e) { await conn.rollback(); throw e; } finally { conn.release(); }
   return { refreshed, frozen, rows: insert.length };
 }
+
+/**
+ * GST, TDS and the cheque for a product viewed on its own. An RM's invoice covers the whole month
+ * and is not split by product, so on a single-product view these are ESTIMATES on that product's
+ * earnings, at the configured rates: GST only when the person has a GSTIN, TDS always.
+ */
+export function estimateTax(base, { hasGst, gstRate, tdsRate }) {
+  const gst = hasGst ? Math.round(base * gstRate) / 100 : 0;
+  const tds = Math.round(base * tdsRate) / 100;
+  return { gst: Math.round(gst * 100) / 100, tds: Math.round(tds * 100) / 100, payable: Math.round(base + gst - tds) };
+}
