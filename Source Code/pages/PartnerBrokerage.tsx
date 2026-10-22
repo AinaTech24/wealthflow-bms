@@ -109,15 +109,7 @@ export const PartnerBrokerage: React.FC<Props> = ({ currentUser }) => {
   const fileRef = useRef<HTMLInputElement>(null);
 
   const partner = 'MOFSL';
-  // Stored either as a bare number (all of it to the RM level) or per level.
-  const rawShare = globalConfig?.partnerSharing?.[partner];
-  const levelPct: Record<string, number> = typeof rawShare === 'number'
-    ? { 3: rawShare }
-    : Object.fromEntries(Object.entries(rawShare || {}).map(([k, v]) => [k, Number(v) || 0]));
-  const sharePct = Object.values(levelPct).reduce((a, b) => a + b, 0);
-
   const [ledger, setLedger] = useState<any>(null);
-  const [pctDraft, setPctDraft] = useState<Record<string, string>>({});
   const [payFor, setPayFor] = useState<{ userId: string; name: string; period: string; suggested: number } | null>(null);
   const [payAmount, setPayAmount] = useState('');
   const [payRef, setPayRef] = useState('');
@@ -151,7 +143,7 @@ export const PartnerBrokerage: React.FC<Props> = ({ currentUser }) => {
         if (a.ok) setAllPeriods(((await a.json()).periods || []).map((x: any) => x.period));
       }
       if (canWrite) {
-        const c = await authFetch(`/api/data?action=partner_codes&_=${Date.now()}`, { cache: 'no-store' });
+        const c = await authFetch(`/api/data?action=partner_codes&period=${encodeURIComponent(p || '')}&_=${Date.now()}`, { cache: 'no-store' });
         if (c.ok) setCodes(await c.json());
       }
     } catch {
@@ -310,11 +302,13 @@ export const PartnerBrokerage: React.FC<Props> = ({ currentUser }) => {
 
   // ── Derived ───────────────────────────────────────────────────────────────
   const totals = summary?.totals;
-  const myEarning = useMemo(() => {
-    if (canWrite) return null;
-    const ours = rows.reduce((a, r) => a + (Number(r.ourShare) || 0), 0);
-    return ours * (sharePct / 100);
-  }, [rows, sharePct, canWrite]);
+  // What the mutual-fund rule pays out of this partner's share, for the month on screen (or all months).
+  const ledgerTotal = useMemo(() => {
+    let t = 0;
+    for (const person of (ledger?.people || [])) for (const m of (person.months || [])) if (!period || m.period === period) t += Number(m.earned) || 0;
+    return t;
+  }, [ledger, period]);
+  const myEarning = canWrite ? null : ledgerTotal;
 
   const filteredCodes = useMemo(() => {
     const q = codeSearch.trim().toLowerCase();
@@ -401,10 +395,10 @@ export const PartnerBrokerage: React.FC<Props> = ({ currentUser }) => {
         {canWrite
           ? <Tile
               label="Payout brokerage"
-              value={(Number(totals?.ourShare) || 0) * (sharePct / 100)}
-              hint={sharePct ? `${sharePct}% of mentor brokerage` : 'no sharing % set yet — set one below'}
+              value={ledgerTotal}
+              hint="paid to RMs and BMs by the mutual-fund rule"
             />
-          : <Tile label="Your payout" value={myEarning ?? 0} accent hint={sharePct ? `${sharePct}% of your clients' share` : 'no sharing % set yet'} />}
+          : <Tile label="Your payout" value={myEarning ?? 0} accent hint="by the mutual-fund rule, on your clients" />}
       </div>
 
       {/* ── Month ─────────────────────────────────────────────────────────── */}
@@ -429,62 +423,14 @@ export const PartnerBrokerage: React.FC<Props> = ({ currentUser }) => {
       )}
 
       {canWrite && (
-        <div className="rounded-xl border-2 border-slate-200 dark:border-slate-700 bg-white dark:bg-slate-800 p-4">
-          <div className="flex items-start gap-3">
-            <div className="flex-1">
-              <p className="text-sm font-bold text-slate-900 dark:text-slate-100">
-                Sharing for {partner}
-              </p>
-              <p className="text-[11px] mt-1 max-w-3xl text-slate-500 dark:text-slate-400">
-                The statement says what the firm earns; it says nothing about what reaches a person, because broking
-                carries no level ladder of its own. Set a percentage against the hierarchy level that should be paid —
-                most clients here sit at level 3 (RM) with their manager at level 4.
-              </p>
-              <div className="flex items-end gap-3 mt-3 flex-wrap">
-                {[1, 2, 3, 4, 5, 6, 7].map(lv => (
-                  <div key={lv}>
-                    <label htmlFor={`pct-${lv}`} className="block text-[9px] font-black uppercase tracking-widest text-slate-400 mb-1">
-                      Level {lv}
-                    </label>
-                    <div className="relative">
-                      <input
-                        id={`pct-${lv}`}
-                        type="number" min="0" max="100" step="0.5"
-                        value={pctDraft[lv] ?? String(levelPct[lv] ?? '')}
-                        onChange={e => setPctDraft(d => ({ ...d, [lv]: e.target.value }))}
-                        className="w-20 pl-2 pr-5 py-1.5 text-sm rounded-lg border border-slate-200 dark:border-slate-600 dark:bg-slate-900 dark:text-slate-100 tabular-nums"
-                        placeholder="0"
-                      />
-                      <span className="absolute right-2 top-1/2 -translate-y-1/2 text-[10px] text-slate-400">%</span>
-                    </div>
-                  </div>
-                ))}
-                <button
-                  onClick={async () => {
-                    const next: Record<string, number> = {};
-                    for (const lv of [1, 2, 3, 4, 5, 6, 7]) {
-                      const v = Number(pctDraft[lv] ?? levelPct[lv] ?? 0);
-                      if (v > 0) next[lv] = v;
-                    }
-                    updateConfig({
-                      ...globalConfig,
-                      partnerSharing: { ...(globalConfig.partnerSharing || {}), [partner]: next },
-                    });
-                    setPctDraft({});
-                    showToast(
-                      Object.keys(next).length
-                        ? `Saved — ${Object.entries(next).map(([l, v]) => `level ${l}: ${v}%`).join(', ')}.`
-                        : 'Cleared — nobody is owed anything from this partner now.',
-                      'success');
-                    setTimeout(load, 400);
-                  }}
-                  className="px-4 py-2 rounded-lg bg-blue-600 text-white text-xs font-bold hover:bg-blue-700 transition"
-                >
-                  Save sharing
-                </button>
-              </div>
-            </div>
-          </div>
+        <div className="rounded-xl border border-slate-200 dark:border-slate-700 bg-white dark:bg-slate-800 p-4">
+          <p className="text-sm font-bold text-slate-900 dark:text-slate-100">How {partner} is paid out</p>
+          <p className="text-xs text-slate-500 dark:text-slate-400 mt-1 max-w-3xl">
+            The statement gives the firm&rsquo;s share (&ldquo;mentor brokerage&rdquo;). That share is split across each client&rsquo;s RM and BM exactly as mutual funds are:
+            the company&rsquo;s % comes off first (an L5 or L6 takes its 5% out of it), the RMs take their own %, and the BM &mdash; or whoever is first above
+            when there is no L4 &mdash; takes what is left. The chain used is the one that applied in the statement&rsquo;s month, and a locked month stays as it was paid.
+            A client code that is not attached to a client reaches nobody until you attach it below.
+          </p>
         </div>
       )}
 
@@ -783,7 +729,7 @@ export const PartnerBrokerage: React.FC<Props> = ({ currentUser }) => {
           : (
             <div className="overflow-x-auto">
               <table className="w-full text-sm">
-                <Head cols={['Date', 'Code', 'Client', 'Segment', 'Category', 'Total', 'Our share', ...(canWrite ? [] : ['Your payout'])]} />
+                <Head cols={['Date', 'Code', 'Client', 'Segment', 'Category', 'Total', 'Our share']} />
                 <tbody>
                   {rows.slice(0, 500).map(r => {
                     const client = r.mappedClientId ? clients.find(c => c.id === r.mappedClientId) : null;
@@ -796,13 +742,6 @@ export const PartnerBrokerage: React.FC<Props> = ({ currentUser }) => {
                         <Td mono>{r.tradeCategory}</Td>
                         <Td mono right>₹{Number(r.totalBrokerage).toLocaleString('en-IN')}</Td>
                         <Td mono right bold>₹{Number(r.ourShare).toLocaleString('en-IN')}</Td>
-                        {!canWrite && (
-                          <Td mono right bold>
-                            {sharePct
-                              ? `₹${(Number(r.ourShare) * sharePct / 100).toLocaleString('en-IN', { maximumFractionDigits: 2 })}`
-                              : '—'}
-                          </Td>
-                        )}
                       </tr>
                     );
                   })}

@@ -13,6 +13,7 @@ import { nameTokens, nameContradicts, bestNameMatches } from './src/lib/nameMatc
 import { planBranchRestructure } from './src/lib/branchRestructure.js';
 import { pickOwnerRecord } from './src/lib/folioOwner.js';
 import { scopePayoutOverview } from './src/lib/payoutScope.js';
+import { recomputePartnerLedger, PARTNER_LEDGER_DDL } from './src/lib/partnerPayout.js';
 import { memberAsOf, residualSplit, breakdownFromShares } from './src/lib/payoutEngine.js';
 import { chainAsOf, planLevelMove, effectiveMonthOr } from './src/lib/hierarchyHistory.js';
 import { monthsToLock, mergeLocks } from './src/lib/lockPeriods.js';
@@ -538,6 +539,7 @@ async function initDB() {
     //    "their" rows. Same shape as the folio -> client mapping on the fund side:
     //    map once, and every later import of that code attaches itself.
     "CREATE TABLE IF NOT EXISTS partner_client_map (partner VARCHAR(40) NOT NULL, clientCode VARCHAR(60) NOT NULL, clientId VARCHAR(120), label VARCHAR(255), updatedAt DATETIME DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP, PRIMARY KEY (partner, clientCode), INDEX idx_pcm_client (clientId))",
+    PARTNER_LEDGER_DDL,
     // ── What has actually been PAID to a person, for any revenue source ───────
     //    `payout_ledger` says what each person EARNED; nothing said what left the
     //    bank. Finance tracked that outside the system, so "how much is still
@@ -918,6 +920,10 @@ async function recomputeAllBreakdowns() {
     } catch (_) {
       console.log(`✅ [recalc] recomputed ${recalcState.processed} tx, ${ledgerCount} ledger rows`);
     }
+    // Partner (Motilal ...) payouts follow the same chains and rates, so refresh them too. Separate
+    // table, own try/catch: the fund recompute above is already finished and cannot be affected.
+    try { const pr = await recomputePartnerLedger(pool); console.log(`[recalc] partner ledger: ${pr.refreshed.length} month(s) rebuilt, ${pr.frozen.length} frozen, ${pr.rows} rows`); }
+    catch (pe) { console.error('[recalc] partner ledger failed:', pe.message); }
   } catch (e) {
     recalcState.error = e.message;
     console.error('[recalc] failed:', e.message);
@@ -1513,16 +1519,18 @@ app.all('/api/data', mutationLimiter, async (req, res) => {
               const key = r.period + '|' + uid;
               const e = peopleMap.get(key) || { period: r.period, userId: uid, name: nameOf(uid), level: team.get(uid)?.level ?? null, clients: new Set(), ourShare: 0, payout: 0 };
               e.clients.add(r.cid); e.ourShare += Number(r.ours) || 0;
-              e.payout += (Number(r.ours) || 0) * (Number(pct[lvl]) || 0) / 100;
+              // payout comes from partner_payout_ledger below
               peopleMap.set(key, e);
             }
           }
+          const [pplRows] = await pool.query(`SELECT period, userId, ROUND(SUM(amount),4) amt FROM partner_payout_ledger WHERE partner = ? GROUP BY period, userId`, [partner]);
+          for (const r of pplRows) { if (!writer && r.userId !== req.user.id) continue; const e = peopleMap.get(r.period + '|' + r.userId); if (e) e.payout = Number(r.amt) || 0; }
           const people = [...peopleMap.values()].map(e => ({
             period: e.period, name: e.name, level: e.level, clients: e.clients.size,
             ourShare: Math.round(e.ourShare * 100) / 100, payout: Math.round(e.payout * 100) / 100,
           })).sort((a, b) => a.period.localeCompare(b.period) || b.payout - a.payout || b.ourShare - a.ourShare);
           res.set('Cache-Control', 'no-store');
-          return res.json({ partner, configured: Object.values(pct).some(v => v > 0), pct, lines, people });
+          return res.json({ partner, configured: true, pct: {}, lines, people });
         } catch (e) {
           console.error('[partner_export]', e);
           return res.status(500).json({ error: 'Failed to build the export' });
@@ -1546,12 +1554,13 @@ app.all('/api/data', mutationLimiter, async (req, res) => {
                       MAX(m.label) label
                FROM partner_brokerage b
                LEFT JOIN partner_client_map m ON m.partner = b.partner AND m.clientCode = b.clientCode
+               WHERE (? = '' OR b.period = ?)
                GROUP BY b.partner, b.clientCode
                UNION ALL
                SELECT m2.partner, m2.clientCode, 0, NULL, NULL, 0, m2.clientId, m2.label
                FROM partner_client_map m2
-               WHERE NOT EXISTS (SELECT 1 FROM partner_brokerage b2 WHERE b2.partner = m2.partner AND b2.clientCode = m2.clientCode)
-             ) t ORDER BY ourShare DESC, label, clientCode`);
+               WHERE ? = '' AND NOT EXISTS (SELECT 1 FROM partner_brokerage b2 WHERE b2.partner = m2.partner AND b2.clientCode = m2.clientCode)
+             ) t ORDER BY ourShare DESC, label, clientCode`, [String(query.period || '').slice(0, 7), String(query.period || '').slice(0, 7), String(query.period || '').slice(0, 7)]);
           res.set('Cache-Control', 'no-store');
           return res.json(rows);
         } catch (e) {
@@ -1574,124 +1583,57 @@ app.all('/api/data', mutationLimiter, async (req, res) => {
         try {
           if (!req.user) return res.status(401).json({ error: 'Not authenticated' });
           const partner = String(query.partner || 'MOFSL').toUpperCase();
-
-          const [[cfgRow]] = await pool.query(`SELECT data FROM config WHERE id IN ('global_config','global') ORDER BY id = 'global_config' DESC LIMIT 1`);
-          let cfg = {}; try { cfg = JSON.parse(cfgRow?.data || '{}'); } catch {}
-          const raw = cfg?.partnerSharing?.[partner];
-          // A bare number means "all of it to the RM level"; an object is per level.
-          const pct = (typeof raw === 'number')
-            ? { 3: raw }
-            : Object.fromEntries(Object.entries(raw || {}).map(([k, v]) => [k, Number(v) || 0]));
-          const anyPct = Object.values(pct).some(v => v > 0);
-
-          // ourShare per client per period — the pot to be split.
-          const [rows] = await pool.query(
-            `SELECT period, mappedClientId cid, ROUND(SUM(ourShare),4) ours
-             FROM partner_brokerage
-             WHERE partner = ? AND mappedClientId IS NOT NULL AND mappedClientId <> ''
-             GROUP BY period, mappedClientId`, [partner]);
-
-          const [clientRows] = await pool.query(`SELECT id, data FROM clients`);
-          const hier = new Map();
-          for (const c of clientRows) {
-            let d = {}; try { d = JSON.parse(c.data || '{}'); } catch {}
-            hier.set(c.id, { hierarchy: d.hierarchy || {}, hierarchyHistory: d.hierarchyHistory });
-          }
-          const [teamRows] = await pool.query(`SELECT id, name, code, role, level FROM team`);
+          await pool.query(PARTNER_LEDGER_DDL);
+          const [earnRows] = await pool.query(
+            `SELECT userId, period, ROUND(SUM(amount),4) amt FROM partner_payout_ledger WHERE partner = ? GROUP BY userId, period`, [partner]);
+          const [teamRows] = await pool.query('SELECT id, name, code, role, level FROM team');
           const team = new Map(teamRows.map(t => [t.id, t]));
-
-          // earned[userId][period]
-          //
-          // Hierarchies here are not uniform: 1,422 clients carry a level3Id and
-          // 1,563 a level4Id, so some clients' RM sits at level 2 instead. A
-          // percentage set only against level 3 therefore pays NOBODY for those
-          // clients, and nothing would say so. Track what fell through the same way
-          // the fund side tracks brokerage "going to the house".
           const earned = new Map();
-          const unattributed = new Map();   // period -> firm share that reached nobody
-          const unattributedClients = new Set();
-          for (const r of rows) {
-            const h = chainAsOf(hier.get(r.cid), r.period).hierarchy; if (!h) continue;   // the chain that applied in the statement's month
-            let claimed = 0;
-            for (let lvl = 1; lvl <= 7; lvl++) {
-              const p = Number(pct[lvl]) || 0; if (!p) continue;
-              const uid = h[`level${lvl}Id`]; if (!uid) continue;
-              claimed += p;
-              if (!earned.has(uid)) earned.set(uid, new Map());
-              const byP = earned.get(uid);
-              byP.set(r.period, (byP.get(r.period) || 0) + (Number(r.ours) * p / 100));
-            }
-            const totalPct = Object.values(pct).reduce((a, b) => a + (Number(b) || 0), 0);
-            const missed = totalPct - claimed;
-            if (missed > 0) {
-              unattributed.set(r.period, (unattributed.get(r.period) || 0) + (Number(r.ours) * missed / 100));
-              unattributedClients.add(r.cid);
-            }
-          }
-
+          for (const r of earnRows) { if (!earned.has(r.userId)) earned.set(r.userId, new Map()); earned.get(r.userId).set(r.period, Number(r.amt) || 0); }
+          // Whatever a statement paid the firm that reached nobody (a code not attached to a client, or a client with no chain).
+          const [unRows] = await pool.query(
+            `SELECT b.period, ROUND(SUM(b.ourShare),4) amt, COUNT(DISTINCT b.mappedClientId) clients
+               FROM partner_brokerage b WHERE b.partner = ? AND (b.mappedClientId IS NULL OR b.mappedClientId = '') GROUP BY b.period`, [partner]);
           const [payRows] = await pool.query(
-            `SELECT userId, period, ROUND(SUM(amount),4) paid FROM payout_settlements
-             WHERE source = ? GROUP BY userId, period`, [partner]);
+            `SELECT userId, period, ROUND(SUM(amount),4) paid FROM payout_settlements WHERE source = ? GROUP BY userId, period`, [partner]);
           const paid = new Map();
-          for (const p of payRows) {
-            if (!paid.has(p.userId)) paid.set(p.userId, new Map());
-            paid.get(p.userId).set(p.period, Number(p.paid) || 0);
-          }
-
-          // A person with no earnings but a recorded payment still belongs here.
+          for (const p of payRows) { if (!paid.has(p.userId)) paid.set(p.userId, new Map()); paid.get(p.userId).set(p.period, Number(p.paid) || 0); }
           const userIds = new Set([...earned.keys(), ...paid.keys()]);
           const scoped = !isWriter(req);
           const out = [];
           for (const uid of userIds) {
             if (scoped && uid !== req.user.id) continue;
             const periods = new Set([...(earned.get(uid)?.keys() || []), ...(paid.get(uid)?.keys() || [])]);
-            const list = [...periods].sort();
             let running = 0;
-            const months = list.map(p => {
-              const e = Number((earned.get(uid)?.get(p)) || 0);
-              const pd = Number((paid.get(uid)?.get(p)) || 0);
+            const months = [...periods].sort().map(p => {
+              const e = Number(earned.get(uid)?.get(p) || 0), pd = Number(paid.get(uid)?.get(p) || 0);
               running += e - pd;
-              return {
-                period: p,
-                earned: Math.round(e * 100) / 100,
-                paid: Math.round(pd * 100) / 100,
-                // Carried is the running total INCLUDING this month — what is still
-                // owed once this month closes, and therefore what August opens with.
-                carried: Math.round(running * 100) / 100,
-              };
+              return { period: p, earned: Math.round(e * 100) / 100, paid: Math.round(pd * 100) / 100, carried: Math.round(running * 100) / 100 };
             });
             const t = team.get(uid);
-            out.push({
-              userId: uid,
-              name: t?.name || uid,
-              code: t?.code || '',
-              level: t?.level ?? null,
-              months,
+            out.push({ userId: uid, name: t?.name || uid, code: t?.code || '', level: t?.level ?? null, months,
               totalEarned: Math.round(months.reduce((a, m) => a + m.earned, 0) * 100) / 100,
               totalPaid: Math.round(months.reduce((a, m) => a + m.paid, 0) * 100) / 100,
-              outstanding: months.length ? months[months.length - 1].carried : 0,
-            });
+              outstanding: months.length ? months[months.length - 1].carried : 0 });
           }
           out.sort((a, b) => b.outstanding - a.outstanding || b.totalEarned - a.totalEarned);
           res.set('Cache-Control', 'no-store');
           return res.json({
-            partner, pct, configured: anyPct, people: out,
-            // Only meaningful to a writer — an RM has no business seeing what the
-            // rest of the book failed to attribute.
-            unattributed: isWriter(req)
-              ? {
-                  total: Math.round([...unattributed.values()].reduce((a, b) => a + b, 0) * 100) / 100,
-                  clients: unattributedClients.size,
-                  byPeriod: [...unattributed.entries()]
-                    .sort((a, b) => a[0].localeCompare(b[0]))
-                    .map(([period, amount]) => ({ period, amount: Math.round(amount * 100) / 100 })),
-                }
-              : null,
+            partner, model: 'MUTUAL_FUND_RULE', configured: true, pct: {}, people: out,
+            unattributed: isWriter(req) ? { total: Math.round(unRows.reduce((a, r) => a + Number(r.amt), 0) * 100) / 100,
+              clients: unRows.reduce((a, r) => a + Number(r.clients || 0), 0), byPeriod: unRows.map(r => ({ period: r.period, amount: Math.round(Number(r.amt) * 100) / 100 })) } : null,
           });
         } catch (e) {
           console.error('[partner_ledger]', e);
-          return res.status(500).json({ error: 'Failed to build partner payout ledger' });
+          return res.status(500).json({ error: 'Failed to build the partner ledger' });
         }
+      }
+
+      // Rebuild the partner payout ledger on demand (ADMIN). Safe to repeat; locked months stay frozen.
+      if (action === 'partner_recompute') {
+        if (!req.user || req.user.role !== 'ADMIN') return res.status(403).json({ error: 'Admin privileges required' });
+        try { const r = await recomputePartnerLedger(pool, { partner: query.partner }); invalidateSummaryCache(); payoutOverviewCache = null; return res.json({ success: true, ...r }); }
+        catch (e) { console.error('[partner_recompute]', e); return res.status(500).json({ error: 'Failed to rebuild the partner ledger' }); }
       }
 
       // ── The accounts desk: everyone, one month, what is owed ──────────────
@@ -1753,22 +1695,9 @@ app.all('/api/data', mutationLimiter, async (req, res) => {
             WHERE t.brokeragePeriod IS NOT NULL AND t.brokeragePeriod <> ''
             GROUP BY t.brokeragePeriod, l.userId`);
 
-          // 2. Partner earnings, split by the configured per-level percentages.
+          // 2. Partner earnings come from partner_payout_ledger (same engine as the funds).
           const [[cfgRow]] = await pool.query(`SELECT data FROM config WHERE id IN ('global_config','global') ORDER BY id = 'global_config' DESC LIMIT 1`);
           let cfg = {}; try { cfg = JSON.parse(cfgRow?.data || '{}'); } catch {}
-          const [pbRows] = await pool.query(
-            `SELECT partner, period, mappedClientId cid, ROUND(SUM(ourShare),4) ours
-             FROM partner_brokerage WHERE mappedClientId IS NOT NULL AND mappedClientId <> ''
-             GROUP BY partner, period, mappedClientId`);
-          let hier = new Map();
-          if (pbRows.length) {
-            const [clientRows] = await pool.query(`SELECT id, data FROM clients`);
-            for (const c of clientRows) {
-              let d = {}; try { d = JSON.parse(c.data || '{}'); } catch {}
-              hier.set(c.id, { hierarchy: d.hierarchy || {}, hierarchyHistory: d.hierarchyHistory });
-            }
-          }
-
           // Everything is keyed by SOURCE: 'MF' for fund trail, and the partner's
           // own code ('MOFSL', …) for each broking statement. Keeping the partner
           // code rather than folding every broker into one "partner" bucket is
@@ -1798,20 +1727,13 @@ app.all('/api/data', mutationLimiter, async (req, res) => {
             byP.set(period, e);
           };
           for (const r of mfRows) bump(r.userId, r.period, MF, Number(r.earned) || 0);
-          for (const r of pbRows) {
-            const raw = cfg?.partnerSharing?.[r.partner];
-            const pct = (typeof raw === 'number') ? { 3: raw } : (raw || {});
-            const h = chainAsOf(hier.get(r.cid), r.period).hierarchy; if (!h) continue;   // the chain that applied in the statement's month
+          await pool.query(PARTNER_LEDGER_DDL);
+          const [pplRows] = await pool.query(
+            `SELECT partner, period, userId, ROUND(SUM(amount),4) amt FROM partner_payout_ledger GROUP BY partner, period, userId`);
+          for (const r of pplRows) {
             const key = String(r.partner || '').trim().toUpperCase() || 'PARTNER';
-            // A partner with rows but no sharing % yet still has to appear in the
-            // product list, or finance cannot tell "nothing earned" from "this
-            // product does not exist".
             sourceKeys.add(key);
-            for (let lvl = 1; lvl <= 7; lvl++) {
-              const p = Number(pct[lvl]) || 0; if (!p) continue;
-              const uid = h[`level${lvl}Id`]; if (!uid) continue;
-              bump(uid, r.period, key, Number(r.ours) * p / 100);
-            }
+            bump(r.userId, r.period, key, Number(r.amt) || 0);
           }
 
           // 3. What has actually been paid, by person, month and source.
@@ -2908,6 +2830,7 @@ app.all('/api/data', mutationLimiter, async (req, res) => {
           await pool.query('INSERT INTO activity_log (userId, userName, action, description, createdAt) VALUES (?,?,?,?,NOW())',
             [req.user?.id || '', req.user?.name || '', 'partner_import',
              `${partner}: ${written} row(s) from ${fileName || 'upload'} — our share Rs ${after.ourShare}`]);
+          try { await recomputePartnerLedger(pool, { partner }); invalidateSummaryCache(); payoutOverviewCache = null; } catch (pe) { console.error('[partner_import] ledger:', pe.message); }
           return res.json({ success: true, batchId, written, ...after });
         } catch (e) {
           console.error('[partner_import]', e);
@@ -2941,6 +2864,7 @@ app.all('/api/data', mutationLimiter, async (req, res) => {
           await pool.query('INSERT INTO activity_log (userId, userName, action, description, createdAt) VALUES (?,?,?,?,NOW())',
             [req.user?.id || '', req.user?.name || '', 'partner_map',
              `${partner}: ${mapped} client code(s) mapped, ${rowsTouched} row(s) re-attributed`]);
+          try { await recomputePartnerLedger(pool, { partner }); payoutOverviewCache = null; } catch (pe) { console.error('[partner_map] ledger:', pe.message); }
           return res.json({ success: true, mapped, rowsTouched });
         } catch (e) {
           console.error('[partner_map]', e);
