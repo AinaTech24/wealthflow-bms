@@ -2293,6 +2293,18 @@ app.all('/api/data', mutationLimiter, async (req, res) => {
                 t.grossTotal += Number(f.grossTotal) || 0;
                 t.txCount    += Number(f.txCount)    || 0;
               }
+              // People who sit on these clients but earn nothing (the L7 company account, an
+              // L5/L6 with no rate) have no ledger row, so the loop above never lists them and
+              // their gross read 0 in every locked month. List them with their gross and 0
+              // earnings. Anyone WITH a ledger row is left exactly as the ledger says.
+              const frozenUsers = new Set(frozen.map(f => f.userId));
+              const lockedTotals = accumulatePayoutTotals(txRows.filter(r => lockedSet.has(r.period)), ctx);
+              for (const lt of Object.values(lockedTotals)) {
+                if (frozenUsers.has(lt.userId)) continue;
+                const t = totals[lt.userId] || (totals[lt.userId] = { userId: lt.userId, grossTotal: 0, earnings: 0, txCount: 0, ownerGross: 0 });
+                t.grossTotal += lt.grossTotal || 0; t.txCount += lt.txCount || 0; t.ownerGross += lt.ownerGross || 0;
+                if (lt.bmOwnerGross) t.bmOwnerGross = (t.bmOwnerGross || 0) + lt.bmOwnerGross;
+              }
             }
           }
 
