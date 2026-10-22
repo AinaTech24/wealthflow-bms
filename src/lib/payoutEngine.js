@@ -19,12 +19,13 @@
  *   4. UPPER LEVELS (L5, L6): paid OUT OF THE COMPANY'S SHARE, never out of the
  *      receiver's. Each slot has a rate (a person's own, else the firm-wide rate for
  *      the level; the owner's legacy rate card is deliberately NOT consulted). A slot
- *      with nobody in it rolls its rate up to the next person above, and stays with
- *      the company if nobody is above. Example, L5 = L6 = 5%, company 15%: a client
- *      with an L5 and an L6 leaves the company 5%; an L5 alone leaves it 10%.
+ *      with nobody in it stays with the company; it does NOT roll up to anyone above.
+ *      Example, L5 = L6 = 5%, company 15%: a client with an L5 and an L6 leaves the
+ *      company 5%; an L5 alone, or an L6 alone, leaves it 10%.
  *   5. The RESIDUAL RECEIVER (the first person at the residual level or above, so
  *      L4, else L5, ...) takes whatever is left: 100 - company(after rule 4) - lower
- *      - upper. So a client owned directly by an L5 pays that L5 90%, an L6 95%.
+ *      - upper. So a client owned directly by an L5 pays that L5 90%, and one owned
+ *      directly by an L6 also 90% (its empty L5 stays with the company).
  *
  * With no upper-level rate set (today's configuration: L5, L6, L7 = 0) rule 4 pays
  * nothing and the result is identical to the model before it existed. That is
@@ -144,16 +145,14 @@ export function residualSplit({ gross, h, lsl, period, teamMap, cfg }) {
   };
   let fundedSum = 0;
   if (receiver) {
-    let pending = 0;
     for (let l = rl + 1; l <= 6; l++) {
       const u = h[`level${l}Id`];
-      if (!u) { pending += slotRate(null, l); continue; }
-      if (u === receiver) { fundedSum += slotRate(u, l) + pending; pending = 0; continue; }
+      if (!u) continue;                                   // nobody here: this slot's share stays with the company
+      if (u === receiver) { fundedSum += slotRate(u, l); continue; }
       if (paid.has(u)) continue;
       const pct = slotRate(u, l);
       if (pct <= 0) continue;
-      const take = pct + pending;
-      pending = 0;
+      const take = pct;
       paid.add(u);
       shares.push({ uid: u, level: l, amount: round4(gross * take / 100), kind: 'upper' });
       upperSum += take; fundedSum += take;

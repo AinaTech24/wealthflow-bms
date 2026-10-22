@@ -300,15 +300,14 @@ export const calculatePayout = (
     };
     let upperSum = 0, fundedSum = 0;
     if (ru) {
-      let pending = 0;
       for (let l = rl + 1; l <= 6; l++) {
         const u = hierarchy[`level${l}Id` as keyof typeof hierarchy];
-        if (!u || !u.trim()) { pending += slotRate(undefined, l); continue; }
-        if (u === ru) { fundedSum += slotRate(u, l) + pending; pending = 0; continue; }
+        if (!u || !u.trim()) continue;                       // nobody here: this slot's share stays with the company
+        if (u === ru) { fundedSum += slotRate(u, l); continue; }
         if (paid.has(u)) continue;
         const pct = slotRate(u, l);
         if (pct <= 0) continue;
-        const take = pct + pending; pending = 0;
+        const take = pct;
         paid.add(u);
         const p = Math.round(gross * take / 100 * 10000) / 10000; levelPayouts[l] = (levelPayouts[l] || 0) + p; if (p !== 0) up[u] = (up[u] || 0) + p; upperSum += take; fundedSum += take; dist += p;
       }

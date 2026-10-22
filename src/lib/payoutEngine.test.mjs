@@ -175,13 +175,19 @@ ok(near(by(s).bm, 400), 'L4 still gets 100 - 15 - 45 = 40%');
 s = residualSplit({ gross: 1000, h: { level5Id: 'p5', level7Id: 'hq' }, period: '2026-09', teamMap: team, cfg: G({ 5: 5, 6: 5 }) });
 ok(near(by(s).p5, 900) && near(1000 - total(s), 100), 'owner at L5: 90%, company 10%');
 s = residualSplit({ gross: 1000, h: { level6Id: 'p6', level7Id: 'hq' }, period: '2026-09', teamMap: team, cfg: G({ 5: 5, 6: 5 }) });
-ok(near(by(s).p6, 950) && near(1000 - total(s), 50), 'owner at L6: 95%, company 5%');
+ok(near(by(s).p6, 900) && near(1000 - total(s), 100), 'owner at L6: 90%, company 10% (its empty L5 stays with the company)');
 s = residualSplit({ gross: 1000, h: { level4Id: 'bm', level7Id: 'hq' }, period: '2026-09', teamMap: team, cfg: G({ 5: 5, 6: 5 }) });
 ok(near(by(s).bm, 850) && near(1000 - total(s), 150), 'owner at L4: 85%, company 15%');
 
-// An empty L5 rolls its share up to the L6 above; with nobody above it stays with the company.
+// An empty slot never rolls up: its 5% stays with the company.
 s = residualSplit({ gross: 1000, h: { level3Id: 'rm', level4Id: 'bm', level6Id: 'p6' }, period: '2026-09', teamMap: team, cfg: G({ 5: 5, 6: 5 }) });
-ok(near(by(s).p6, 100) && near(by(s).bm, 600) && near(1000 - total(s), 50), 'empty L5 rolls up to L6 (5% + 5%)');
+ok(near(by(s).p6, 50) && near(by(s).bm, 600) && near(1000 - total(s), 100), 'empty L5 stays with the company: L6 gets only its own 5%');
+// The production case: an RM at 75%, nobody at L4 or L5, Finowise at L6. Finowise gets the L4 remainder (10%)
+// plus its own 5% = 15%; the company keeps 10% (the empty L5's 5% and its own L7 5%).
+const t5 = new Map([['rm75', { level: 3, customLevels: { 3: 50 } }], ['fin', { level: 6 }], ['hq', { level: 7 }]]);
+s = residualSplit({ gross: 1000, h: { level3Id: 'rm75', level6Id: 'fin', level7Id: 'hq' }, lsl: 3, period: '2026-09', teamMap: t5, cfg: G({ 5: 5, 6: 5, 7: 5 }, { leadSourcePct: 25 }) });
+const sumOf = (r, u) => r.shares.filter(x => x.uid === u).reduce((q, x) => q + x.amount, 0);
+ok(near(sumOf(s, 'rm75'), 750) && near(sumOf(s, 'fin'), 150) && near(1000 - total(s), 100), 'RM 75% + Finowise at L6 only: Finowise 15% (10% remainder + 5%), company 10%');
 s = residualSplit({ gross: 1000, h: { level3Id: 'rm', level4Id: 'bm', level5Id: 'p5' }, period: '2026-09', teamMap: team, cfg: G({ 5: 5, 6: 5 }) });
 ok(near(by(s).p5, 50) && near(by(s).bm, 600) && near(1000 - total(s), 100), 'empty L6 stays with the company');
 
