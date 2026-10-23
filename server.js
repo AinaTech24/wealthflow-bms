@@ -13,7 +13,7 @@ import { nameTokens, nameContradicts, bestNameMatches } from './src/lib/nameMatc
 import { planBranchRestructure } from './src/lib/branchRestructure.js';
 import { pickOwnerRecord } from './src/lib/folioOwner.js';
 import { scopePayoutOverview } from './src/lib/payoutScope.js';
-import { recomputePartnerLedger, PARTNER_LEDGER_DDL, PARTNER_FORMAT_DDL, estimateTax } from './src/lib/partnerPayout.js';
+import { recomputePartnerLedger, PARTNER_LEDGER_DDL, PARTNER_FORMAT_DDL, estimateTax, ensurePartnerMapData, buildManualChain, manualId } from './src/lib/partnerPayout.js';
 import { memberAsOf, residualSplit, breakdownFromShares } from './src/lib/payoutEngine.js';
 import { chainAsOf, planLevelMove, effectiveMonthOr } from './src/lib/hierarchyHistory.js';
 import { monthsToLock, mergeLocks } from './src/lib/lockPeriods.js';
@@ -1415,7 +1415,9 @@ app.all('/api/data', mutationLimiter, async (req, res) => {
           if (query.partner) { where += ' AND partner = ?'; args.push(String(query.partner)); }
           if (query.period)  { where += ' AND period = ?';  args.push(String(query.period)); }
           if (!isWriter(req)) {
-            const mine = await clientIdsForMember(req.user.id);
+            await ensurePartnerMapData(pool);
+            const [pseudoRows] = await pool.query('SELECT partner, clientCode FROM partner_client_map WHERE data LIKE ?', ['%"' + req.user.id + '"%']);
+            const mine = [...(await clientIdsForMember(req.user.id)), ...pseudoRows.map(m => manualId(m.partner, m.clientCode))];
             if (!mine.length) {
               res.set('Cache-Control', 'no-store');
               return res.json(action === 'partner_rows' ? [] : { periods: [], segments: [], totals: null });
@@ -1495,6 +1497,9 @@ app.all('/api/data', mutationLimiter, async (req, res) => {
             let d = {}; try { d = JSON.parse(c.data || '{}'); } catch {}
             hier.set(c.id, { name: c.name, hierarchy: d.hierarchy || {}, hierarchyHistory: d.hierarchyHistory });
           }
+          await ensurePartnerMapData(pool);
+          const [manRows] = await pool.query("SELECT clientCode, label, data FROM partner_client_map WHERE partner = ? AND data IS NOT NULL AND data <> ''", [partner]);
+          for (const m of manRows) { try { hier.set(manualId(partner, m.clientCode), { name: m.label || m.clientCode, hierarchy: JSON.parse(m.data).hierarchy || {}, hierarchyHistory: undefined }); } catch { /* skip */ } }
           const [teamRows] = await pool.query('SELECT id, name, level FROM team');
           const team = new Map(teamRows.map(t => [t.id, t]));
           const nameOf = (id) => (id ? (team.get(id)?.name || id) : '');
@@ -1543,6 +1548,7 @@ app.all('/api/data', mutationLimiter, async (req, res) => {
       if (action === 'partner_codes') {
         try {
           if (!isWriter(req)) return res.status(403).json({ error: 'Forbidden' });
+          await ensurePartnerMapData(pool);
           const pPer = String(query.period || '').slice(0, 7), pPart = String(query.partner || '').trim().toUpperCase();
           // Codes with statement rows, then the codes the partner's client sheet added that
           // have not traded yet (rows_ = 0), so the whole sheet can be attached in one place.
@@ -1552,13 +1558,13 @@ app.all('/api/data', mutationLimiter, async (req, res) => {
                       COUNT(*) rows_, MIN(b.period) firstPeriod, MAX(b.period) lastPeriod,
                       ROUND(SUM(b.ourShare),2) ourShare,
                       MAX(b.mappedClientId) mappedClientId,
-                      MAX(m.label) label
+                      MAX(m.label) label, MAX(m.data) mdata
                FROM partner_brokerage b
                LEFT JOIN partner_client_map m ON m.partner = b.partner AND m.clientCode = b.clientCode
                WHERE (? = '' OR b.period = ?) AND (? = '' OR b.partner = ?)
                GROUP BY b.partner, b.clientCode
                UNION ALL
-               SELECT m2.partner, m2.clientCode, 0, NULL, NULL, 0, m2.clientId, m2.label
+               SELECT m2.partner, m2.clientCode, 0, NULL, NULL, 0, m2.clientId, m2.label, m2.data
                FROM partner_client_map m2
                WHERE ? = '' AND (? = '' OR m2.partner = ?) AND NOT EXISTS (SELECT 1 FROM partner_brokerage b2 WHERE b2.partner = m2.partner AND b2.clientCode = m2.clientCode)
              ) t ORDER BY ourShare DESC, label, clientCode`, [pPer, pPer, pPart, pPart, pPer, pPart, pPart]);
@@ -1567,7 +1573,13 @@ app.all('/api/data', mutationLimiter, async (req, res) => {
           const monthsOf = new Map();
           for (const m of mrows) { if (!monthsOf.has(m.clientCode)) monthsOf.set(m.clientCode, []); monthsOf.get(m.clientCode).push({ period: m.period, ourShare: Number(m.amt) || 0 }); }
           res.set('Cache-Control', 'no-store');
-          return res.json(rows.map(r => ({ ...r, months: monthsOf.get(r.clientCode) || [] })));
+          const [tm] = await pool.query('SELECT id, name, level FROM team');
+          const tname = new Map(tm.map(t => [t.id, t]));
+          return res.json(rows.map(({ mdata, ...r }) => {
+            let rmbm = null;
+            if (mdata) { try { const d = JSON.parse(mdata); rmbm = { rmId: d.rmId || null, bmId: d.bmId || null, rmName: tname.get(d.rmId)?.name || '', bmName: tname.get(d.bmId)?.name || tname.get(d.hierarchy?.level4Id)?.name || '', chain: d.hierarchy || {} }; } catch { /* ignore */ } }
+            return { ...r, rmbm, months: monthsOf.get(r.clientCode) || [] };
+          }));
         } catch (e) {
           console.error('[partner_codes]', e);
           return res.status(500).json({ error: 'Failed to read partner client codes' });
@@ -1606,7 +1618,7 @@ app.all('/api/data', mutationLimiter, async (req, res) => {
                FROM partner_brokerage b WHERE b.partner = ? AND (b.mappedClientId IS NULL OR b.mappedClientId = '') GROUP BY b.period`, [partner]);
           // Clients that are attached but have nobody above them: their money reaches no one.
           const [mappedGroups] = await pool.query(
-            `SELECT b.mappedClientId cid, MAX(c.name) cname, ROUND(SUM(b.ourShare),2) amt FROM partner_brokerage b LEFT JOIN clients c ON c.id = b.mappedClientId
+            `SELECT b.mappedClientId cid, COALESCE(MAX(c.name), MAX(pm.label), b.mappedClientId) cname, ROUND(SUM(b.ourShare),2) amt FROM partner_brokerage b LEFT JOIN clients c ON c.id = b.mappedClientId LEFT JOIN partner_client_map pm ON pm.partner = b.partner AND pm.clientCode = b.clientCode
               WHERE b.partner = ? AND b.mappedClientId IS NOT NULL AND b.mappedClientId <> '' GROUP BY b.mappedClientId`, [partner]);
           const [withPay] = await pool.query('SELECT DISTINCT clientId FROM partner_payout_ledger WHERE partner = ?', [partner]);
           const paidClients = new Set(withPay.map(r => r.clientId));
@@ -2805,7 +2817,7 @@ app.all('/api/data', mutationLimiter, async (req, res) => {
           if (!/^[A-Z0-9]{2,20}$/.test(partner)) return res.status(400).json({ error: 'The partner code must be 2-20 letters or digits.' });
           const label = String(payload?.label || partner).trim().slice(0, 80);
           const f = payload?.format || {};
-          const data = { clientCol: String(f.clientCol || '').slice(0, 120), amountCol: String(f.amountCol || '').slice(0, 120), monthCol: String(f.monthCol || '').slice(0, 120) };
+          const data = { clientCol: String(f.clientCol || '').slice(0, 120), amountCol: String(f.amountCol || '').slice(0, 120), monthCol: String(f.monthCol || '').slice(0, 120), panCol: String(f.panCol || '').slice(0, 120) };
           if (!data.clientCol || !data.amountCol) return res.status(400).json({ error: 'A client column and an amount column are required.' });
           await pool.query(PARTNER_FORMAT_DDL);
           await pool.query('INSERT INTO partner_formats (partner, label, data) VALUES (?,?,?) ON DUPLICATE KEY UPDATE label = VALUES(label), data = VALUES(data)', [partner, label, JSON.stringify(data)]);
@@ -2842,12 +2854,14 @@ app.all('/api/data', mutationLimiter, async (req, res) => {
           if (!/^[A-Z0-9]{2,20}$/.test(partner)) return res.status(400).json({ error: 'The partner code must be 2-20 letters or digits.' });
           if (!rows.length) return res.status(400).json({ error: 'No rows to import' });
 
+          await ensurePartnerMapData(pool);
           const batchId = `PB_${partner}_${Date.now()}`;
           // The same partner and month imported again REPLACES the earlier rows (a corrected statement,
           // or the real statement after a derived one) instead of stacking a second copy on top.
           const filePeriods = [...new Set(rows.map(r => String(r.period || '').slice(0, 7)).filter(p => /^[0-9]{4}-[0-9]{2}$/.test(p)))];
           const conn = await pool.getConnection();
-          let replaced = 0, written = 0;
+          let replaced = 0, written = 0, panMatched = 0;
+          const panAmbiguous = [], panUnknown = [];
           try {
           await conn.beginTransaction();
           if (filePeriods.length) {
@@ -2911,6 +2925,27 @@ app.all('/api/data', mutationLimiter, async (req, res) => {
                  partnerShare = VALUES(partnerShare), data = VALUES(data)`, params);
             written += chunk.length;
           }
+          // A PAN in the file is the surest way to find the client: every code not attached yet goes to the one client holding that PAN.
+          const panOfCode = new Map();
+          for (const r of rows) {
+            const code = String(r.clientCode || '').trim(); const pan = String(r.pan || r.extra?.pan || '').trim().toUpperCase();
+            if (code && /^[A-Z]{5}[0-9]{4}[A-Z]$/.test(pan) && !codeToClient.get(code) && !panOfCode.has(code)) panOfCode.set(code, pan);
+          }
+          if (panOfCode.size) {
+            const [cl] = await conn.query('SELECT id, name, pan, data FROM clients WHERE UPPER(pan) IN (?)', [[...new Set(panOfCode.values())]]);
+            const byPan = new Map();
+            for (const c of cl) { const k = String(c.pan).toUpperCase(); if (!byPan.has(k)) byPan.set(k, []); byPan.get(k).push(c); }
+            const sig = (c) => { try { return JSON.stringify(JSON.parse(c.data || '{}').hierarchy || {}); } catch { return ''; } };
+            for (const [code, pan] of panOfCode) {
+              const hits = byPan.get(pan) || [];
+              if (!hits.length) { panUnknown.push(code); continue; }
+              // Two client records with one PAN are fine when they sit under the same RM/BM chain; otherwise it is a person's call.
+              if (hits.length > 1 && !hits.every(c => sig(c) === sig(hits[0]))) { panAmbiguous.push(code); continue; }
+              await conn.query('INSERT INTO partner_client_map (partner, clientCode, clientId, label, data) VALUES (?,?,?,?,NULL) ON DUPLICATE KEY UPDATE clientId = VALUES(clientId), label = VALUES(label), data = NULL', [partner, code, hits[0].id, String(hits[0].name || '').slice(0, 255)]);
+              await conn.query('UPDATE partner_brokerage SET mappedClientId = ? WHERE partner = ? AND clientCode = ?', [hits[0].id, partner, code]);
+              panMatched++;
+            }
+          }
           await conn.commit();
           } catch (txe) { await conn.rollback(); throw txe; } finally { conn.release(); }
           const [[after]] = await pool.query(
@@ -2922,7 +2957,7 @@ app.all('/api/data', mutationLimiter, async (req, res) => {
             [req.user?.id || '', req.user?.name || '', 'partner_import',
              `${partner}: ${written} row(s) from ${fileName || 'upload'} — our share Rs ${after.ourShare}`]);
           try { await recomputePartnerLedger(pool, { partner }); invalidateSummaryCache(); payoutOverviewCache = null; } catch (pe) { console.error('[partner_import] ledger:', pe.message); }
-          return res.json({ success: true, batchId, written, replaced, ...after });
+          return res.json({ success: true, batchId, written, replaced, panMatched, panAmbiguous: panAmbiguous.length, panUnknown: panUnknown.length, ...after });
         } catch (e) {
           console.error('[partner_import]', e);
           return res.status(500).json({ error: e.message });
@@ -2936,15 +2971,25 @@ app.all('/api/data', mutationLimiter, async (req, res) => {
           const pairs = Array.isArray(payload?.pairs) ? payload.pairs : [];
           if (!partner || !pairs.length) return res.status(400).json({ error: 'partner and pairs are required' });
           let mapped = 0, rowsTouched = 0;
+          await ensurePartnerMapData(pool);
+          let teamMap = null;
           for (const p of pairs) {
             const code = String(p.clientCode || '').trim();
             if (!code) continue;
-            const clientId = p.clientId ? String(p.clientId) : null;
+            let clientId = p.clientId ? String(p.clientId) : null, mdata = null;
+            if (!clientId && (p.rmId || p.bmId)) {
+              // No WealthFlow client behind this code: attach it straight to the RM and BM chosen.
+              if (!teamMap) { const [tr] = await pool.query('SELECT id, level, parentId FROM team'); teamMap = new Map(tr.map(t => [t.id, { id: t.id, level: t.level, parentId: t.parentId }])); }
+              const h = buildManualChain({ rmId: p.rmId ? String(p.rmId) : null, bmId: p.bmId ? String(p.bmId) : null }, teamMap);
+              if (!Object.values(h).some(Boolean)) return res.status(400).json({ error: `The RM/BM chosen for ${code} has no level set.` });
+              clientId = manualId(partner, code);
+              mdata = JSON.stringify({ hierarchy: h, rmId: p.rmId || null, bmId: p.bmId || null });
+            }
             await pool.query(
-              `INSERT INTO partner_client_map (partner, clientCode, clientId, label)
-               VALUES (?,?,?,?)
-               ON DUPLICATE KEY UPDATE clientId = VALUES(clientId), label = VALUES(label)`,
-              [partner, code, clientId, p.label ? String(p.label).slice(0, 255) : null]);
+              `INSERT INTO partner_client_map (partner, clientCode, clientId, label, data)
+               VALUES (?,?,?,?,?)
+               ON DUPLICATE KEY UPDATE clientId = VALUES(clientId), label = VALUES(label), data = VALUES(data)`,
+              [partner, code, clientId, p.label ? String(p.label).slice(0, 255) : null, mdata]);
             const [r] = await pool.query(
               `UPDATE partner_brokerage SET mappedClientId = ? WHERE partner = ? AND clientCode = ?`,
               [clientId, partner, code]);

@@ -49,6 +49,9 @@ function monthOf(raw: string): string | null {
   const d = parseTradeDate(s);
   return d ? d.slice(0, 7) : null;
 }
+// A PAN column ("PAN", "PAN No", "Client PAN"…) lets the server find the client by PAN instead of by name.
+const panIndex = (header: string[]) => header.findIndex(h => /(^|[^a-z])pan([^a-z]|$)/i.test(String(h || '')));
+const cleanPan = (v: any) => { const x = String(v ?? '').trim().toUpperCase(); return /^[A-Z]{5}[0-9]{4}[A-Z]$/.test(x) ? x : ''; };
 const lastDayOf = (period: string) => { const [y, mo] = period.split('-').map(Number); return `${period}-${String(new Date(y, mo, 0).getDate()).padStart(2, '0')}`; };
 
 // Volt Money: one line per customer per month, upfront + trail, and the invoice total the firm raises.
@@ -56,6 +59,7 @@ const lastDayOf = (period: string) => { const [y, mo] = period.split('-').map(Nu
 function parseVolt(grid: string[][], header: string[]) {
   const at = (n: string) => header.findIndex(h => h.toLowerCase() === n.toLowerCase());
   const iM = at('Month'), iN = at('Customer name'), iU = at('Upfront amount'), iT = at('Trail amount'), iTot = at('Total invoice amount');
+  const iP = panIndex(header);
   const rows: any[] = []; let skipped = 0;
   for (const r of grid.slice(1)) {
     if (!r || r.every(c => String(c ?? '').trim() === '')) continue;
@@ -69,7 +73,7 @@ function parseVolt(grid: string[][], header: string[]) {
       rows.push({
         clientCode: name.toUpperCase(), tradeDate: period ? lastDayOf(period) : '', period, segment: 'Volt Money', tradeCategory: cat,
         totalBrokerage: amt, ourShare: amt, partnerShare: 0, product: '', parentProfile: '',
-        extra: { clientName: name, 'Customer name': name },
+        pan: iP >= 0 ? cleanPan(r[iP]) : '', extra: { clientName: name, 'Customer name': name, ...(iP >= 0 && cleanPan(r[iP]) ? { pan: cleanPan(r[iP]) } : {}) },
       });
     }
   }
@@ -87,6 +91,7 @@ function customToFormat(cf: CustomFormat, fixedMonth = ''): PartnerFormat {
     extra: [],
     parse: (grid, header) => {
       const iC = header.indexOf(cf.clientCol), iA = header.indexOf(cf.amountCol), iM = cf.monthCol ? header.indexOf(cf.monthCol) : -1;
+      const iP = panIndex(header);
       const rows: any[] = []; let skipped = 0;
       for (const r of grid.slice(1)) {
         if (!r || r.every(c => String(c ?? '').trim() === '')) continue;
@@ -97,7 +102,8 @@ function customToFormat(cf: CustomFormat, fixedMonth = ''): PartnerFormat {
         const period = fixedMonth || (iM >= 0 ? monthOf(String(r[iM] ?? '')) || '' : '');
         rows.push({
           clientCode: name.toUpperCase(), tradeDate: period ? lastDayOf(period) : '', period, segment: cf.label, tradeCategory: 'EARNING',
-          totalBrokerage: amt, ourShare: amt, partnerShare: 0, product: '', parentProfile: '', extra: { clientName: name },
+          totalBrokerage: amt, ourShare: amt, partnerShare: 0, product: '', parentProfile: '', pan: iP >= 0 ? cleanPan(r[iP]) : '',
+          extra: { clientName: name, ...(iP >= 0 && cleanPan(r[iP]) ? { pan: cleanPan(r[iP]) } : {}) },
         });
       }
       return { rows, skipped };
@@ -170,10 +176,12 @@ interface CodeRow {
   firstPeriod: string | null; lastPeriod: string | null; ourShare: number;
   mappedClientId: string | null; label: string | null;
   months?: { period: string; ourShare: number }[];
+  /** Set when the code is attached straight to an RM and BM rather than to a client. */
+  rmbm?: { rmId: string | null; bmId: string | null; rmName: string; bmName: string } | null;
 }
 
 export const PartnerBrokerage: React.FC<Props> = ({ currentUser }) => {
-  const { clients, globalConfig, updateConfig } = useData();
+  const { clients, team, globalConfig, updateConfig } = useData();
   const { showToast } = useToast();
   const isAdmin = currentUser.role === Role.ADMIN;
   const isFinance = currentUser.role === Role.FINANCE;
@@ -365,6 +373,7 @@ export const PartnerBrokerage: React.FC<Props> = ({ currentUser }) => {
         fmt = made;
       }
       const idx = (name: string) => header.indexOf(name);
+      const panIdx = panIndex(header);
       const cell = (r: string[], name: string) => {
         const i = idx(name);
         return i >= 0 ? String(r[i] ?? '').trim() : '';
@@ -380,7 +389,10 @@ export const PartnerBrokerage: React.FC<Props> = ({ currentUser }) => {
         if (!tradeDate || !clientCode) { skipped++; continue; }
         const extra: Record<string, string> = {};
         for (const e of fmt.extra) { const v = cell(r, e); if (v) extra[e] = v; }
+        const pv = panIdx >= 0 ? cleanPan(r[panIdx]) : '';
+        if (pv) extra['pan'] = pv;
         out.push({
+          pan: pv,
           clientCode,
           tradeDate,
           period: tradeDate.slice(0, 7),
@@ -417,6 +429,8 @@ export const PartnerBrokerage: React.FC<Props> = ({ currentUser }) => {
         `${fmt!.label}: ${sj.written} row${sj.written !== 1 ? 's' : ''} imported` +
         (skipped ? `, ${skipped} skipped (no month/date or client)` : '') +
         (sj.replaced ? `. Replaced ${sj.replaced} earlier row${sj.replaced !== 1 ? 's' : ''} for the same month` : '') +
+        (sj.panMatched ? `. ${sj.panMatched} client code${sj.panMatched !== 1 ? 's' : ''} attached by PAN` : '') +
+        (sj.panAmbiguous ? `. ${sj.panAmbiguous} PAN${sj.panAmbiguous !== 1 ? 's match' : ' matches'} more than one client — attach by hand` : '') +
         `. ${sj.unmapped} row${sj.unmapped !== 1 ? 's' : ''} await client mapping.`,
         'success');
       setPartnerList(prev => [...new Set([...prev, fmt!.code])]);
@@ -430,6 +444,29 @@ export const PartnerBrokerage: React.FC<Props> = ({ currentUser }) => {
       setUploading(false);
       if (fileRef.current) fileRef.current.value = '';
     }
+  };
+
+  // Attach a code that has no WealthFlow client straight to the RM and BM who handle that person.
+  const people = useMemo(() => team.filter(t => t.role !== Role.ADMIN && t.role !== Role.FINANCE), [team]);
+  const rmOptions = useMemo(() => people.filter(t => t.level >= 1 && t.level <= 3).sort((a, b) => a.name.localeCompare(b.name)), [people]);
+  const bmOptions = useMemo(() => people.filter(t => t.level >= 4 && t.level <= 6).sort((a, b) => a.name.localeCompare(b.name)), [people]);
+  const [rmbmPick, setRmbmPick] = useState<Record<string, { rm: string; bm: string }>>({});
+  const [attachMode, setAttachMode] = useState<Record<string, 'rmbm' | 'client' | 'view'>>({});
+  // The BM above an RM, found from the reporting line, so picking the RM usually fills the BM in.
+  const bmAbove = (rmId: string) => {
+    let x = team.find(t => t.id === rmId), guard = 0;
+    while (x && x.parentId && guard++ < 12) { const par = team.find(t => t.id === x!.parentId); if (!par) break; if (par.level >= 4) return par.id; x = par; }
+    return '';
+  };
+  const saveRmBm = async (clientCode: string, label: string | null) => {
+    const v = rmbmPick[clientCode]; if (!v || (!v.rm && !v.bm)) { showToast('Choose the RM and the BM.', 'warning'); return; }
+    const res = await authFetch('/api/data', { method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ action: 'partner_map', payload: { partner, pairs: [{ clientCode, rmId: v.rm || null, bmId: v.bm || null, label }] } }) });
+    const j = await res.json();
+    if (!res.ok) { showToast(j?.error || 'Could not save.', 'error'); return; }
+    showToast(`${clientCode} → ${team.find(t => t.id === v.rm)?.name || '—'} / ${team.find(t => t.id === (v.bm || bmAbove(v.rm)))?.name || '—'} · ${j.rowsTouched} row${j.rowsTouched !== 1 ? 's' : ''} now reach them`, 'success');
+    setRmbmPick(pk => { const n = { ...pk }; delete n[clientCode]; return n; });
+    await load();
   };
 
   const saveMapping = async (clientCode: string, clientId: string) => {
@@ -647,7 +684,7 @@ export const PartnerBrokerage: React.FC<Props> = ({ currentUser }) => {
               {unmappedCount} client{unmappedCount !== 1 ? 's are' : ' is'} still missing mapping — {partnerName} money for {unmappedCount !== 1 ? 'them' : 'this client'} reaches no RM or BM yet.
             </p>
             <p className="text-[11px] text-red-700/90 dark:text-red-400/90 mt-1 max-w-3xl">
-              Attach each one to a client in <b>Client codes</b> below. The moment you do, the amount shows under that client&rsquo;s RM and BM (their dashboard and the Payouts page) for every month it was earned.
+              Files that carry a PAN attach by PAN on their own. For the rest, pick the RM and BM in <b>Client codes</b> below. The moment you do, the amount shows under that client&rsquo;s RM and BM (their dashboard and the Payouts page) for every month it was earned.
             </p>
             <ul className="mt-2 text-[11px] text-red-800 dark:text-red-300 space-y-0.5">
               {codes.filter(c => !c.mappedClientId && c.rows_ > 0).sort((a, b) => b.ourShare - a.ourShare).slice(0, 8).map(c => (
@@ -1021,35 +1058,52 @@ export const PartnerBrokerage: React.FC<Props> = ({ currentUser }) => {
                         <Td mono>{mo ? mo.period : 'no trade yet'}</Td>
                         <Td mono right bold>₹{Number(mo ? mo.ourShare : c.ourShare).toLocaleString('en-IN', { maximumFractionDigits: 2 })}</Td>
                         <td className="py-2 pr-4">
-                          {mi === 0 ? (<>
-                          <div className="flex items-center gap-2">
-                            <select
-                              id={`map-${c.clientCode}`}
-                              value={pick[c.clientCode] ?? c.mappedClientId ?? suggestionFor(c.label || c.clientCode)}
-                              onChange={e => setPick(p => ({ ...p, [c.clientCode]: e.target.value }))}
-                              className="text-xs rounded-lg border border-slate-200 dark:border-slate-600 dark:bg-slate-900 dark:text-slate-100 px-2 py-1.5 max-w-[260px]"
-                            >
-                              <option value="">— not attached —</option>
-                              {c.mappedClientId && !clients.some(cl => cl.id === c.mappedClientId) && (
-                                <option value={c.mappedClientId}>{c.label || c.mappedClientId} (attached)</option>
-                              )}
-                              {clients.map(cl => (
-                                <option key={cl.id} value={cl.id}>{cl.name}{cl.pan ? ` · ${cl.pan}` : ''}</option>
-                              ))}
-                            </select>
-                            {(pick[c.clientCode] ?? c.mappedClientId ?? suggestionFor(c.label || c.clientCode)) !== (c.mappedClientId ?? '') && (
-                              <button
-                                onClick={() => saveMapping(c.clientCode, pick[c.clientCode] ?? suggestionFor(c.label || c.clientCode))}
-                                className="px-2.5 py-1.5 rounded-lg bg-emerald-600 text-white text-[10px] font-black uppercase tracking-widest hover:bg-emerald-700 transition flex items-center gap-1"
-                              >
-                                <Check className="w-3 h-3" /> Save
-                              </button>
-                            )}
-                          </div>
-                          {!c.mappedClientId && pick[c.clientCode] === undefined && suggestionFor(c.label || c.clientCode) && !suggestionFor.exact(c.label || c.clientCode) && (
-                            <div className="text-[10px] text-amber-600 mt-0.5">Closest name match — check it is the same person, then Save.</div>
-                          )}
-                          </>) : <span className="text-[11px] text-slate-400">same client</span>}
+                          {mi === 0 ? (() => {
+                            const isManual = !!c.rmbm;
+                            const attached = c.mappedClientId && !isManual ? clients.find(cl => cl.id === c.mappedClientId) : null;
+                            const mode = attachMode[c.clientCode] ?? (c.mappedClientId ? 'view' : 'rmbm');
+                            const sel = rmbmPick[c.clientCode] ?? { rm: c.rmbm?.rmId || '', bm: c.rmbm?.bmId || '' };
+                            const sug = suggestionFor(c.label || c.clientCode);
+                            const selCls = 'text-xs rounded-lg border border-slate-200 dark:border-slate-600 dark:bg-slate-900 dark:text-slate-100 px-2 py-1.5 max-w-[210px]';
+                            if (mode === 'view') return (
+                              <div className="text-xs">
+                                <span className="text-emerald-700 dark:text-emerald-400 font-bold">✓ {c.rmbm ? `RM ${c.rmbm.rmName || '—'} · BM ${c.rmbm.bmName || '—'}` : `Client: ${attached?.name || c.label || c.mappedClientId}`}</span>
+                                <button onClick={() => setAttachMode(m => ({ ...m, [c.clientCode]: 'rmbm' }))} className="ml-2 text-[10px] font-black uppercase tracking-widest text-slate-500 hover:text-blue-600">Change</button>
+                              </div>);
+                            if (mode === 'client') return (
+                              <div>
+                                <div className="flex items-center gap-2">
+                                  <select id={`map-${c.clientCode}`} value={pick[c.clientCode] ?? c.mappedClientId ?? sug} onChange={e => setPick(pk => ({ ...pk, [c.clientCode]: e.target.value }))} className={selCls + ' max-w-[260px]'}>
+                                    <option value="">— not attached —</option>
+                                    {clients.map(cl => <option key={cl.id} value={cl.id}>{cl.name}{cl.pan ? ` · ${cl.pan}` : ''}</option>)}
+                                  </select>
+                                  {(pick[c.clientCode] ?? c.mappedClientId ?? sug) !== (c.mappedClientId ?? '') && (
+                                    <button onClick={() => saveMapping(c.clientCode, pick[c.clientCode] ?? sug)} className="px-2.5 py-1.5 rounded-lg bg-emerald-600 text-white text-[10px] font-black uppercase tracking-widest hover:bg-emerald-700 transition flex items-center gap-1"><Check className="w-3 h-3" /> Save</button>
+                                  )}
+                                </div>
+                                <button onClick={() => setAttachMode(m => ({ ...m, [c.clientCode]: 'rmbm' }))} className="mt-1 text-[10px] font-black uppercase tracking-widest text-slate-500 hover:text-blue-600">← pick RM / BM instead</button>
+                              </div>);
+                            return (
+                              <div>
+                                <div className="flex items-center gap-2 flex-wrap">
+                                  <select id={`map-${c.clientCode}`} aria-label="RM" value={sel.rm} onChange={e => setRmbmPick(pk => ({ ...pk, [c.clientCode]: { rm: e.target.value, bm: pk[c.clientCode]?.bm || bmAbove(e.target.value) } }))} className={selCls}>
+                                    <option value="">RM — choose</option>
+                                    {rmOptions.map(t => <option key={t.id} value={t.id}>{t.name} · L{t.level}</option>)}
+                                  </select>
+                                  <select aria-label="BM" value={sel.bm} onChange={e => setRmbmPick(pk => ({ ...pk, [c.clientCode]: { rm: pk[c.clientCode]?.rm ?? sel.rm, bm: e.target.value } }))} className={selCls}>
+                                    <option value="">BM — choose</option>
+                                    {bmOptions.map(t => <option key={t.id} value={t.id}>{t.name} · L{t.level}</option>)}
+                                  </select>
+                                  {(sel.rm || sel.bm) && (sel.rm !== (c.rmbm?.rmId || '') || sel.bm !== (c.rmbm?.bmId || '')) && (
+                                    <button onClick={() => { if (!rmbmPick[c.clientCode]) setRmbmPick(pk => ({ ...pk, [c.clientCode]: sel })); setTimeout(() => saveRmBm(c.clientCode, c.label || c.clientCode), 0); }} className="px-2.5 py-1.5 rounded-lg bg-emerald-600 text-white text-[10px] font-black uppercase tracking-widest hover:bg-emerald-700 transition flex items-center gap-1"><Check className="w-3 h-3" /> Save</button>
+                                  )}
+                                </div>
+                                <div className="mt-1 flex items-center gap-3 flex-wrap text-[10px]">
+                                  {sug && !c.mappedClientId && <button onClick={() => saveMapping(c.clientCode, sug)} className="font-black uppercase tracking-widest text-amber-600 hover:text-amber-700">Looks like client {clients.find(cl => cl.id === sug)?.name} — attach</button>}
+                                  <button onClick={() => setAttachMode(m => ({ ...m, [c.clientCode]: 'client' }))} className="font-black uppercase tracking-widest text-slate-500 hover:text-blue-600">or attach to a client</button>
+                                </div>
+                              </div>);
+                          })() : <span className="text-[11px] text-slate-400">same client</span>}
                         </td>
                       </tr>
                     ))}
@@ -1071,11 +1125,12 @@ export const PartnerBrokerage: React.FC<Props> = ({ currentUser }) => {
                 <tbody>
                   {rows.slice(0, 500).map(r => {
                     const client = r.mappedClientId ? clients.find(c => c.id === r.mappedClientId) : null;
+                    const viaRmBm = String(r.mappedClientId || '').startsWith('RMBM:');
                     return (
                       <tr key={r.id} className="border-b border-slate-100 dark:border-slate-700/50">
                         <Td mono>{String(r.tradeDate || '').slice(0, 10)}</Td>
                         <Td mono>{r.clientCode}</Td>
-                        <Td>{client?.name || <span className="text-red-500 text-xs font-bold">unattached</span>}</Td>
+                        <Td>{client?.name || (viaRmBm ? <span className="text-emerald-700 dark:text-emerald-400 text-xs font-bold">via RM / BM</span> : <span className="text-red-500 text-xs font-bold">unattached</span>)}</Td>
                         <Td mono>{String(r.segment || '').trim()}</Td>
                         <Td mono>{r.tradeCategory}</Td>
                         <Td mono right>₹{Number(r.totalBrokerage).toLocaleString('en-IN')}</Td>

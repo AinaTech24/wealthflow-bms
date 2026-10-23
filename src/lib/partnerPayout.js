@@ -23,6 +23,50 @@ export const PARTNER_LEDGER_DDL =
   'userId VARCHAR(100) NOT NULL, kind VARCHAR(12) NOT NULL, amount DECIMAL(15,4) NOT NULL, level INT, ' +
   'PRIMARY KEY (partner, period, clientId, userId, kind), INDEX idx_ppl_user (userId, period), INDEX idx_ppl_period (partner, period))';
 
+// A partner client who is not in WealthFlow can be attached straight to an RM and a BM. Its statement rows then carry a
+// pseudo client id (RMBM:<partner>:<code>) and the chain is stored on partner_client_map.data.
+export const MANUAL_PREFIX = 'RMBM:';
+export const manualId = (partner, code) => `${MANUAL_PREFIX}${String(partner).toUpperCase()}:${code}`;
+export const isManualId = (id) => typeof id === 'string' && id.startsWith(MANUAL_PREFIX);
+export const parseManualId = (id) => { const rest = id.slice(MANUAL_PREFIX.length); const i = rest.indexOf(':'); return { partner: rest.slice(0, i), code: rest.slice(i + 1) }; };
+
+/**
+ * The level chain for a client attached by RM and BM: the RM sits in their own level slot, the BM in theirs (found from
+ * the RM's reporting line when not given), and everyone above the BM sits in the slot of their own level.
+ * `team` is a Map of id -> { level, parentId }.
+ */
+export function buildManualChain({ rmId, bmId }, team) {
+  const h = {};
+  const put = (id) => {
+    const t = team.get(id); if (!t) return false;
+    const lvl = Math.min(7, Math.max(1, Number(t.level) || 0)); if (!Number(t.level)) return false;
+    if (!h[`level${lvl}Id`]) h[`level${lvl}Id`] = id;
+    return true;
+  };
+  const upFrom = (id, wantBm) => {
+    let x = team.get(id), guard = 0;
+    while (x && x.parentId && guard++ < 12) {
+      const par = team.get(x.parentId); if (!par) break;
+      if (wantBm && Number(par.level) >= 4) return par.id;
+      if (!wantBm) put(par.id);
+      x = par;
+    }
+    return null;
+  };
+  if (rmId) put(rmId);
+  let bm = bmId || null;
+  if (!bm && rmId && !(Number(team.get(rmId)?.level) >= 4)) bm = upFrom(rmId, true);
+  if (bm) put(bm);
+  const top = bm || rmId;
+  if (top) upFrom(top, false);
+  return h;
+}
+
+/** partner_client_map.data holds the RM/BM chain; older databases need the column added once. */
+export async function ensurePartnerMapData(pool) {
+  try { await pool.query('ALTER TABLE partner_client_map ADD COLUMN data TEXT'); } catch (e) { if (!/Duplicate column/i.test(String(e.message))) throw e; }
+}
+
 /** Pure: split one client's partner share for one month. Same function as the fund. */
 export function partnerShares({ ours, h, lsl, period, teamMap, cfg }) {
   return residualSplit({ gross: ours, h, lsl, period, teamMap, cfg }).shares.filter(s => s.amount !== 0);
@@ -34,6 +78,7 @@ export function partnerShares({ ours, h, lsl, period, teamMap, cfg }) {
  */
 export async function recomputePartnerLedger(pool, { partner } = {}) {
   await pool.query(PARTNER_LEDGER_DDL);
+  await ensurePartnerMapData(pool);
   const [[cfgRow]] = await pool.query("SELECT data FROM config WHERE id IN ('global_config','global') ORDER BY id = 'global_config' DESC LIMIT 1");
   let cfg = {}; try { cfg = JSON.parse(cfgRow?.data || '{}'); } catch { /* keep {} */ }
   const ecfg = {
@@ -49,6 +94,9 @@ export async function recomputePartnerLedger(pool, { partner } = {}) {
     clients.set(c.id, { hierarchy: d.hierarchy || {}, hierarchyHistory: d.hierarchyHistory, leadSourceLevel: d.leadSourceLevel ? Number(d.leadSourceLevel) : undefined });
   }
   const [teamRows] = await pool.query('SELECT id, level, data FROM team');
+  const [manualRows] = await pool.query("SELECT partner, clientCode, data FROM partner_client_map WHERE data IS NOT NULL AND data <> ''");
+  const manual = new Map();
+  for (const m of manualRows) { try { manual.set(manualId(m.partner, m.clientCode), { hierarchy: JSON.parse(m.data).hierarchy || {}, hierarchyHistory: undefined, leadSourceLevel: undefined }); } catch { /* skip */ } }
   const teamMap = new Map();
   for (const t of teamRows) {
     let d = {}; try { d = JSON.parse(t.data || '{}'); } catch { /* keep {} */ }
@@ -83,7 +131,7 @@ export async function recomputePartnerLedger(pool, { partner } = {}) {
     // attached, or its RM/BM set, only afterwards) is added, so late mapping still reaches its RM/BM.
     if (frozenSet.has(mk)) { if (hasRows.has(mk + '|' + g.cid)) continue; }
     else if (!refreshSet.has(mk)) continue;
-    const c = clients.get(g.cid); if (!c) continue;
+    const c = (isManualId(g.cid) ? manual.get(g.cid) : clients.get(g.cid)); if (!c) continue;
     const ch = chainAsOf(c, g.period); if (!ch.hierarchy || !Object.values(ch.hierarchy).some(Boolean)) continue;
     for (const s of partnerShares({ ours: Number(g.ours) || 0, h: ch.hierarchy, lsl: ch.leadSourceLevel, period: g.period, teamMap, cfg: ecfg })) {
       insert.push([g.partner, g.period, g.cid, s.uid, s.kind, s.amount, s.level]);
