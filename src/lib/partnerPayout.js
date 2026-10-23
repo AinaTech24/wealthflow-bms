@@ -63,6 +63,8 @@ export async function recomputePartnerLedger(pool, { partner } = {}) {
   const [existing] = await pool.query(
     `SELECT partner, period, COUNT(*) n FROM partner_payout_ledger${partner ? ' WHERE partner = ?' : ''} GROUP BY partner, period`, pArg);
   const stored = new Map(existing.map(r => [r.partner + '|' + r.period, Number(r.n)]));
+  const [haveClients] = await pool.query(`SELECT DISTINCT partner, period, clientId FROM partner_payout_ledger${partner ? ' WHERE partner = ?' : ''}`, pArg);
+  const hasRows = new Set(haveClients.map(r => r.partner + '|' + r.period + '|' + r.clientId));
 
   const keys = new Map();
   for (const g of groups) keys.set(g.partner + '|' + g.period, [g.partner, g.period]);
@@ -74,8 +76,13 @@ export async function recomputePartnerLedger(pool, { partner } = {}) {
     refreshed.push([p, per]);
   }
   const refreshSet = new Set(refreshed.map(([p, per]) => p + '|' + per));
+  const frozenSet = new Set(frozen.map(([p, per]) => p + '|' + per));
   for (const g of groups) {
-    if (!refreshSet.has(g.partner + '|' + g.period)) continue;
+    const mk = g.partner + '|' + g.period;
+    // A locked month keeps every client's payout as it was paid. A client that had none then (its code was
+    // attached, or its RM/BM set, only afterwards) is added, so late mapping still reaches its RM/BM.
+    if (frozenSet.has(mk)) { if (hasRows.has(mk + '|' + g.cid)) continue; }
+    else if (!refreshSet.has(mk)) continue;
     const c = clients.get(g.cid); if (!c) continue;
     const ch = chainAsOf(c, g.period); if (!ch.hierarchy || !Object.values(ch.hierarchy).some(Boolean)) continue;
     for (const s of partnerShares({ ours: Number(g.ours) || 0, h: ch.hierarchy, lsl: ch.leadSourceLevel, period: g.period, teamMap, cfg: ecfg })) {

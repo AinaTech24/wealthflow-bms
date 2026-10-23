@@ -83,6 +83,22 @@ await saveCfg(id, { ...c0, lockedPeriods: (c0.lockedPeriods || []).filter(p => p
 await recomputePartnerLedger(pool);
 ok(JSON.stringify(await ledger()) === frozenBase, 'putting the rate back restores the original payout');
 
+// 5b. a locked month still takes a client that was attached late, and leaves everyone else as paid
+{
+  const cur = await cfgRow();
+  cur.cfg.lockedPeriods = [...new Set([...(cur.cfg.lockedPeriods || []), '2026-08'])]; await saveCfg(cur.id, cur.cfg);
+  await recomputePartnerLedger(pool);
+  const settled = JSON.stringify(await ledger());
+  await pool.query("INSERT INTO partner_brokerage (id, partner, batchId, tradeDate, period, clientCode, segment, tradeCategory, totalBrokerage, ourShare, partnerShare, mappedClientId, data) SELECT 'PB_LATE', partner, batchId, tradeDate, period, 'LATE1', segment, tradeCategory, 1000, 600, 400, 'c_b02', '{}' FROM partner_brokerage WHERE period = '2026-08' LIMIT 1");
+  await recomputePartnerLedger(pool);
+  const after = await ledger();
+  ok(after.some(r => r.clientId === 'c_b02' && r.period === '2026-08' && Number(r.amount) > 0), 'a client attached after the month was locked reaches its RM/BM');
+  ok(JSON.stringify(after.filter(r => r.clientId !== 'c_b02')) === JSON.stringify(JSON.parse(settled).filter(r => r.clientId !== 'c_b02')), 'everyone already paid in the locked month is unchanged');
+  await pool.query("DELETE FROM partner_brokerage WHERE id = 'PB_LATE'");
+  cur.cfg.lockedPeriods = (cur.cfg.lockedPeriods || []).filter(p => p !== '2026-08'); await saveCfg(cur.id, cur.cfg);
+  await pool.query('DELETE FROM partner_payout_ledger'); await recomputePartnerLedger(pool);
+}
+
 // 6. the mutual fund is untouched by every step above
 ok(await fp() === before, 'mutual-fund tables (transactions, payout_ledger) unchanged');
 

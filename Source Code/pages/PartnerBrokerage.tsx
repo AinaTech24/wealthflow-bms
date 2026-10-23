@@ -169,6 +169,7 @@ interface CodeRow {
   partner: string; clientCode: string; rows_: number;
   firstPeriod: string | null; lastPeriod: string | null; ourShare: number;
   mappedClientId: string | null; label: string | null;
+  months?: { period: string; ourShare: number }[];
 }
 
 export const PartnerBrokerage: React.FC<Props> = ({ currentUser }) => {
@@ -220,7 +221,11 @@ export const PartnerBrokerage: React.FC<Props> = ({ currentUser }) => {
   const [period, setPeriod] = useState('');
   const [allPeriods, setAllPeriods] = useState<string[]>([]);
 
+  // Only the newest load may write to the screen: a slower earlier one (another partner or month) must not overwrite it.
+  const loadSeq = useRef(0);
   const load = async (p = period, pr = partner) => {
+    const my = ++loadSeq.current;
+    const stale = () => my !== loadSeq.current;
     setBusy(true);
     const q = (p ? `&period=${encodeURIComponent(p)}` : '') + `&partner=${encodeURIComponent(pr)}`;
     try {
@@ -229,26 +234,28 @@ export const PartnerBrokerage: React.FC<Props> = ({ currentUser }) => {
         authFetch(`/api/data?action=partner_rows${q}&_=${Date.now()}`, { cache: 'no-store' }),
         authFetch(`/api/data?action=partner_ledger&partner=${pr}&_=${Date.now()}`, { cache: 'no-store' }),
       ]);
+      if (stale()) return;
       if (s.ok) {
         const body = await s.json();
+        if (stale()) return;
         setSummary(body);
         // An unfiltered call already lists every month, so take it from there and
         // save a round trip.
         if (!p) setAllPeriods((body.periods || []).map((x: any) => x.period));
       }
-      if (r.ok) setRows(await r.json());
-      if (l.ok) setLedger(await l.json());
+      if (r.ok) { const rj = await r.json(); if (stale()) return; setRows(rj); }
+      if (l.ok) { const lj = await l.json(); if (stale()) return; setLedger(lj); }
       if (p) {
         const a = await authFetch(`/api/data?action=partner_summary&partner=${encodeURIComponent(pr)}&_=${Date.now()}`, { cache: 'no-store' });
-        if (a.ok) setAllPeriods(((await a.json()).periods || []).map((x: any) => x.period));
+        if (a.ok) { const aj = await a.json(); if (stale()) return; setAllPeriods((aj.periods || []).map((x: any) => x.period)); }
       }
       if (canWrite) {
         const c = await authFetch(`/api/data?action=partner_codes&partner=${encodeURIComponent(pr)}&period=${encodeURIComponent(p || '')}&_=${Date.now()}`, { cache: 'no-store' });
-        if (c.ok) setCodes(await c.json());
+        if (c.ok) { const cj = await c.json(); if (stale()) return; setCodes(cj); }
       }
     } catch {
       showToast('Could not load partner brokerage.', 'error');
-    } finally { setBusy(false); }
+    } finally { if (my === loadSeq.current) setBusy(false); }
   };
 
   useEffect(() => {
@@ -479,7 +486,27 @@ export const PartnerBrokerage: React.FC<Props> = ({ currentUser }) => {
     const norm = (v: string) => String(v || '').toUpperCase().replace(/[^A-Z0-9]+/g, '');
     const byName = new Map<string, string[]>();
     for (const cl of clients) { const k = norm(cl.name); if (!k) continue; byName.set(k, [...(byName.get(k) || []), cl.id]); }
-    return (label: string | null) => { const ids = label ? byName.get(norm(label)) : null; return ids && ids.length === 1 ? ids[0] : ''; };
+    const words = (v: string) => String(v || '').toUpperCase().replace(/[^A-Z0-9 ]+/g, ' ').split(/\s+/).filter(Boolean);
+    // "SHAKEEL KHAN" fits "Shakeel Khan Mansuri", and "SRILAKSHMI N" fits "SRILAKSHMI NARAYANASWAMY": every word of the
+    // shorter name starts a different word of the longer one. Only a single client may fit.
+    const covers = (short: string[], long: string[]) => {
+      if (short.length < 2 || short.length > long.length) return false;
+      const used = new Set<number>();
+      return short.every(w => { const k = long.findIndex((x, i) => !used.has(i) && x.startsWith(w)); if (k < 0) return false; used.add(k); return true; });
+    };
+    // Either name may be the abbreviated one ("SRILAKSHMI N" against "SRILAKSHMI NARAYANASWAMY", or the reverse).
+    const fits = (a: string[], b: string[]) => covers(a, b) || covers(b, a);
+    const fn = (label: string | null) => {
+      if (!label) return { id: '', exact: false };
+      const ids = byName.get(norm(label));
+      if (ids && ids.length === 1) return { id: ids[0], exact: true };
+      const w = words(label);
+      const close = clients.filter(cl => fits(w, words(cl.name)));
+      return close.length === 1 ? { id: close[0].id, exact: false } : { id: '', exact: false };
+    };
+    const f: any = (label: string | null) => fn(label).id;
+    f.exact = (label: string | null) => fn(label).exact;
+    return f as ((label: string | null) => string) & { exact: (label: string | null) => boolean };
   }, [clients]);
 
   return (
@@ -939,23 +966,47 @@ export const PartnerBrokerage: React.FC<Props> = ({ currentUser }) => {
             </div>
           }
         >
+          {(() => {
+            const pending = codes.filter(c => !c.mappedClientId && c.rows_ > 0 && suggestionFor(c.label || c.clientCode));
+            if (!pending.length) return null;
+            return (
+              <div className="mb-3 flex items-center gap-3 flex-wrap">
+                <span className="text-[11px] text-slate-500 dark:text-slate-400">{pending.length} unattached code{pending.length !== 1 ? 's have' : ' has'} a client with the same or a very close name.</span>
+                <button
+                  onClick={async () => {
+                    const pairs = pending.map(c => { const id = suggestionFor(c.label || c.clientCode); return { clientCode: c.clientCode, clientId: id, label: clients.find(x => x.id === id)?.name || null }; });
+                    const list = pairs.map(x => `${x.clientCode}  →  ${x.label}`).join('\n');
+                    if (!window.confirm(`Attach these ${pairs.length} code${pairs.length !== 1 ? 's' : ''}?\n\n${list}`)) return;
+                    const res = await authFetch('/api/data', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ action: 'partner_map', payload: { partner, pairs } }) });
+                    const j = await res.json();
+                    if (!res.ok) { showToast(j?.error || 'Could not attach.', 'error'); return; }
+                    showToast(`${pairs.length} code${pairs.length !== 1 ? 's' : ''} attached · ${j.rowsTouched} row${j.rowsTouched !== 1 ? 's' : ''} now reach their RM/BM.`, 'success');
+                    await load();
+                  }}
+                  className="px-3 py-1.5 rounded-lg bg-emerald-600 text-white text-[10px] font-black uppercase tracking-widest hover:bg-emerald-700 transition"
+                >Attach all suggested</button>
+              </div>
+            );
+          })()}
           {!filteredCodes.length
             ? <Empty>No client codes yet.</Empty>
             : (
               <div className="overflow-x-auto">
                 <table className="w-full text-sm">
-                  <Head cols={['Code', 'Rows', 'Months', 'Our share', 'Attached to']} />
+                  <Head cols={['Code', 'Month', 'Our share', 'Attached to']} />
                   <tbody>
-                    {filteredCodes.map(c => (
-                      <tr key={`${c.partner}-${c.clientCode}`} className="border-b border-slate-100 dark:border-slate-700/50">
+                    {filteredCodes.flatMap(c => (c.months && c.months.length ? c.months : [null]).map((mo, mi) => ({ c, mo, mi }))).map(({ c, mo, mi }) => (
+                      <tr key={`${c.partner}-${c.clientCode}-${mo ? mo.period : 'none'}`} className={mi === 0 ? 'border-t border-slate-200 dark:border-slate-700' : ''}>
                         <td className="py-2 pr-4">
-                          <div className="font-mono font-bold text-slate-900 dark:text-slate-100">{c.clientCode}</div>
-                          {c.label && <div className="text-[11px] text-slate-500 dark:text-slate-400">{c.label}</div>}
+                          {mi === 0 && <>
+                            <div className="font-mono font-bold text-slate-900 dark:text-slate-100">{c.clientCode}</div>
+                            {c.label && <div className="text-[11px] text-slate-500 dark:text-slate-400">{c.label}</div>}
+                          </>}
                         </td>
-                        <Td mono right>{c.rows_}</Td>
-                        <Td mono>{!c.firstPeriod ? 'no trade yet' : c.firstPeriod === c.lastPeriod ? c.firstPeriod : `${c.firstPeriod} → ${c.lastPeriod}`}</Td>
-                        <Td mono right bold>₹{Number(c.ourShare).toLocaleString('en-IN')}</Td>
+                        <Td mono>{mo ? mo.period : 'no trade yet'}</Td>
+                        <Td mono right bold>₹{Number(mo ? mo.ourShare : c.ourShare).toLocaleString('en-IN', { maximumFractionDigits: 2 })}</Td>
                         <td className="py-2 pr-4">
+                          {mi === 0 ? (<>
                           <div className="flex items-center gap-2">
                             <select
                               id={`map-${c.clientCode}`}
@@ -980,6 +1031,10 @@ export const PartnerBrokerage: React.FC<Props> = ({ currentUser }) => {
                               </button>
                             )}
                           </div>
+                          {!c.mappedClientId && pick[c.clientCode] === undefined && suggestionFor(c.label || c.clientCode) && !suggestionFor.exact(c.label || c.clientCode) && (
+                            <div className="text-[10px] text-amber-600 mt-0.5">Closest name match — check it is the same person, then Save.</div>
+                          )}
+                          </>) : <span className="text-[11px] text-slate-400">same client</span>}
                         </td>
                       </tr>
                     ))}

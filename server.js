@@ -1562,8 +1562,12 @@ app.all('/api/data', mutationLimiter, async (req, res) => {
                FROM partner_client_map m2
                WHERE ? = '' AND (? = '' OR m2.partner = ?) AND NOT EXISTS (SELECT 1 FROM partner_brokerage b2 WHERE b2.partner = m2.partner AND b2.clientCode = m2.clientCode)
              ) t ORDER BY ourShare DESC, label, clientCode`, [pPer, pPer, pPart, pPart, pPer, pPart, pPart]);
+          const [mrows] = await pool.query(
+            `SELECT clientCode, period, ROUND(SUM(ourShare),2) amt FROM partner_brokerage WHERE (? = '' OR partner = ?) AND (? = '' OR period = ?) GROUP BY clientCode, period ORDER BY period`, [pPart, pPart, pPer, pPer]);
+          const monthsOf = new Map();
+          for (const m of mrows) { if (!monthsOf.has(m.clientCode)) monthsOf.set(m.clientCode, []); monthsOf.get(m.clientCode).push({ period: m.period, ourShare: Number(m.amt) || 0 }); }
           res.set('Cache-Control', 'no-store');
-          return res.json(rows);
+          return res.json(rows.map(r => ({ ...r, months: monthsOf.get(r.clientCode) || [] })));
         } catch (e) {
           console.error('[partner_codes]', e);
           return res.status(500).json({ error: 'Failed to read partner client codes' });
