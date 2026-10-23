@@ -273,8 +273,21 @@ export const PartnerBrokerage: React.FC<Props> = ({ currentUser }) => {
     })();
   }, []);
   useEffect(() => { setSettleMonth(ledger?.settledThrough || ''); }, [ledger]);
-  const choosePartner = (code: string) => { setPartner(code); setPeriod(''); setPick({}); setCodeSearch(''); load('', code); };
-  useEffect(() => { load(); /* eslint-disable-next-line */ }, []);
+  // The page is month by month: it opens on the newest month that partner has, and everything on it (tiles, missing
+  // mapping, client codes, ledger, statement rows) follows the month chosen. "All months" is still one pick away.
+  const latestMonthOf = async (pr: string) => {
+    try {
+      const r = await authFetch(`/api/data?action=partner_summary&partner=${encodeURIComponent(pr)}&_=${Date.now()}`, { cache: 'no-store' });
+      if (r.ok) return ((await r.json()).periods || []).map((x: any) => String(x.period)).sort().pop() || '';
+    } catch { /* fall back to every month */ }
+    return '';
+  };
+  const choosePartner = async (code: string) => {
+    setPartner(code); setPick({}); setCodeSearch('');
+    const latest = await latestMonthOf(code);
+    setPeriod(latest); load(latest, code);
+  };
+  useEffect(() => { (async () => { const latest = await latestMonthOf(partner); setPeriod(latest); load(latest, partner); })(); /* eslint-disable-next-line */ }, []);
   // Changing the month refetches rather than filtering in the browser: the row
   // endpoint caps at 20,000 rows, so a client-side filter would quietly lie once
   // more than one month of statements is in.
@@ -407,8 +420,10 @@ export const PartnerBrokerage: React.FC<Props> = ({ currentUser }) => {
         `. ${sj.unmapped} row${sj.unmapped !== 1 ? 's' : ''} await client mapping.`,
         'success');
       setPartnerList(prev => [...new Set([...prev, fmt!.code])]);
-      setPartner(fmt!.code); setPeriod('');
-      await load('', fmt!.code);
+      setPartner(fmt!.code);
+      const latest = await latestMonthOf(fmt!.code);
+      setPeriod(latest);
+      await load(latest, fmt!.code);
     } catch (e: any) {
       showToast(e?.message || 'Import failed.', 'error');
     } finally {
