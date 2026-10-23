@@ -4,8 +4,12 @@
  * with at least one RM or BM (levels 1-4) in their chain. Everything else is skipped
  * and listed, never imported.
  *
- *   node tools/importTurnBrok.mjs dry   <turnbrok.json>
- *   node tools/importTurnBrok.mjs apply <turnbrok.json>
+ *   node tools/importTurnBrok.mjs dry   <turnbrok.json> [--all]
+ *   node tools/importTurnBrok.mjs apply <turnbrok.json> [--all]
+ *
+ * By default ONLY codes attached to a client with an RM/BM are imported. With --all, codes that are not attached yet are
+ * imported too, as UNMAPPED rows (no client), so they show up in the Partner Brokerage "missing mapping" list and can be
+ * given an RM/BM there. Attached codes come out exactly as before.
  *
  * turnbrok.json = { "2026-08": [{ code, name, trading, delivery, total }], "2026-09": [...] }
  *   trading  = trading buy + sell brokerage;  delivery = delivery buy + sell brokerage.
@@ -22,6 +26,7 @@ import './../bootstrap-env.js';
 import pool from '../src/lib/db.js';
 
 const MODE = process.argv[2];
+const ALL = process.argv.includes('--all');
 const files = JSON.parse(fs.readFileSync(process.argv[3], 'utf8'));
 const PARTNER = 'MOFSL', DEFAULT_RATIO = 0.45, RATIO_MONTH = '2026-07';
 const code = (s) => String(s || '').replace(/^'/, '').trim().toUpperCase();
@@ -45,15 +50,16 @@ for (const [period, list] of Object.entries(files)) {
     const k = code(f.code), total = Number(f.total) || 0;
     if (!total) { out.skipped.push({ k, name: f.name, total: 0, why: 'no brokerage' }); continue; }
     const cid = clientOf.get(k);
-    if (!cid) { out.skipped.push({ k, name: f.name, total, why: 'not attached to a WealthFlow client' }); continue; }
-    if (!hasRmBm(cid)) { out.skipped.push({ k, name: f.name, total, why: 'client has no RM/BM' }); continue; }
+    if (!cid && !ALL) { out.skipped.push({ k, name: f.name, total, why: 'not attached to a WealthFlow client' }); continue; }
+    if (cid && !hasRmBm(cid)) { out.skipped.push({ k, name: f.name, total, why: 'client has no RM/BM' }); continue; }
     if (Math.abs((Number(f.trading) || 0) + (Number(f.delivery) || 0) - total) > 0.01) out.mismatch.push(k);
     const ratio = julyRatio.has(k) ? julyRatio.get(k) : DEFAULT_RATIO;
     const from = julyRatio.has(k) ? `${RATIO_MONTH} statement` : `default ${DEFAULT_RATIO * 100}%`;
+    out.unattached = (out.unattached || 0) + (cid ? 0 : 1);
     const parts = [['TRD', Number(f.trading) || 0], ['DEL', Number(f.delivery) || 0]].filter(([, v]) => Math.abs(v) > 0);
     if (!parts.length) parts.push(['DEL', total]);
     for (const [cat, amt] of parts) out.rows.push({
-      id: `${PARTNER}_${period}_TB_${k}_${cat}`, period, code: f.code ? String(f.code).replace(/^'/, '').trim() : k, cat, cid,
+      id: `${PARTNER}_${period}_TB_${k}_${cat}`, period, code: f.code ? String(f.code).replace(/^'/, '').trim() : k, cat, cid: cid || null,
       total: r4(amt), ours: r4(amt * ratio), partner: r4(amt - amt * ratio), ratio, from, name: f.name,
     });
   }
@@ -62,6 +68,7 @@ for (const [period, list] of Object.entries(files)) {
 for (const p of plan) {
   const t = p.rows.reduce((a, r) => a + r.total, 0), o = p.rows.reduce((a, r) => a + r.ours, 0);
   console.log(`\n${p.period}: ${p.rows.length} rows from ${new Set(p.rows.map(r => r.code)).size} codes | total brokerage ${t.toFixed(2)} | our share ${o.toFixed(2)} (${t ? (o / t * 100).toFixed(1) : 0}%)`);
+  if (p.unattached) console.log(`   of which NOT attached to a client (imported as unmapped): ${p.unattached} codes`);
   console.log(`   ratio source: ${p.rows.filter(r => r.from.startsWith(RATIO_MONTH)).length} rows from July, ${p.rows.filter(r => r.from.startsWith('default')).length} rows at the ${DEFAULT_RATIO * 100}% default`);
   if (p.mismatch.length) console.log('   trading+delivery != total for:', p.mismatch.join(','));
   const sk = p.skipped.filter(s => s.total);
@@ -70,6 +77,14 @@ for (const p of plan) {
 }
 if (MODE !== 'apply') { await pool.end(); process.exit(0); }
 
+{
+  const fsx = await import('fs'); const osx = await import('os');
+  const dir = osx.homedir() + '/backups'; fsx.mkdirSync(dir, { recursive: true });
+  const [old] = await pool.query('SELECT * FROM partner_brokerage WHERE partner = ? AND batchId IN (?)', [PARTNER, plan.map(x => `PB_${PARTNER}_TB_${x.period}`)]);
+  const file = `${dir}/before-turnbrok-all-${new Date().toISOString().replace(/[:.]/g, '-')}.json`;
+  fsx.writeFileSync(file, JSON.stringify({ partner_brokerage: old }));
+  console.log('backup written:', file, `(${old.length} rows)`);
+}
 const conn = await pool.getConnection();
 try {
   await conn.beginTransaction();
