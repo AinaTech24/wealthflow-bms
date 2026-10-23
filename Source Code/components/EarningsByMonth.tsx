@@ -1,7 +1,7 @@
 import React, { useEffect, useMemo, useState } from 'react';
 import { Wallet, RefreshCw } from 'lucide-react';
 import { authFetch } from '../contexts/DataContext';
-import { labelFor } from '../utils/payoutSources';
+import { labelFor, registerLabels } from '../utils/payoutSources';
 
 /**
  * Earned, paid and still-owed money, month by month, for one product or all of
@@ -19,7 +19,7 @@ interface MonthRow {
   bySource?: Record<string, SourceFigures>;
 }
 interface Person { userId: string; name: string; months: MonthRow[] }
-interface Overview { periods: string[]; people: Person[]; sources?: string[] }
+interface Overview { periods: string[]; people: Person[]; sources?: string[]; sourceLabels?: Record<string, string> }
 
 type Mode = 'all' | 'month' | 'quarter' | 'year';
 interface Row { period: string; mf: number; partner: number; earned: number; paid: number; carriedIn: number; outstanding: number }
@@ -49,7 +49,7 @@ export const EarningsByMonth: React.FC<{ firmWide: boolean }> = ({ firmWide }) =
     try {
       const r = await authFetch(`/api/data?action=payout_overview&_=${Date.now()}`, { cache: 'no-store' });
       if (!r.ok) throw new Error(String(r.status));
-      setData(await r.json());
+      const j = await r.json(); registerLabels(j.sourceLabels); setData(j);
     } catch { setFailed(true); }
     finally { setBusy(false); }
   };

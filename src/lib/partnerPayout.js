@@ -105,3 +105,7 @@ export function estimateTax(base, { hasGst, gstRate, tdsRate }) {
   const tds = Math.round(base * tdsRate) / 100;
   return { gst: Math.round(gst * 100) / 100, tds: Math.round(tds * 100) / 100, payable: Math.round(base + gst - tds) };
 }
+
+/** File layouts taught for a partner whose statement the system did not recognise. */
+export const PARTNER_FORMAT_DDL =
+  'CREATE TABLE IF NOT EXISTS partner_formats (partner VARCHAR(40) NOT NULL PRIMARY KEY, label VARCHAR(80), data TEXT)';

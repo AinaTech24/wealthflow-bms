@@ -13,7 +13,7 @@ import { nameTokens, nameContradicts, bestNameMatches } from './src/lib/nameMatc
 import { planBranchRestructure } from './src/lib/branchRestructure.js';
 import { pickOwnerRecord } from './src/lib/folioOwner.js';
 import { scopePayoutOverview } from './src/lib/payoutScope.js';
-import { recomputePartnerLedger, PARTNER_LEDGER_DDL, estimateTax } from './src/lib/partnerPayout.js';
+import { recomputePartnerLedger, PARTNER_LEDGER_DDL, PARTNER_FORMAT_DDL, estimateTax } from './src/lib/partnerPayout.js';
 import { memberAsOf, residualSplit, breakdownFromShares } from './src/lib/payoutEngine.js';
 import { chainAsOf, planLevelMove, effectiveMonthOr } from './src/lib/hierarchyHistory.js';
 import { monthsToLock, mergeLocks } from './src/lib/lockPeriods.js';
@@ -1592,6 +1592,7 @@ app.all('/api/data', mutationLimiter, async (req, res) => {
           const [[pcfgRow]] = await pool.query("SELECT data FROM config WHERE id IN ('global_config','global') ORDER BY id = 'global_config' DESC LIMIT 1");
           let pcfg = {}; try { pcfg = JSON.parse(pcfgRow?.data || '{}'); } catch { /* keep {} */ }
           const pGst = Number(pcfg.defaultGstRate) || 18, pTds = Number(pcfg.defaultTdsRate) || 2;
+          const pSettled = /^[0-9]{4}-[0-9]{2}$/.test(String(pcfg.partnerSettledThrough || '')) ? String(pcfg.partnerSettledThrough) : '';
           const hasGstin = (uid) => { try { return !!String(JSON.parse(team.get(uid)?.data || '{}').gstNumber || '').trim(); } catch { return false; } };
           const earned = new Map();
           for (const r of earnRows) { if (!earned.has(r.userId)) earned.set(r.userId, new Map()); earned.get(r.userId).set(r.period, Number(r.amt) || 0); }
@@ -1599,6 +1600,13 @@ app.all('/api/data', mutationLimiter, async (req, res) => {
           const [unRows] = await pool.query(
             `SELECT b.period, ROUND(SUM(b.ourShare),4) amt, COUNT(DISTINCT b.mappedClientId) clients
                FROM partner_brokerage b WHERE b.partner = ? AND (b.mappedClientId IS NULL OR b.mappedClientId = '') GROUP BY b.period`, [partner]);
+          // Clients that are attached but have nobody above them: their money reaches no one.
+          const [mappedGroups] = await pool.query(
+            `SELECT b.mappedClientId cid, MAX(c.name) cname, ROUND(SUM(b.ourShare),2) amt FROM partner_brokerage b LEFT JOIN clients c ON c.id = b.mappedClientId
+              WHERE b.partner = ? AND b.mappedClientId IS NOT NULL AND b.mappedClientId <> '' GROUP BY b.mappedClientId`, [partner]);
+          const [withPay] = await pool.query('SELECT DISTINCT clientId FROM partner_payout_ledger WHERE partner = ?', [partner]);
+          const paidClients = new Set(withPay.map(r => r.clientId));
+          const noChain = mappedGroups.filter(g => !paidClients.has(g.cid)).map(g => ({ clientId: g.cid, name: g.cname || g.cid, amount: Number(g.amt) || 0 }));
           const [payRows] = await pool.query(
             `SELECT userId, period, ROUND(SUM(amount),4) paid FROM payout_settlements WHERE source = ? GROUP BY userId, period`, [partner]);
           const paid = new Map();
@@ -1611,7 +1619,8 @@ app.all('/api/data', mutationLimiter, async (req, res) => {
             const periods = new Set([...(earned.get(uid)?.keys() || []), ...(paid.get(uid)?.keys() || [])]);
             let running = 0;
             const months = [...periods].sort().map(p => {
-              const e = Number(earned.get(uid)?.get(p) || 0), pd = Number(paid.get(uid)?.get(p) || 0);
+              const e = Number(earned.get(uid)?.get(p) || 0), pd0 = Number(paid.get(uid)?.get(p) || 0);
+              const pd = (pSettled && p <= pSettled) ? Math.max(pd0, e) : pd0;
               const carriedIn = running;
               running += e - pd;
               return { period: p, carriedIn: Math.round(carriedIn * 100) / 100, earned: Math.round(e * 100) / 100, paid: Math.round(pd * 100) / 100, carried: Math.round(running * 100) / 100,
@@ -1626,7 +1635,7 @@ app.all('/api/data', mutationLimiter, async (req, res) => {
           out.sort((a, b) => b.outstanding - a.outstanding || b.totalEarned - a.totalEarned);
           res.set('Cache-Control', 'no-store');
           return res.json({
-            partner, model: 'MUTUAL_FUND_RULE', configured: true, pct: {}, people: out,
+            partner, model: 'MUTUAL_FUND_RULE', configured: true, pct: {}, people: out, settledThrough: pSettled, noChain: isWriter(req) ? noChain : [],
             unattributed: isWriter(req) ? { total: Math.round(unRows.reduce((a, r) => a + Number(r.amt), 0) * 100) / 100,
               clients: unRows.reduce((a, r) => a + Number(r.clients || 0), 0), byPeriod: unRows.map(r => ({ period: r.period, amount: Math.round(Number(r.amt) * 100) / 100 })) } : null,
           });
@@ -1634,6 +1643,18 @@ app.all('/api/data', mutationLimiter, async (req, res) => {
           console.error('[partner_ledger]', e);
           return res.status(500).json({ error: 'Failed to build the partner ledger' });
         }
+      }
+
+      // File layouts the admin has taught the system for a partner whose file it did not recognise.
+      if (action === 'partner_formats') {
+        try {
+          if (!req.user) return res.status(401).json({ error: 'Not authenticated' });
+          if (!isWriter(req)) return res.status(403).json({ error: 'Forbidden' });
+          await pool.query(PARTNER_FORMAT_DDL);
+          const [rows] = await pool.query('SELECT partner, label, data FROM partner_formats ORDER BY partner');
+          res.set('Cache-Control', 'no-store');
+          return res.json(rows.map(r => { let d = {}; try { d = JSON.parse(r.data || '{}'); } catch { /* keep {} */ } return { partner: r.partner, label: r.label, ...d }; }));
+        } catch (e) { console.error('[partner_formats]', e); return res.status(500).json({ error: 'Failed to read the saved formats' }); }
       }
 
       // Rebuild the partner payout ledger on demand (ADMIN). Safe to repeat; locked months stay frozen.
@@ -1781,6 +1802,7 @@ app.all('/api/data', mutationLimiter, async (req, res) => {
             invoiceOf.set(`${r.userId}|${r.month}`, d);
           }
           const gstRate = Number(cfg.defaultGstRate) || 18;
+          const settledThrough = /^[0-9]{4}-[0-9]{2}$/.test(String(cfg.partnerSettledThrough || '')) ? String(cfg.partnerSettledThrough) : '';
           const tdsRate = Number(cfg.defaultTdsRate) || 2;
           const firmState = String(cfg.firmState || '').trim().toLowerCase();
           const taxOf = new Map();
@@ -1837,7 +1859,9 @@ app.all('/api/data', mutationLimiter, async (req, res) => {
               let tot = 0, pd = 0;
               const bySource = {};
               for (const s of sources) {
-                const se = e[s] || 0, sp = pdSplit[s] || 0;
+                const se = e[s] || 0, sp0 = pdSplit[s] || 0;
+                // Partner statements up to the settled-through month were paid before the system took over.
+                const sp = (s !== MF && settledThrough && p <= settledThrough) ? Math.max(sp0, se) : sp0;
                 tot += se; pd += sp;
                 bySource[s] = {
                   ...estimateTax(r2(se), { hasGst: !!taxOf.get(uid)?.hasGst, gstRate, tdsRate }),
@@ -1879,7 +1903,9 @@ app.all('/api/data', mutationLimiter, async (req, res) => {
           }
           people.sort((a, b) => b.outstanding - a.outstanding || b.totalEarned - a.totalEarned);
 
-          const body = { generatedAt: new Date().toISOString(), periods, people, sources };
+          const sourceLabels = {};
+          try { await pool.query(PARTNER_FORMAT_DDL); const [lb] = await pool.query('SELECT partner, label FROM partner_formats'); for (const r of lb) if (r.label) sourceLabels[r.partner] = r.label; } catch { /* labels are cosmetic */ }
+          const body = { generatedAt: new Date().toISOString(), periods, people, sources, settledThrough, sourceLabels };
           payoutOverviewCache = { at: now, body };
           res.set('X-Cache', 'MISS');
           res.set('Cache-Control', 'no-store');
@@ -2768,6 +2794,40 @@ app.all('/api/data', mutationLimiter, async (req, res) => {
         return res.status(403).json({ error: 'Admin or Finance privileges required to modify data' });
       }
 
+      if (action === 'partner_format_save') {
+        if (!canMutate(req, action)) return res.status(403).json({ error: 'Admin privileges required' });
+        try {
+          const partner = String(payload?.partner || '').trim().toUpperCase();
+          if (!/^[A-Z0-9]{2,20}$/.test(partner)) return res.status(400).json({ error: 'The partner code must be 2-20 letters or digits.' });
+          const label = String(payload?.label || partner).trim().slice(0, 80);
+          const f = payload?.format || {};
+          const data = { clientCol: String(f.clientCol || '').slice(0, 120), amountCol: String(f.amountCol || '').slice(0, 120), monthCol: String(f.monthCol || '').slice(0, 120) };
+          if (!data.clientCol || !data.amountCol) return res.status(400).json({ error: 'A client column and an amount column are required.' });
+          await pool.query(PARTNER_FORMAT_DDL);
+          await pool.query('INSERT INTO partner_formats (partner, label, data) VALUES (?,?,?) ON DUPLICATE KEY UPDATE label = VALUES(label), data = VALUES(data)', [partner, label, JSON.stringify(data)]);
+          await pool.query('INSERT INTO activity_log (userId, userName, action, description, createdAt) VALUES (?,?,?,?,NOW())', [req.user?.id || '', req.user?.name || '', 'partner_format', `${partner}: file layout saved (client "${data.clientCol}", amount "${data.amountCol}"${data.monthCol ? `, month "${data.monthCol}"` : ''})`]);
+          return res.json({ success: true, partner });
+        } catch (e) { console.error('[partner_format_save]', e); return res.status(500).json({ error: e.message }); }
+      }
+
+      // Partner payouts for months up to this one are treated as already paid in full (the cut-over from the old process).
+      if (action === 'partner_settled_through') {
+        if (!canMutate(req, action)) return res.status(403).json({ error: 'Admin privileges required' });
+        try {
+          const period = payload?.period ? String(payload.period).slice(0, 7) : '';
+          if (period && !/^[0-9]{4}-[0-9]{2}$/.test(period)) return res.status(400).json({ error: 'period must look like 2026-08' });
+          const [[row]] = await pool.query("SELECT id, data FROM config WHERE id IN ('global_config','global') ORDER BY id = 'global_config' DESC LIMIT 1");
+          if (!row) return res.status(404).json({ error: 'No configuration row found' });
+          let cfg = {}; try { cfg = JSON.parse(row.data || '{}'); } catch { /* keep {} */ }
+          const before = cfg.partnerSettledThrough || '';
+          if (period) cfg.partnerSettledThrough = period; else delete cfg.partnerSettledThrough;
+          await pool.query('UPDATE config SET data = ? WHERE id = ?', [JSON.stringify(cfg), row.id]);
+          await pool.query('INSERT INTO activity_log (userId, userName, action, description, createdAt) VALUES (?,?,?,?,NOW())', [req.user?.id || '', req.user?.name || '', 'partner_settled_through', `Partner payouts treated as paid through ${period || '(none)'} (was ${before || 'none'})`]);
+          invalidateSummaryCache(); payoutOverviewCache = null;
+          return res.json({ success: true, settledThrough: period });
+        } catch (e) { console.error('[partner_settled_through]', e); return res.status(500).json({ error: e.message }); }
+      }
+
       if (action === 'partner_import') {
         if (!canMutate(req, action)) return res.status(403).json({ error: 'Admin privileges required' });
         try {
@@ -2775,6 +2835,7 @@ app.all('/api/data', mutationLimiter, async (req, res) => {
           const fileName = String(payload?.fileName || '').trim();
           const rows = Array.isArray(payload?.rows) ? payload.rows : [];
           if (!partner) return res.status(400).json({ error: 'partner is required' });
+          if (!/^[A-Z0-9]{2,20}$/.test(partner)) return res.status(400).json({ error: 'The partner code must be 2-20 letters or digits.' });
           if (!rows.length) return res.status(400).json({ error: 'No rows to import' });
 
           const batchId = `PB_${partner}_${Date.now()}`;
@@ -4401,7 +4462,8 @@ app.all('/api/data', mutationLimiter, async (req, res) => {
               // locked would write the older, shorter list back and silently unlock it, so a
               // save may add locks but never remove one (see unlock_period).
               const [[stored]] = await connection.query('SELECT data FROM config WHERE id = ?', [id]);
-              let prevLocks = []; try { prevLocks = JSON.parse(stored?.data || '{}').lockedPeriods || []; } catch {}
+              let prevLocks = [], prevSettled = ''; try { const pc = JSON.parse(stored?.data || '{}'); prevLocks = pc.lockedPeriods || []; prevSettled = pc.partnerSettledThrough || ''; } catch {}
+              if (prevSettled) rest.partnerSettledThrough = prevSettled; else delete rest.partnerSettledThrough;
               rest.lockedPeriods = mergeLocks(prevLocks, rest.lockedPeriods);
               await connection.query('INSERT INTO config (id, data) VALUES (?, ?) ON DUPLICATE KEY UPDATE data=VALUES(data)', [id, JSON.stringify(rest)]);
             }

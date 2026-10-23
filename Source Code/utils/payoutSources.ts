@@ -11,4 +11,9 @@ export const SOURCE_LABEL: Record<string, string> = {
   VOLT: 'Volt Money',
 };
 
-export const labelFor = (key: string) => (key === 'all' ? 'All products' : SOURCE_LABEL[key] || key);
+// Partners whose file layout was taught on the Partner Brokerage page carry their own name; the server
+// sends them with the payout overview and the page registers them here.
+const CUSTOM_LABEL: Record<string, string> = {};
+export const registerLabels = (m?: Record<string, string>) => { if (m) Object.assign(CUSTOM_LABEL, m); };
+
+export const labelFor = (key: string) => (key === 'all' ? 'All products' : SOURCE_LABEL[key] || CUSTOM_LABEL[key] || key);

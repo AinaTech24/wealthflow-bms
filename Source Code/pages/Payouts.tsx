@@ -5,7 +5,7 @@ import { authFetch } from '../contexts/DataContext';
 import { useToast } from '../components/Toast';
 import { formatCompactINR } from '../utils/formatINR';
 import { exportToExcel } from '../utils/excelExport';
-import { labelFor } from '../utils/payoutSources';
+import { labelFor, registerLabels } from '../utils/payoutSources';
 
 interface Props { currentUser: TeamMember }
 
@@ -48,7 +48,7 @@ export const Payouts: React.FC<Props> = ({ currentUser }) => {
   const isAdmin = currentUser.role === Role.ADMIN;
   const isFinance = currentUser.role === Role.FINANCE;
 
-  const [data, setData] = useState<{ periods: string[]; people: Person[]; sources?: string[] } | null>(null);
+  const [data, setData] = useState<{ periods: string[]; people: Person[]; sources?: string[]; settledThrough?: string; sourceLabels?: Record<string, string> } | null>(null);
   const [period, setPeriod] = useState('');
   /** 'all', or one of the product codes the server reports. */
   const [source, setSource] = useState('all');
@@ -67,6 +67,7 @@ export const Payouts: React.FC<Props> = ({ currentUser }) => {
       const r = await authFetch(`/api/data?action=payout_overview&_=${Date.now()}`, { cache: 'no-store' });
       if (!r.ok) { showToast('Could not load payouts.', 'error'); return; }
       const j = await r.json();
+      registerLabels(j.sourceLabels);
       setData(j);
       setPeriod(cur => cur || (j.periods?.length ? j.periods[j.periods.length - 1] : ''));
     } catch {
@@ -257,6 +258,12 @@ export const Payouts: React.FC<Props> = ({ currentUser }) => {
           Showing <b>{labelFor(source)}</b> only. GST, TDS and the cheque here are <span className="text-amber-600 font-black">estimates</span> on this
           product&rsquo;s earnings at the configured rates (an RM&rsquo;s invoice covers the whole month, so see <b>All products</b> for the invoice figures).
           {' '}A payment recorded here is booked against <b>{labelFor(source)}</b>, so it clears this balance and no other.
+        </p>
+      )}
+
+      {data?.settledThrough && source !== 'MF' && (
+        <p className="text-[11px] text-slate-500 dark:text-slate-400 -mt-2">
+          Partner payouts up to <b>{prettyMonth(data.settledThrough)}</b> were paid before this system took over, so they show as paid in full. Anything after that is owed until you record a payment.
         </p>
       )}
 

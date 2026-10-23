@@ -43,6 +43,9 @@ function monthOf(raw: string): string | null {
   if (/^\d{4}-\d{2}$/.test(s)) return s;
   const m = s.match(/^([A-Za-z]{3})[a-z]*[\s-]+(\d{4})$/);
   if (m && MONTHS[m[1].toLowerCase()]) return `${m[2]}-${MONTHS[m[1].toLowerCase()]}`;
+  // A CSV month like "2026-09" comes back from the sheet reader as a US-style short date ("9/1/26").
+  const us = s.match(/^(\d{1,2})\/(\d{1,2})\/(\d{2})$/);
+  if (us) { const a1 = Number(us[1]), b1 = Number(us[2]); const mo = a1 <= 12 ? a1 : b1; if (mo >= 1 && mo <= 12) return `20${us[3]}-${String(mo).padStart(2, '0')}`; }
   const d = parseTradeDate(s);
   return d ? d.slice(0, 7) : null;
 }
@@ -56,21 +59,50 @@ function parseVolt(grid: string[][], header: string[]) {
   const rows: any[] = []; let skipped = 0;
   for (const r of grid.slice(1)) {
     if (!r || r.every(c => String(c ?? '').trim() === '')) continue;
-    const period = monthOf(String(r[iM] ?? ''));
+    const period = monthOf(String(r[iM] ?? '')) || '';
     const name = String(r[iN] ?? '').replace(/\s+/g, ' ').trim();
-    if (!period || !name) { skipped++; continue; }
+    if (!name) { skipped++; continue; }
     const up = num(r[iU]), tr = num(r[iT]), tot = num(r[iTot]);
     const parts = ([['UPFRONT', up], ['TRAIL', tr]] as [string, number][]).filter(([, v]) => v !== 0);
     if (!parts.length && tot !== 0) parts.push(['TOTAL', tot]);
     for (const [cat, amt] of parts) {
       rows.push({
-        clientCode: name.toUpperCase(), tradeDate: lastDayOf(period), period, segment: 'Volt Money', tradeCategory: cat,
+        clientCode: name.toUpperCase(), tradeDate: period ? lastDayOf(period) : '', period, segment: 'Volt Money', tradeCategory: cat,
         totalBrokerage: amt, ourShare: amt, partnerShare: 0, product: '', parentProfile: '',
         extra: { clientName: name, 'Customer name': name },
       });
     }
   }
   return { rows, skipped };
+}
+
+// A partner whose layout was taught on screen: which column is the client, which is the firm's amount, and
+// (optionally) which is the month. One line per client per month, the amount is what the firm earned.
+interface CustomFormat { partner: string; label: string; clientCol: string; amountCol: string; monthCol?: string }
+const plainNum = (v: any) => { const n = parseFloat(String(v ?? '').replace(/[^0-9.\-]/g, '')); return Number.isFinite(n) ? n : 0; };
+function customToFormat(cf: CustomFormat, fixedMonth = ''): PartnerFormat {
+  return {
+    code: cf.partner, label: cf.label, signature: [cf.clientCol, cf.amountCol],
+    columns: { clientCode: cf.clientCol, tradeDate: cf.monthCol || '', segment: '', tradeCategory: '', totalBrokerage: cf.amountCol, ourShare: cf.amountCol, partnerShare: '' },
+    extra: [],
+    parse: (grid, header) => {
+      const iC = header.indexOf(cf.clientCol), iA = header.indexOf(cf.amountCol), iM = cf.monthCol ? header.indexOf(cf.monthCol) : -1;
+      const rows: any[] = []; let skipped = 0;
+      for (const r of grid.slice(1)) {
+        if (!r || r.every(c => String(c ?? '').trim() === '')) continue;
+        const name = String(r[iC] ?? '').replace(/\s+/g, ' ').trim();
+        const amt = plainNum(r[iA]);
+        if (!name) { skipped++; continue; }
+        if (amt === 0) continue;
+        const period = fixedMonth || (iM >= 0 ? monthOf(String(r[iM] ?? '')) || '' : '');
+        rows.push({
+          clientCode: name.toUpperCase(), tradeDate: period ? lastDayOf(period) : '', period, segment: cf.label, tradeCategory: 'EARNING',
+          totalBrokerage: amt, ourShare: amt, partnerShare: 0, product: '', parentProfile: '', extra: { clientName: name },
+        });
+      }
+      return { rows, skipped };
+    },
+  };
 }
 
 const PARTNER_FORMATS: PartnerFormat[] = [
@@ -158,7 +190,25 @@ export const PartnerBrokerage: React.FC<Props> = ({ currentUser }) => {
   // Which partner's statements are on screen. Every partner that has imported a file is in the dropdown.
   const [partner, setPartner] = useState('MOFSL');
   const [partnerList, setPartnerList] = useState<string[]>(PARTNER_FORMATS.map(f => f.code));
-  const partnerName = labelFor(partner);
+  const [customFormats, setCustomFormats] = useState<CustomFormat[]>([]);
+  const labelOfPartner = (c: string) => customFormats.find(f => f.partner === c)?.label || labelFor(c);
+  const partnerName = labelOfPartner(partner);
+
+  // Popups the upload can raise: which month a file is for, and what an unrecognised file's columns mean.
+  const [monthAsk, setMonthAsk] = useState<{ message: string; resolve: (m: string | null) => void } | null>(null);
+  const [monthPick, setMonthPick] = useState('');
+  const askMonth = (message: string) => new Promise<string | null>(resolve => { setMonthPick(''); setMonthAsk({ message, resolve }); });
+  const [setup, setSetup] = useState<{ fileName: string; header: string[]; grid: string[][]; resolve: (f: PartnerFormat | null) => void } | null>(null);
+  const [setupForm, setSetupForm] = useState({ name: '', clientCol: '', amountCol: '', monthMode: 'column', monthCol: '', fixedMonth: '' });
+  const askSetup = (fileName: string, header: string[], grid: string[][]) => new Promise<PartnerFormat | null>(resolve => {
+    const guess = (re: RegExp, not = '') => header.find(h => re.test(h) && h !== not) || '';
+    const clientCol = guess(/client|customer|name|code|investor|pan/i);
+    const amountCol = guess(/total|amount|brok|commission|earning|earned|payout|revenue|income|fee/i, clientCol);
+    const monthCol = guess(/month|period|date/i, clientCol);
+    setSetupForm({ name: '', clientCol, amountCol, monthMode: monthCol ? 'column' : 'fixed', monthCol, fixedMonth: '' });
+    setSetup({ fileName, header, grid, resolve });
+  });
+  const [settleMonth, setSettleMonth] = useState('');
   const [ledger, setLedger] = useState<any>(null);
   const [payFor, setPayFor] = useState<{ userId: string; name: string; period: string; suggested: number } | null>(null);
   const [payAmount, setPayAmount] = useState('');
@@ -208,9 +258,14 @@ export const PartnerBrokerage: React.FC<Props> = ({ currentUser }) => {
         if (!r.ok) return;
         const have = ((await r.json()).periods || []).map((x: any) => String(x.partner));
         setPartnerList(prev => [...new Set([...prev, ...have])]);
+        if (canWrite) {
+          const f = await authFetch(`/api/data?action=partner_formats&_=${Date.now()}`, { cache: 'no-store' });
+          if (f.ok) { const list: CustomFormat[] = await f.json(); setCustomFormats(list); setPartnerList(prev => [...new Set([...prev, ...list.map(x => x.partner)])]); }
+        }
       } catch { /* the registry list is enough */ }
     })();
   }, []);
+  useEffect(() => { setSettleMonth(ledger?.settledThrough || ''); }, [ledger]);
   const choosePartner = (code: string) => { setPartner(code); setPeriod(''); setPick({}); setCodeSearch(''); load('', code); };
   useEffect(() => { load(); /* eslint-disable-next-line */ }, []);
   // Changing the month refetches rather than filtering in the browser: the row
@@ -278,13 +333,16 @@ export const PartnerBrokerage: React.FC<Props> = ({ currentUser }) => {
       }
       const grid: string[][] = j.jsonData;
       const header = grid[0].map((h: any) => String(h ?? '').trim());
-      const fmt = PARTNER_FORMATS.find(f => f.signature.every(sig => header.includes(sig)));
+      let fmt: PartnerFormat | undefined = PARTNER_FORMATS.find(f => f.signature.every(sig => header.includes(sig)));
       if (!fmt) {
-        showToast(
-          `Unrecognised file. Expected a ${PARTNER_FORMATS.map(f => f.label).join(' or ')} statement ` +
-          `(Motilal needs the columns ${PARTNER_FORMATS[0].signature.join(', ')}; Volt Money needs ${PARTNER_FORMATS[1].signature.join(', ')}).`,
-          'error');
-        return;
+        const taught = customFormats.find(f => header.includes(f.clientCol) && header.includes(f.amountCol));
+        if (taught) fmt = customToFormat(taught);
+      }
+      if (!fmt) {
+        // Nothing matches: ask what the columns mean instead of refusing the file.
+        const made = await askSetup(file.name, header, grid);
+        if (!made) return;
+        fmt = made;
       }
       const idx = (name: string) => header.indexOf(name);
       const cell = (r: string[], name: string) => {
@@ -317,26 +375,33 @@ export const PartnerBrokerage: React.FC<Props> = ({ currentUser }) => {
         });
       }
       if (!out.length) { showToast('No usable rows in that file.', 'error'); return; }
+      // Lines with no month of their own: ask which month the file is for.
+      const undated = out.filter(r => !r.period).length;
+      if (undated) {
+        const m = await askMonth(`${undated} line${undated !== 1 ? 's have' : ' has'} no month in this file. Which month is it for?`);
+        if (!m) { showToast('Upload cancelled — no month chosen.', 'warning'); return; }
+        for (const r of out) if (!r.period) { r.period = m; r.tradeDate = lastDayOf(m); }
+      }
 
       const save = await authFetch('/api/data', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
           action: 'partner_import',
-          payload: { partner: fmt.code, fileName: file.name, rows: out },
+          payload: { partner: fmt!.code, fileName: file.name, rows: out },
         }),
       });
       const sj = await save.json();
       if (!save.ok) { showToast(sj?.error || 'Import failed.', 'error'); return; }
       showToast(
-        `${fmt.label}: ${sj.written} row${sj.written !== 1 ? 's' : ''} imported` +
+        `${fmt!.label}: ${sj.written} row${sj.written !== 1 ? 's' : ''} imported` +
         (skipped ? `, ${skipped} skipped (no month/date or client)` : '') +
         (sj.replaced ? `. Replaced ${sj.replaced} earlier row${sj.replaced !== 1 ? 's' : ''} for the same month` : '') +
         `. ${sj.unmapped} row${sj.unmapped !== 1 ? 's' : ''} await client mapping.`,
         'success');
-      setPartnerList(prev => [...new Set([...prev, fmt.code])]);
-      setPartner(fmt.code); setPeriod('');
-      await load('', fmt.code);
+      setPartnerList(prev => [...new Set([...prev, fmt!.code])]);
+      setPartner(fmt!.code); setPeriod('');
+      await load('', fmt!.code);
     } catch (e: any) {
       showToast(e?.message || 'Import failed.', 'error');
     } finally {
@@ -497,7 +562,7 @@ export const PartnerBrokerage: React.FC<Props> = ({ currentUser }) => {
           onChange={e => choosePartner(e.target.value)}
           className="px-3 py-2 rounded-lg border border-slate-200 dark:border-slate-600 dark:bg-slate-900 dark:text-slate-100 text-xs font-bold"
         >
-          {partnerList.map(p => <option key={p} value={p}>{labelFor(p)}</option>)}
+          {partnerList.map(p => <option key={p} value={p}>{labelOfPartner(p)}</option>)}
         </select>
       </div>
       {allPeriods.length > 0 && (
@@ -535,16 +600,53 @@ export const PartnerBrokerage: React.FC<Props> = ({ currentUser }) => {
       {canWrite && unmappedCount > 0 && (
         <div className="rounded-xl border-2 border-red-300 dark:border-red-700 bg-red-50 dark:bg-red-900/20 p-4 flex items-start gap-3">
           <Link2 className="w-5 h-5 text-red-600 flex-shrink-0 mt-0.5" />
-          <div>
+          <div className="min-w-0">
             <p className="text-sm font-bold text-red-800 dark:text-red-300">
-              {unmappedCount} client code{unmappedCount !== 1 ? 's are' : ' is'} not attached to a client yet.
+              {unmappedCount} client{unmappedCount !== 1 ? 's are' : ' is'} still missing mapping — {partnerName} money for {unmappedCount !== 1 ? 'them' : 'this client'} reaches no RM or BM yet.
             </p>
             <p className="text-[11px] text-red-700/90 dark:text-red-400/90 mt-1 max-w-3xl">
-              The statement has no RM column — every row is one branch — so until a code is attached, nobody but an
-              admin can see it and it reaches no payout. Attach them below; later imports of the same code then
-              attribute themselves.
+              Attach each one to a client in <b>Client codes</b> below. The moment you do, the amount shows under that client&rsquo;s RM and BM (their dashboard and the Payouts page) for every month it was earned.
             </p>
+            <ul className="mt-2 text-[11px] text-red-800 dark:text-red-300 space-y-0.5">
+              {codes.filter(c => !c.mappedClientId && c.rows_ > 0).sort((a, b) => b.ourShare - a.ourShare).slice(0, 8).map(c => (
+                <li key={c.clientCode} className="font-mono">{c.label || c.clientCode}{c.label && c.label !== c.clientCode ? ` (${c.clientCode})` : ''} — ₹{Number(c.ourShare).toLocaleString('en-IN', { maximumFractionDigits: 2 })}</li>
+              ))}
+              {unmappedCount > 8 && <li>…and {unmappedCount - 8} more</li>}
+            </ul>
           </div>
+        </div>
+      )}
+      {canWrite && (ledger?.noChain || []).length > 0 && (
+        <div className="rounded-xl border-2 border-amber-300 dark:border-amber-700 bg-amber-50 dark:bg-amber-900/20 p-4 flex items-start gap-3">
+          <AlertTriangle className="w-5 h-5 text-amber-600 flex-shrink-0 mt-0.5" />
+          <div>
+            <p className="text-sm font-bold text-amber-800 dark:text-amber-300">
+              {(ledger.noChain as any[]).length} attached client{(ledger.noChain as any[]).length !== 1 ? 's have' : ' has'} no RM or BM above {(ledger.noChain as any[]).length !== 1 ? 'them' : 'it'}.
+            </p>
+            <p className="text-[11px] text-amber-800/90 dark:text-amber-400/90 mt-1 max-w-3xl">Their {partnerName} money reaches nobody. Set the RM/BM on Clients &amp; Map, then press Recalculate.</p>
+            <ul className="mt-2 text-[11px] text-amber-900 dark:text-amber-300 space-y-0.5">
+              {(ledger.noChain as any[]).slice(0, 8).map((n: any) => <li key={n.clientId} className="font-mono">{n.name} — ₹{Number(n.amount).toLocaleString('en-IN', { maximumFractionDigits: 2 })}</li>)}
+            </ul>
+          </div>
+        </div>
+      )}
+
+      {isAdmin && (
+        <div className="rounded-xl border border-slate-200 dark:border-slate-700 bg-white dark:bg-slate-800 p-4 flex items-center gap-3 flex-wrap">
+          <p className="text-xs text-slate-600 dark:text-slate-300 max-w-xl">
+            <b>Already paid:</b> partner payouts for every month up to this one are treated as paid in full (still owed ₹0). Months after it are owed until a payment is recorded.
+          </p>
+          <input type="month" value={settleMonth} onChange={e => setSettleMonth(e.target.value)} className="px-3 py-2 rounded-lg border border-slate-200 dark:border-slate-600 dark:bg-slate-900 dark:text-slate-100 text-xs font-bold" />
+          <button
+            onClick={async () => {
+              const res = await authFetch('/api/data', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ action: 'partner_settled_through', payload: { period: settleMonth || null } }) });
+              const j = await res.json();
+              if (!res.ok) { showToast(j?.error || 'Could not save.', 'error'); return; }
+              showToast(settleMonth ? `Partner payouts up to ${prettyMonth(settleMonth)} now show as paid.` : 'Cleared — nothing is treated as paid automatically.', 'success');
+              await load();
+            }}
+            className="px-3 py-2 rounded-lg bg-emerald-600 text-white text-xs font-bold hover:bg-emerald-700 transition"
+          >Save</button>
         </div>
       )}
 
@@ -691,6 +793,84 @@ export const PartnerBrokerage: React.FC<Props> = ({ currentUser }) => {
             </>
           )}
       </Panel>
+
+      {/* Which month is this file for? */}
+      {monthAsk && (
+        <div className="fixed inset-0 z-50 bg-slate-900/50 flex items-center justify-center p-4">
+          <div className="bg-white dark:bg-slate-800 rounded-2xl border border-slate-200 dark:border-slate-700 p-5 w-full max-w-sm">
+            <h3 className="font-bold text-slate-900 dark:text-slate-100">Which month is this file for?</h3>
+            <p className="text-xs text-slate-500 dark:text-slate-400 mt-1">{monthAsk.message}</p>
+            <input type="month" value={monthPick} onChange={e => setMonthPick(e.target.value)} className="mt-3 w-full px-3 py-2 rounded-lg border border-slate-200 dark:border-slate-600 dark:bg-slate-900 dark:text-slate-100" />
+            <p className="text-[11px] text-slate-400 mt-2">If this month was uploaded before for this partner, this file replaces it.</p>
+            <div className="flex gap-2 mt-4">
+              <button onClick={() => { monthAsk.resolve(null); setMonthAsk(null); }} className="flex-1 px-4 py-2 rounded-lg border border-slate-200 dark:border-slate-600 text-slate-600 dark:text-slate-300 text-sm font-bold">Cancel</button>
+              <button disabled={!monthPick} onClick={() => { monthAsk.resolve(monthPick); setMonthAsk(null); }} className="flex-1 px-4 py-2 rounded-lg bg-blue-600 text-white text-sm font-bold disabled:opacity-40">Continue</button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* A file the system has not seen before: say what its columns mean */}
+      {setup && (
+        <div className="fixed inset-0 z-50 bg-slate-900/50 flex items-center justify-center p-4">
+          <div className="bg-white dark:bg-slate-800 rounded-2xl border border-slate-200 dark:border-slate-700 p-5 w-full max-w-lg max-h-[90vh] overflow-y-auto">
+            <h3 className="font-bold text-slate-900 dark:text-slate-100">New partner file</h3>
+            <p className="text-xs text-slate-500 dark:text-slate-400 mt-1">{setup.fileName} is not a layout the system knows. Tell it what the columns mean once; the next file with the same columns is read on its own.</p>
+            <label className="block text-[10px] font-black uppercase tracking-widest text-slate-400 mt-4 mb-1">Partner / product name</label>
+            <input value={setupForm.name} onChange={e => setSetupForm({ ...setupForm, name: e.target.value })} placeholder="e.g. ICICI" className="w-full px-3 py-2 rounded-lg border border-slate-200 dark:border-slate-600 dark:bg-slate-900 dark:text-slate-100" />
+            <div className="grid grid-cols-2 gap-3 mt-3">
+              <div>
+                <label className="block text-[10px] font-black uppercase tracking-widest text-slate-400 mb-1">Client column</label>
+                <select value={setupForm.clientCol} onChange={e => setSetupForm({ ...setupForm, clientCol: e.target.value })} className="w-full px-3 py-2 rounded-lg border border-slate-200 dark:border-slate-600 dark:bg-slate-900 dark:text-slate-100 text-sm">
+                  <option value="">Choose…</option>{setup.header.filter(h => h).map(h => <option key={h} value={h}>{h}</option>)}
+                </select>
+              </div>
+              <div>
+                <label className="block text-[10px] font-black uppercase tracking-widest text-slate-400 mb-1">Amount we earn</label>
+                <select value={setupForm.amountCol} onChange={e => setSetupForm({ ...setupForm, amountCol: e.target.value })} className="w-full px-3 py-2 rounded-lg border border-slate-200 dark:border-slate-600 dark:bg-slate-900 dark:text-slate-100 text-sm">
+                  <option value="">Choose…</option>{setup.header.filter(h => h).map(h => <option key={h} value={h}>{h}</option>)}
+                </select>
+              </div>
+            </div>
+            <label className="block text-[10px] font-black uppercase tracking-widest text-slate-400 mt-3 mb-1">Month</label>
+            <div className="flex gap-2 flex-wrap items-center">
+              <select value={setupForm.monthMode} onChange={e => setSetupForm({ ...setupForm, monthMode: e.target.value })} className="px-3 py-2 rounded-lg border border-slate-200 dark:border-slate-600 dark:bg-slate-900 dark:text-slate-100 text-sm">
+                <option value="column">The file has a month column</option>
+                <option value="fixed">The whole file is one month</option>
+              </select>
+              {setupForm.monthMode === 'column'
+                ? <select value={setupForm.monthCol} onChange={e => setSetupForm({ ...setupForm, monthCol: e.target.value })} className="px-3 py-2 rounded-lg border border-slate-200 dark:border-slate-600 dark:bg-slate-900 dark:text-slate-100 text-sm"><option value="">Choose…</option>{setup.header.filter(h => h).map(h => <option key={h} value={h}>{h}</option>)}</select>
+                : <input type="month" value={setupForm.fixedMonth} onChange={e => setSetupForm({ ...setupForm, fixedMonth: e.target.value })} className="px-3 py-2 rounded-lg border border-slate-200 dark:border-slate-600 dark:bg-slate-900 dark:text-slate-100 text-sm" />}
+            </div>
+            <div className="mt-3 overflow-x-auto rounded-lg border border-slate-200 dark:border-slate-700">
+              <table className="w-full text-[11px]"><tbody>
+                <tr className="bg-slate-50 dark:bg-slate-900/40 font-bold">{setup.header.slice(0, 6).map((h, i) => <td key={i} className="px-2 py-1 whitespace-nowrap">{h}</td>)}</tr>
+                {setup.grid.slice(1, 4).map((r, ri) => <tr key={ri}>{r.slice(0, 6).map((c, i) => <td key={i} className="px-2 py-1 whitespace-nowrap text-slate-500">{String(c ?? '')}</td>)}</tr>)}
+              </tbody></table>
+            </div>
+            <div className="flex gap-2 mt-4">
+              <button onClick={() => { setup.resolve(null); setSetup(null); }} className="flex-1 px-4 py-2 rounded-lg border border-slate-200 dark:border-slate-600 text-slate-600 dark:text-slate-300 text-sm font-bold">Cancel</button>
+              <button
+                onClick={async () => {
+                  const f = setupForm; const code = f.name.toUpperCase().replace(/[^A-Z0-9]/g, '').slice(0, 20);
+                  if (code.length < 2) { showToast('Give the partner a name.', 'warning'); return; }
+                  if (!f.clientCol || !f.amountCol || f.clientCol === f.amountCol) { showToast('Choose a client column and a different amount column.', 'warning'); return; }
+                  if (f.monthMode === 'column' && !f.monthCol) { showToast('Choose the month column, or say the whole file is one month.', 'warning'); return; }
+                  if (f.monthMode === 'fixed' && !f.fixedMonth) { showToast('Pick the month this file is for.', 'warning'); return; }
+                  const cf: CustomFormat = { partner: code, label: f.name.trim(), clientCol: f.clientCol, amountCol: f.amountCol, monthCol: f.monthMode === 'column' ? f.monthCol : '' };
+                  const res = await authFetch('/api/data', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ action: 'partner_format_save', payload: { partner: code, label: cf.label, format: cf } }) });
+                  const j = await res.json();
+                  if (!res.ok) { showToast(j?.error || 'Could not save the layout.', 'error'); return; }
+                  setCustomFormats(prev => [...prev.filter(x => x.partner !== code), cf]);
+                  setup.resolve(customToFormat(cf, f.monthMode === 'fixed' ? f.fixedMonth : ''));
+                  setSetup(null);
+                }}
+                className="flex-1 px-4 py-2 rounded-lg bg-blue-600 text-white text-sm font-bold hover:bg-blue-700 transition"
+              >Save &amp; import</button>
+            </div>
+          </div>
+        </div>
+      )}
 
       {/* Record-a-payment dialog */}
       {payFor && (
