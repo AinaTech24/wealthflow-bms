@@ -8,6 +8,7 @@
 export const SOURCE_LABEL: Record<string, string> = {
   MF: 'Mutual fund',
   MOFSL: 'Motilal Oswal',
+  VOLT: 'Volt Money',
 };
 
 export const labelFor = (key: string) => (key === 'all' ? 'All products' : SOURCE_LABEL[key] || key);

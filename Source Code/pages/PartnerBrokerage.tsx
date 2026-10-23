@@ -5,6 +5,7 @@ import { TeamMember, Role } from '../types';
 import { useData, authFetch } from '../contexts/DataContext';
 import { useToast } from '../components/Toast';
 import { formatCompactINR } from '../utils/formatINR';
+import { labelFor } from '../utils/payoutSources';
 
 interface Props { currentUser: TeamMember }
 
@@ -32,6 +33,44 @@ interface PartnerFormat {
   };
   /** Columns kept verbatim for the detail view; not used in any total. */
   extra: string[];
+  /** A statement that is not a daily trade list (e.g. one line per customer per month) reads itself. */
+  parse?: (grid: string[][], header: string[]) => { rows: any[]; skipped: number };
+}
+
+// "2026-06" | "Jun 2026" | "01/06/2026" -> "2026-06"
+function monthOf(raw: string): string | null {
+  const s = String(raw || '').trim();
+  if (/^\d{4}-\d{2}$/.test(s)) return s;
+  const m = s.match(/^([A-Za-z]{3})[a-z]*[\s-]+(\d{4})$/);
+  if (m && MONTHS[m[1].toLowerCase()]) return `${m[2]}-${MONTHS[m[1].toLowerCase()]}`;
+  const d = parseTradeDate(s);
+  return d ? d.slice(0, 7) : null;
+}
+const lastDayOf = (period: string) => { const [y, mo] = period.split('-').map(Number); return `${period}-${String(new Date(y, mo, 0).getDate()).padStart(2, '0')}`; };
+
+// Volt Money: one line per customer per month, upfront + trail, and the invoice total the firm raises.
+// There is no client code, so the customer NAME is the code; it is matched to a client by name.
+function parseVolt(grid: string[][], header: string[]) {
+  const at = (n: string) => header.findIndex(h => h.toLowerCase() === n.toLowerCase());
+  const iM = at('Month'), iN = at('Customer name'), iU = at('Upfront amount'), iT = at('Trail amount'), iTot = at('Total invoice amount');
+  const rows: any[] = []; let skipped = 0;
+  for (const r of grid.slice(1)) {
+    if (!r || r.every(c => String(c ?? '').trim() === '')) continue;
+    const period = monthOf(String(r[iM] ?? ''));
+    const name = String(r[iN] ?? '').replace(/\s+/g, ' ').trim();
+    if (!period || !name) { skipped++; continue; }
+    const up = num(r[iU]), tr = num(r[iT]), tot = num(r[iTot]);
+    const parts = ([['UPFRONT', up], ['TRAIL', tr]] as [string, number][]).filter(([, v]) => v !== 0);
+    if (!parts.length && tot !== 0) parts.push(['TOTAL', tot]);
+    for (const [cat, amt] of parts) {
+      rows.push({
+        clientCode: name.toUpperCase(), tradeDate: lastDayOf(period), period, segment: 'Volt Money', tradeCategory: cat,
+        totalBrokerage: amt, ourShare: amt, partnerShare: 0, product: '', parentProfile: '',
+        extra: { clientName: name, 'Customer name': name },
+      });
+    }
+  }
+  return { rows, skipped };
 }
 
 const PARTNER_FORMATS: PartnerFormat[] = [
@@ -52,6 +91,14 @@ const PARTNER_FORMATS: PartnerFormat[] = [
     extra: ['Branch Code', 'Subbroker Code', 'DealerCode', 'BusinessType', 'Product',
             'Sub Prod Code', 'Parent Profile', 'BA Profile', 'BA Sharing',
             'Referral Value', 'Parent Sharing Percent'],
+  },
+  {
+    code: 'VOLT',
+    label: 'Volt Money — Earnings report',
+    signature: ['Customer name', 'Total invoice amount'],
+    columns: { clientCode: 'Customer name', tradeDate: 'Month', segment: '', tradeCategory: '', totalBrokerage: 'Total invoice amount', ourShare: 'Total invoice amount', partnerShare: '' },
+    extra: [],
+    parse: parseVolt,
   },
 ];
 
@@ -108,7 +155,10 @@ export const PartnerBrokerage: React.FC<Props> = ({ currentUser }) => {
   const [pick, setPick] = useState<Record<string, string>>({});
   const fileRef = useRef<HTMLInputElement>(null);
 
-  const partner = 'MOFSL';
+  // Which partner's statements are on screen. Every partner that has imported a file is in the dropdown.
+  const [partner, setPartner] = useState('MOFSL');
+  const [partnerList, setPartnerList] = useState<string[]>(PARTNER_FORMATS.map(f => f.code));
+  const partnerName = labelFor(partner);
   const [ledger, setLedger] = useState<any>(null);
   const [payFor, setPayFor] = useState<{ userId: string; name: string; period: string; suggested: number } | null>(null);
   const [payAmount, setPayAmount] = useState('');
@@ -120,14 +170,14 @@ export const PartnerBrokerage: React.FC<Props> = ({ currentUser }) => {
   const [period, setPeriod] = useState('');
   const [allPeriods, setAllPeriods] = useState<string[]>([]);
 
-  const load = async (p = period) => {
+  const load = async (p = period, pr = partner) => {
     setBusy(true);
-    const q = p ? `&period=${encodeURIComponent(p)}` : '';
+    const q = (p ? `&period=${encodeURIComponent(p)}` : '') + `&partner=${encodeURIComponent(pr)}`;
     try {
       const [s, r, l] = await Promise.all([
         authFetch(`/api/data?action=partner_summary${q}&_=${Date.now()}`, { cache: 'no-store' }),
         authFetch(`/api/data?action=partner_rows${q}&_=${Date.now()}`, { cache: 'no-store' }),
-        authFetch(`/api/data?action=partner_ledger&partner=${partner}&_=${Date.now()}`, { cache: 'no-store' }),
+        authFetch(`/api/data?action=partner_ledger&partner=${pr}&_=${Date.now()}`, { cache: 'no-store' }),
       ]);
       if (s.ok) {
         const body = await s.json();
@@ -139,11 +189,11 @@ export const PartnerBrokerage: React.FC<Props> = ({ currentUser }) => {
       if (r.ok) setRows(await r.json());
       if (l.ok) setLedger(await l.json());
       if (p) {
-        const a = await authFetch(`/api/data?action=partner_summary&_=${Date.now()}`, { cache: 'no-store' });
+        const a = await authFetch(`/api/data?action=partner_summary&partner=${encodeURIComponent(pr)}&_=${Date.now()}`, { cache: 'no-store' });
         if (a.ok) setAllPeriods(((await a.json()).periods || []).map((x: any) => x.period));
       }
       if (canWrite) {
-        const c = await authFetch(`/api/data?action=partner_codes&period=${encodeURIComponent(p || '')}&_=${Date.now()}`, { cache: 'no-store' });
+        const c = await authFetch(`/api/data?action=partner_codes&partner=${encodeURIComponent(pr)}&period=${encodeURIComponent(p || '')}&_=${Date.now()}`, { cache: 'no-store' });
         if (c.ok) setCodes(await c.json());
       }
     } catch {
@@ -151,6 +201,17 @@ export const PartnerBrokerage: React.FC<Props> = ({ currentUser }) => {
     } finally { setBusy(false); }
   };
 
+  useEffect(() => {
+    (async () => {
+      try {
+        const r = await authFetch(`/api/data?action=partner_summary&_=${Date.now()}`, { cache: 'no-store' });
+        if (!r.ok) return;
+        const have = ((await r.json()).periods || []).map((x: any) => String(x.partner));
+        setPartnerList(prev => [...new Set([...prev, ...have])]);
+      } catch { /* the registry list is enough */ }
+    })();
+  }, []);
+  const choosePartner = (code: string) => { setPartner(code); setPeriod(''); setPick({}); setCodeSearch(''); load('', code); };
   useEffect(() => { load(); /* eslint-disable-next-line */ }, []);
   // Changing the month refetches rather than filtering in the browser: the row
   // endpoint caps at 20,000 rows, so a client-side filter would quietly lie once
@@ -183,7 +244,7 @@ export const PartnerBrokerage: React.FC<Props> = ({ currentUser }) => {
         sheets.push({
           name: monthLabel(m),
           rows: lines.filter(l => l.period === m).map(l => ({
-            'Client code': l.clientCode, 'Name (Motilal)': l.motilalName, 'WealthFlow client': l.client || '(not attached)',
+            'Client code': l.clientCode, [`Name (${partnerName})`]: l.motilalName, 'WealthFlow client': l.client || '(not attached)',
             'L1 RM': l.l1, 'L2 RM': l.l2, 'L3 RM': l.l3, 'L4 BM': l.l4, L5: l.l5, L6: l.l6, L7: l.l7,
             Type: l.category === 'TRD' ? 'Trading' : l.category === 'DEL' ? 'Delivery' : l.category,
             'Total brokerage': round2(l.total), 'Our share': round2(l.ourShare),
@@ -198,7 +259,7 @@ export const PartnerBrokerage: React.FC<Props> = ({ currentUser }) => {
           'Our share on their clients': x.ourShare, 'Payout (at the set %)': x.payout,
         })),
       });
-      await exportSheetsToExcel(sheets, `motilal-brokerage-${new Date().toISOString().slice(0, 10)}`);
+      await exportSheetsToExcel(sheets, `${partner.toLowerCase()}-brokerage-${new Date().toISOString().slice(0, 10)}`);
       showToast(`Exported ${months.length} month${months.length !== 1 ? 's' : ''}.`, 'success');
     } catch { showToast('Could not build the export.', 'error'); } finally { setExporting(false); }
   };
@@ -221,7 +282,7 @@ export const PartnerBrokerage: React.FC<Props> = ({ currentUser }) => {
       if (!fmt) {
         showToast(
           `Unrecognised file. Expected a ${PARTNER_FORMATS.map(f => f.label).join(' or ')} statement ` +
-          `(needs the columns ${PARTNER_FORMATS[0].signature.join(', ')}).`,
+          `(Motilal needs the columns ${PARTNER_FORMATS[0].signature.join(', ')}; Volt Money needs ${PARTNER_FORMATS[1].signature.join(', ')}).`,
           'error');
         return;
       }
@@ -231,9 +292,10 @@ export const PartnerBrokerage: React.FC<Props> = ({ currentUser }) => {
         return i >= 0 ? String(r[i] ?? '').trim() : '';
       };
 
-      const out: any[] = [];
+      let out: any[] = [];
       let skipped = 0;
-      for (const r of grid.slice(1)) {
+      if (fmt.parse) { const pr = fmt.parse(grid, header); out = pr.rows; skipped = pr.skipped; }
+      else for (const r of grid.slice(1)) {
         if (!r || r.every(c => String(c ?? '').trim() === '')) continue;
         const tradeDate = parseTradeDate(cell(r, fmt.columns.tradeDate));
         const clientCode = cell(r, fmt.columns.clientCode);
@@ -268,11 +330,13 @@ export const PartnerBrokerage: React.FC<Props> = ({ currentUser }) => {
       if (!save.ok) { showToast(sj?.error || 'Import failed.', 'error'); return; }
       showToast(
         `${fmt.label}: ${sj.written} row${sj.written !== 1 ? 's' : ''} imported` +
-        (skipped ? `, ${skipped} skipped (no date or client code)` : '') +
+        (skipped ? `, ${skipped} skipped (no month/date or client)` : '') +
         (sj.replaced ? `. Replaced ${sj.replaced} earlier row${sj.replaced !== 1 ? 's' : ''} for the same month` : '') +
         `. ${sj.unmapped} row${sj.unmapped !== 1 ? 's' : ''} await client mapping.`,
         'success');
-      await load();
+      setPartnerList(prev => [...new Set([...prev, fmt.code])]);
+      setPartner(fmt.code); setPeriod('');
+      await load('', fmt.code);
     } catch (e: any) {
       showToast(e?.message || 'Import failed.', 'error');
     } finally {
@@ -360,7 +424,7 @@ export const PartnerBrokerage: React.FC<Props> = ({ currentUser }) => {
           <h1 className="text-2xl font-bold text-slate-900 dark:text-slate-100 tracking-tight">Partner Brokerage</h1>
           <p className="text-sm text-slate-500 dark:text-slate-400 mt-0.5">
             {canWrite
-              ? 'Broking revenue from Motilal Oswal and other partners — separate from mutual fund trail.'
+              ? 'Broking and partner revenue (Motilal Oswal, Volt Money and others) — each partner on its own, separate from mutual fund trail.'
               : 'Broking revenue from your mapped clients.'}
           </p>
         </div>
@@ -414,7 +478,7 @@ export const PartnerBrokerage: React.FC<Props> = ({ currentUser }) => {
           accent
           hint={canWrite ? 'our side of the split, stated by the file' : "the firm's cut on your clients"}
         />
-        <Tile label="Partner brokerage" value={totals?.partnerShare} hint={`retained by ${partner}`} />
+        <Tile label="Partner brokerage" value={totals?.partnerShare} hint={`retained by ${partnerName}`} />
         {canWrite
           ? <Tile
               label="Payout brokerage"
@@ -424,7 +488,18 @@ export const PartnerBrokerage: React.FC<Props> = ({ currentUser }) => {
           : <Tile label="Your payout" value={myEarning ?? 0} accent hint="by the mutual-fund rule, on your clients" />}
       </div>
 
-      {/* ── Month ─────────────────────────────────────────────────────────── */}
+      {/* ── Partner / Month ───────────────────────────────────────────────── */}
+      <div className="flex items-center gap-3 flex-wrap">
+        <label htmlFor="pb-partner" className="text-[10px] font-black uppercase tracking-widest text-slate-400">Partner</label>
+        <select
+          id="pb-partner"
+          value={partner}
+          onChange={e => choosePartner(e.target.value)}
+          className="px-3 py-2 rounded-lg border border-slate-200 dark:border-slate-600 dark:bg-slate-900 dark:text-slate-100 text-xs font-bold"
+        >
+          {partnerList.map(p => <option key={p} value={p}>{labelFor(p)}</option>)}
+        </select>
+      </div>
       {allPeriods.length > 0 && (
         <div className="flex items-center gap-3 flex-wrap">
           <label htmlFor="pb-month" className="text-[10px] font-black uppercase tracking-widest text-slate-400">Month</label>
@@ -447,7 +522,7 @@ export const PartnerBrokerage: React.FC<Props> = ({ currentUser }) => {
 
       {canWrite && (
         <div className="rounded-xl border border-slate-200 dark:border-slate-700 bg-white dark:bg-slate-800 p-4">
-          <p className="text-sm font-bold text-slate-900 dark:text-slate-100">How {partner} is paid out</p>
+          <p className="text-sm font-bold text-slate-900 dark:text-slate-100">How {partnerName} is paid out</p>
           <p className="text-xs text-slate-500 dark:text-slate-400 mt-1 max-w-3xl">
             The statement gives the firm&rsquo;s share (&ldquo;mentor brokerage&rdquo;). That share is split across each client&rsquo;s RM and BM exactly as mutual funds are:
             the company&rsquo;s % comes off first (an L5 or L6 takes its 5% out of it), the RMs take their own %, and the BM &mdash; or whoever is first above
@@ -559,7 +634,7 @@ export const PartnerBrokerage: React.FC<Props> = ({ currentUser }) => {
               <p className="text-[11px] text-slate-500 dark:text-slate-400 mb-3 max-w-3xl">
                 {period ? <>Showing <b>{period}</b>.</> : <>Showing <b>all months</b> added up per person — pick a month above to see just that month.</>}
                 {' '}<b>Brought fwd</b> is what was still owed when {period ? 'the month' : 'the first month'} opened and <b>Still owed</b> is what is
-                owed after it. GST, TDS and the cheque are <span className="text-amber-600 font-black">estimates</span> on {partner}&rsquo;s earnings at the
+                owed after it. GST, TDS and the cheque are <span className="text-amber-600 font-black">estimates</span> on {partnerName}&rsquo;s earnings at the
                 configured rates. Pay a month in parts and the ledger adds the parts up.
               </p>
               <div className="overflow-x-auto">
@@ -704,7 +779,7 @@ export const PartnerBrokerage: React.FC<Props> = ({ currentUser }) => {
                           <div className="flex items-center gap-2">
                             <select
                               id={`map-${c.clientCode}`}
-                              value={pick[c.clientCode] ?? c.mappedClientId ?? suggestionFor(c.label)}
+                              value={pick[c.clientCode] ?? c.mappedClientId ?? suggestionFor(c.label || c.clientCode)}
                               onChange={e => setPick(p => ({ ...p, [c.clientCode]: e.target.value }))}
                               className="text-xs rounded-lg border border-slate-200 dark:border-slate-600 dark:bg-slate-900 dark:text-slate-100 px-2 py-1.5 max-w-[260px]"
                             >
@@ -716,9 +791,9 @@ export const PartnerBrokerage: React.FC<Props> = ({ currentUser }) => {
                                 <option key={cl.id} value={cl.id}>{cl.name}{cl.pan ? ` · ${cl.pan}` : ''}</option>
                               ))}
                             </select>
-                            {(pick[c.clientCode] ?? c.mappedClientId ?? suggestionFor(c.label)) !== (c.mappedClientId ?? '') && (
+                            {(pick[c.clientCode] ?? c.mappedClientId ?? suggestionFor(c.label || c.clientCode)) !== (c.mappedClientId ?? '') && (
                               <button
-                                onClick={() => saveMapping(c.clientCode, pick[c.clientCode] ?? suggestionFor(c.label))}
+                                onClick={() => saveMapping(c.clientCode, pick[c.clientCode] ?? suggestionFor(c.label || c.clientCode))}
                                 className="px-2.5 py-1.5 rounded-lg bg-emerald-600 text-white text-[10px] font-black uppercase tracking-widest hover:bg-emerald-700 transition flex items-center gap-1"
                               >
                                 <Check className="w-3 h-3" /> Save

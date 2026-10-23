@@ -1,5 +1,5 @@
 import React, { useState, useEffect, useMemo, useRef } from 'react';
-import { Wallet, Search, RefreshCw, AlertTriangle, Download, Upload, ShieldAlert, ChevronDown } from 'lucide-react';
+import { Wallet, Search, RefreshCw, AlertTriangle, Download, ShieldAlert, ChevronDown } from 'lucide-react';
 import { TeamMember, Role } from '../types';
 import { authFetch } from '../contexts/DataContext';
 import { useToast } from '../components/Toast';
@@ -58,7 +58,6 @@ export const Payouts: React.FC<Props> = ({ currentUser }) => {
   const [payFor, setPayFor] = useState<{ p: Person; m: MonthRow } | null>(null);
   const [amount, setAmount] = useState('');
   const [reference, setReference] = useState('');
-  const importRef = useRef<HTMLInputElement>(null);
   const [health, setHealth] = useState<any>(null);
   const [openCheck, setOpenCheck] = useState<string | null>(null);
 
@@ -162,76 +161,6 @@ export const Payouts: React.FC<Props> = ({ currentUser }) => {
   const payView = payFor ? view(payFor.m) : null;
   const payTax = payFor ? taxFor(payFor.m) : null;
 
-  // ── Bulk import ───────────────────────────────────────────────────────────
-  // Export the month, fill the "Pay now" column, upload it back. Settling 121
-  // people one dialog at a time is not a workflow.
-  const importPayments = async (file: File) => {
-    setBusy(true);
-    try {
-      const form = new FormData();
-      form.append('file', file);
-      const res = await authFetch('/api/parse-sheet', { method: 'POST', body: form });
-      const j = await res.json();
-      if (!j?.ok || !Array.isArray(j.jsonData) || j.jsonData.length < 2) {
-        showToast('Could not read that file.', 'error'); return;
-      }
-      const grid: any[][] = j.jsonData;
-      const header = grid[0].map((h: any) => String(h ?? '').trim().toLowerCase());
-      const col = (...names: string[]) => {
-        for (const n of names) { const i = header.indexOf(n.toLowerCase()); if (i >= 0) return i; }
-        return -1;
-      };
-      const iAmount = col('pay now', 'amount', 'paid now', 'payment');
-      const iCode = col('code', 'employee code', 'arn');
-      const iName = col('name', 'person');
-      const iRef = col('reference', 'utr', 'ref');
-      if (iAmount < 0) {
-        showToast('That sheet has no "Pay now" column. Export this month, fill that column in, and upload it back.', 'error');
-        return;
-      }
-      if (iCode < 0 && iName < 0) {
-        showToast('That sheet has neither a Code nor a Name column, so the payments cannot be matched to people.', 'error');
-        return;
-      }
-      const payload = grid.slice(1).map(r => ({
-        code: iCode >= 0 ? String(r[iCode] ?? '').trim() : '',
-        name: iName >= 0 ? String(r[iName] ?? '').trim() : '',
-        reference: iRef >= 0 ? String(r[iRef] ?? '').trim() : '',
-        amount: Number(String(r[iAmount] ?? '').replace(/[₹,\s]/g, '')),
-      })).filter(x => Number.isFinite(x.amount) && x.amount !== 0);
-
-      if (!payload.length) {
-        showToast('Nothing to record — the "Pay now" column is empty on every row.', 'warning');
-        return;
-      }
-      const total = payload.reduce((a, x) => a + x.amount, 0);
-      if (!window.confirm(
-        `Record ${payload.length} payment${payload.length !== 1 ? 's' : ''} totalling ${inr(total)} ` +
-        `for ${prettyMonth(period)}, against ${labelFor(paySource)}?` +
-        `\n\nThis adds to whatever has already been recorded for this month.`)) return;
-
-      const save = await authFetch('/api/data', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        // Booked against the product on screen, same as a single payment — an
-        // uploaded Motilal sheet must not clear mutual fund balances.
-        body: JSON.stringify({ action: 'settle_bulk', payload: { source: paySource, period, rows: payload } }),
-      });
-      const sj = await save.json();
-      if (!save.ok) { showToast(sj?.error || 'Import failed.', 'error'); return; }
-      showToast(
-        `${sj.recorded} payment${sj.recorded !== 1 ? 's' : ''} recorded, ${inr(sj.total)} in total` +
-        (sj.skipped?.length ? ` · ${sj.skipped.length} row(s) skipped (${sj.skipped.slice(0, 3).map((s: any) => s.label || '?').join(', ')}${sj.skipped.length > 3 ? '…' : ''})` : ''),
-        sj.skipped?.length ? 'warning' : 'success');
-      await load();
-    } catch (e: any) {
-      showToast(e?.message || 'Import failed.', 'error');
-    } finally {
-      setBusy(false);
-      if (importRef.current) importRef.current.value = '';
-    }
-  };
-
   const recordPayment = async () => {
     if (!payFor) return;
     const amt = Number(amount);
@@ -291,9 +220,6 @@ export const Payouts: React.FC<Props> = ({ currentUser }) => {
           <button
             onClick={() => {
               if (!rows.length) { showToast('Nothing to export for this month.', 'warning'); return; }
-              // "Pay now" ships empty on purpose: fill it in, upload the same
-              // sheet back, and those become the month's payments. Leaving the
-              // already-Paid column to be re-read would double every payment.
               exportToExcel(rows.map(({ p, m, v, t }) => ({
                 Name: p.name, Code: p.code, Level: p.level ?? '',
                 Product: labelFor(source),
@@ -304,28 +230,11 @@ export const Payouts: React.FC<Props> = ({ currentUser }) => {
                      'Invoice raised': t.invoiced ? (t.invoiceStatus || 'YES') : 'no' },
                 'Already paid': v.paid,
                 'Still owed': v.outstanding,
-                'Pay now': '',
-                Reference: '',
               })), `Payouts_${period}${source === 'all' ? '' : `_${source}`}`, 'Payouts');
             }}
             className="px-3 py-2 rounded-lg border border-slate-200 dark:border-slate-600 text-slate-600 dark:text-slate-300 text-xs font-bold flex items-center gap-1.5 hover:border-emerald-400 transition"
           >
             <Download className="w-3.5 h-3.5" /> Export
-          </button>
-          <input
-            ref={importRef}
-            id="payout-import"
-            type="file"
-            accept=".csv,.xlsx,.xls"
-            className="hidden"
-            onChange={e => { const f = e.target.files?.[0]; if (f) importPayments(f); }}
-          />
-          <button
-            onClick={() => importRef.current?.click()}
-            disabled={busy}
-            className="bg-blue-600 text-white px-3 py-2 rounded-lg text-xs font-bold shadow-lg shadow-blue-100 dark:shadow-none hover:bg-blue-700 transition flex items-center gap-1.5 disabled:opacity-50"
-          >
-            <Upload className="w-3.5 h-3.5" /> Import payments
           </button>
         </div>
       </div>
