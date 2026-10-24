@@ -940,6 +940,9 @@ export const Imports: React.FC<ImportsProps> = ({ currentUser }) => {
       // a folio — 201 of them reached production this way from one Karvy file.
       const isTruncatedFolio = (f: string) => /^\d{6}0{5,}$/.test(String(f || '').trim());
       const clientByName = new Map<string, Client | null>();
+      // Folios the firm has decided belong to NO client record (Admin: config.folioBlocklist). A row on one of them is never matched
+      // to a client by folio, PAN or name and never creates one, so it stays unmapped for review instead of drifting onto a namesake.
+      const blockedFolios = new Set<string>(((globalConfig as any)?.folioBlocklist || []).map((x: any) => String(x).trim()));
       // PAN is NOT a unique investor key in Indian mutual funds: a MINOR invests
       // under the guardian's PAN, so siblings legitimately share one (verified in
       // this book: Jiyanshi/Jisha Sodingara, Jiyan/Jyot Vaishnani, Tulsi/Dhyani
@@ -1076,6 +1079,7 @@ export const Imports: React.FC<ImportsProps> = ({ currentUser }) => {
         if (!row || row.length === 0) continue;
 
         const folio = String(row[mapIndices['folio']] || '');
+        const folioBlocked = !!folio && blockedFolios.has(folio.trim());
         const pan = String(row[mapIndices['pan']] || '').toUpperCase().trim();
         const investorName = String(row[mapIndices['investorName']] || 'Unknown');
 
@@ -1151,7 +1155,7 @@ export const Imports: React.FC<ImportsProps> = ({ currentUser }) => {
         // which is what mixed two siblings' holdings onto a single client record.
         // PAN is only trusted when the NAME also matches, or when that PAN has
         // exactly one client on file (no family sharing it).
-        const panOwners = effectivePan ? (clientsByPan.get(effectivePan) || []) : [];
+        const panOwners = effectivePan && !folioBlocked ? (clientsByPan.get(effectivePan) || []) : [];
 
         // Resolve the folio against EVERY record claiming it, and let the investor
         // name break the tie. One claimant is used unless the name flatly
@@ -1162,7 +1166,7 @@ export const Imports: React.FC<ImportsProps> = ({ currentUser }) => {
         // Unmapped is the right failure: it is visible on this page and reaches
         // nobody, whereas a confident wrong guess reaches the wrong person's payout
         // and nothing says so.
-        const folioClaimants = folio ? (clientsByFolio.get(folio) || []) : [];
+        const folioClaimants = folio && !folioBlocked ? (clientsByFolio.get(folio) || []) : [];
         let folioMatch: Client | undefined;
         if (folioClaimants.length === 1) {
           folioMatch = nameContradicts(folioClaimants[0].name, investorName) ? undefined : folioClaimants[0];
@@ -1190,7 +1194,7 @@ export const Imports: React.FC<ImportsProps> = ({ currentUser }) => {
 
         let matchedClient: Client | undefined =
           folioMatch ||
-          (effectivePan ? clientByPanName.get(effectivePan + '|' + nameKey(investorName)) : undefined) ||
+          (effectivePan && !folioBlocked ? clientByPanName.get(effectivePan + '|' + nameKey(investorName)) : undefined) ||
           (panOwners.length === 1 ? panOwners[0] : undefined);
 
         // Enrich the matched client: append a folio not yet on that record, and
@@ -1250,7 +1254,7 @@ export const Imports: React.FC<ImportsProps> = ({ currentUser }) => {
         //    with no RM yet is still the same investor, and skipping them here
         //    drops through to the auto-create fallback below, which mints a
         //    duplicate `c_bkg_` record for someone who already exists.
-        if (!matchedClient) {
+        if (!matchedClient && !folioBlocked) {
           const byName = clientByName.get(normName(investorName));
           if (byName) {
             const live = foundNewClients[byName.id] || byName;
@@ -1265,7 +1269,7 @@ export const Imports: React.FC<ImportsProps> = ({ currentUser }) => {
           }
         }
 
-        if (!matchedClient && effectivePan) {
+        if (!matchedClient && effectivePan && !folioBlocked) {
           const panNameKey = effectivePan + '|' + nameKey(investorName);
           if (foundNewClients[panNameKey]) {
             matchedClient = foundNewClients[panNameKey];
@@ -1307,7 +1311,7 @@ export const Imports: React.FC<ImportsProps> = ({ currentUser }) => {
         //    a Folio Master later carries this investor's PAN it matches by folio and
         //    backfills the PAN into this same record (no duplicate). This guarantees
         //    no new investor is ever lost to "unmapped".
-        if (!matchedClient && !isMasterImport && investorName && investorName.trim() && folio) {
+        if (!matchedClient && !folioBlocked && !isMasterImport && investorName && investorName.trim() && folio) {
           const nkey = `c_bkg_${normName(investorName)}`;
           if (foundNewClients[nkey]) {
             matchedClient = foundNewClients[nkey];

@@ -173,6 +173,8 @@ export interface SharingConfig {
   leadSharingModel?: 'SLICES' | 'CUMULATIVE';
   designationCumulative?: Partial<Record<number, number>>;
   leadSourcePct?: number;
+  // Folios that belong to no client record: the importer never matches or creates a client for them. Server-owned (kept on config save).
+  folioBlocklist?: string[];
 }
 
 export interface Client {

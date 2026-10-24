@@ -4550,8 +4550,10 @@ app.all('/api/data', mutationLimiter, async (req, res) => {
               // locked would write the older, shorter list back and silently unlock it, so a
               // save may add locks but never remove one (see unlock_period).
               const [[stored]] = await connection.query('SELECT data FROM config WHERE id = ?', [id]);
-              let prevLocks = [], prevSettled = ''; try { const pc = JSON.parse(stored?.data || '{}'); prevLocks = pc.lockedPeriods || []; prevSettled = pc.partnerSettledThrough || ''; } catch {}
+              let prevLocks = [], prevSettled = '', prevBlock = []; try { const pc = JSON.parse(stored?.data || '{}'); prevLocks = pc.lockedPeriods || []; prevSettled = pc.partnerSettledThrough || ''; prevBlock = Array.isArray(pc.folioBlocklist) ? pc.folioBlocklist : []; } catch {}
               if (prevSettled) rest.partnerSettledThrough = prevSettled; else delete rest.partnerSettledThrough;
+              // Folios blocked from client matching are set on the server only; a settings save must not drop them.
+              if (prevBlock.length) rest.folioBlocklist = prevBlock; else delete rest.folioBlocklist;
               rest.lockedPeriods = mergeLocks(prevLocks, rest.lockedPeriods);
               await connection.query('INSERT INTO config (id, data) VALUES (?, ?) ON DUPLICATE KEY UPDATE data=VALUES(data)', [id, JSON.stringify(rest)]);
             }
