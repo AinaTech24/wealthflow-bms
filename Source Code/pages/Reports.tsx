@@ -281,7 +281,7 @@ export const Reports: React.FC<ReportsProps> = ({ currentUser }) => {
   const filteredClientWiseSummary = useMemo(() => {
     return clientWiseSummary.filter(c =>
       c.name.toLowerCase().includes(clientSearchTerm.toLowerCase()) ||
-      c.pan.toLowerCase().includes(clientSearchTerm.toLowerCase())
+      (c.pan || "").toLowerCase().includes(clientSearchTerm.toLowerCase())
     );
   }, [clientWiseSummary, clientSearchTerm]);
 

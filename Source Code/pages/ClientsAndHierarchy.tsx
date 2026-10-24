@@ -145,7 +145,7 @@ export const ClientsAndHierarchy: React.FC<ClientsAndHierarchyProps> = ({ curren
           if (gapFilter === 'noFolios' && (c.folios || []).filter(Boolean).length > 0) return false;
         }
         return c.name.toLowerCase().includes(term) ||
-          c.pan.toLowerCase().includes(term) ||
+          (c.pan || "").toLowerCase().includes(term) ||
           (term.length >= 3 && managerText(c).includes(term));
       })
       // Sort by AUM desc by default — biggest clients first

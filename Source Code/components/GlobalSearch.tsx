@@ -80,7 +80,7 @@ export const GlobalSearch: React.FC<GlobalSearchProps> = ({ isOpen, onClose, onN
 
     // Clients
     clients
-      .filter(c => c.name.toLowerCase().includes(q) || c.pan.toLowerCase().includes(q))
+      .filter(c => c.name.toLowerCase().includes(q) || (c.pan || "").toLowerCase().includes(q))
       .slice(0, 5)
       .forEach(c => items.push({
         id: `client_${c.id}`,
@@ -109,7 +109,7 @@ export const GlobalSearch: React.FC<GlobalSearchProps> = ({ isOpen, onClose, onN
     // Transactions (search by investor name or AMC)
     if (isAdmin) {
       transactions
-        .filter(tx => tx.investorName.toLowerCase().includes(q) || tx.amcName.toLowerCase().includes(q) || tx.pan.toLowerCase().includes(q))
+        .filter(tx => tx.investorName.toLowerCase().includes(q) || tx.amcName.toLowerCase().includes(q) || (tx.pan || "").toLowerCase().includes(q))
         .slice(0, 3)
         .forEach(tx => items.push({
           id: `tx_${tx.id}`,
