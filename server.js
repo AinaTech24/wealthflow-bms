@@ -13,6 +13,7 @@ import { nameTokens, nameContradicts, bestNameMatches } from './src/lib/nameMatc
 import { planBranchRestructure } from './src/lib/branchRestructure.js';
 import { pickOwnerRecord } from './src/lib/folioOwner.js';
 import { scopePayoutOverview } from './src/lib/payoutScope.js';
+import { RTA_FILES, RTA_LOG_DDL, buildChecklist, fileKeyOf } from './src/lib/rtaChecklist.js';
 import { recomputePartnerLedger, PARTNER_LEDGER_DDL, PARTNER_FORMAT_DDL, estimateTax, ensurePartnerMapData, buildManualChain, manualId } from './src/lib/partnerPayout.js';
 import { memberAsOf, residualSplit, breakdownFromShares } from './src/lib/payoutEngine.js';
 import { chainAsOf, planLevelMove, effectiveMonthOr } from './src/lib/hierarchyHistory.js';
@@ -1689,6 +1690,29 @@ app.all('/api/data', mutationLimiter, async (req, res) => {
       //    Partner brokerage is folded in through the same flat per-level
       //    percentages the Partner Brokerage page sets, so a person's row is what
       //    they are owed in total, not per revenue stream.
+      // ── Which RTA files are in for each month, and which are still missing ──────────
+      //    The Imports page shows this as a checklist and a pop-up. ADMIN only.
+      if (action === 'rta_checklist') {
+        try {
+          if (!req.user || req.user.role !== 'ADMIN') return res.status(403).json({ error: 'Admin privileges required' });
+          res.set('Cache-Control', 'no-store');
+          await pool.query(RTA_LOG_DDL);
+          const d0 = new Date(); d0.setMonth(d0.getMonth() - 14);
+          const from = d0.getFullYear() + '-' + String(d0.getMonth() + 1).padStart(2, '0');
+          const [rows] = await pool.query(
+            "SELECT t.brokeragePeriod period, JSON_UNQUOTE(JSON_EXTRACT(t.data,'$.source')) src, (b.fileName LIKE '%SIF%' OR t.amcName LIKE '%SIF%') sif, COUNT(*) n, ROUND(SUM(t.grossAmount),2) g, MAX(b.fileName) f " +
+            "FROM transactions t LEFT JOIN batches b ON b.id = t.batchId WHERE t.brokeragePeriod >= ? GROUP BY 1,2,3", [from]);
+          const found = rows.map(r => ({ period: r.period, key: fileKeyOf({ source: r.src, sif: Number(r.sif) }), rows: Number(r.n) || 0, gross: Number(r.g) || 0, fileName: r.f || '' })).filter(r => r.key && r.period);
+          const [lg] = await pool.query('SELECT period, source, fileName, rowsCount FROM rta_import_log ORDER BY id DESC');
+          const logged = lg.map(r => ({ period: r.period, key: (RTA_FILES.find(x => x.master && x.source === r.source) || {}).key, fileName: r.fileName || '', rows: Number(r.rowsCount) || 0 })).filter(r => r.key);
+          const periods = [...new Set([...found.map(f => f.period), ...logged.map(l => l.period)])].sort();
+          return res.json({ months: buildChecklist({ found, logged, periods }).slice(-6), files: RTA_FILES });
+        } catch (e) {
+          console.error('[rta_checklist]', e);
+          return res.status(500).json({ error: 'Failed to read the file checklist' });
+        }
+      }
+
       // ── Which months are frozen, and is each one safe to freeze? ──────────────────
       //    A locked month keeps its stored payouts forever. That is only right when
       //    the payouts exist, so each month reports how many of its rows have a stored
@@ -2824,6 +2848,21 @@ app.all('/api/data', mutationLimiter, async (req, res) => {
           await pool.query('INSERT INTO activity_log (userId, userName, action, description, createdAt) VALUES (?,?,?,?,NOW())', [req.user?.id || '', req.user?.name || '', 'partner_format', `${partner}: file layout saved (client "${data.clientCol}", amount "${data.amountCol}"${data.monthCol ? `, month "${data.monthCol}"` : ''})`]);
           return res.json({ success: true, partner });
         } catch (e) { console.error('[partner_format_save]', e); return res.status(500).json({ error: e.message }); }
+      }
+
+      // A folio master (WBR9 / MFSD211) imports clients only and leaves no rows behind, so the Imports page records each one
+      // here; the file checklist reads it to know the master was done for the month.
+      if (action === 'rta_log') {
+        if (!req.user || req.user.role !== 'ADMIN') return res.status(403).json({ error: 'Admin privileges required' });
+        try {
+          const period = String(payload?.period || '').slice(0, 7);
+          const source = String(payload?.source || '').toUpperCase();
+          if (!/^[0-9]{4}-[0-9]{2}$/.test(period)) return res.status(400).json({ error: 'period must look like 2026-09' });
+          if (!RTA_FILES.some(x => x.master && x.source === source)) return res.status(400).json({ error: 'Only folio master files are logged' });
+          await pool.query(RTA_LOG_DDL);
+          await pool.query('INSERT INTO rta_import_log (period, source, fileName, rowsCount, createdBy) VALUES (?,?,?,?,?)', [period, source, String(payload?.fileName || '').slice(0, 250), Number(payload?.rows) || 0, req.user?.id || '']);
+          return res.json({ success: true });
+        } catch (e) { console.error('[rta_log]', e); return res.status(500).json({ error: e.message }); }
       }
 
       // Partner payouts for months up to this one are treated as already paid in full (the cut-over from the old process).

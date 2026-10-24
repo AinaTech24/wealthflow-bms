@@ -11,6 +11,7 @@ import { useData, authFetch } from '../contexts/DataContext';
 import { runBatchCalculation } from '../services/calculationService';
 import { Pagination } from '../components/Pagination';
 import { useToast } from '../components/Toast';
+import { RtaMonthChips, RtaMissingModal, monthsWithGaps, gapSignature, type RtaMonth, type RtaFile } from '../components/RtaChecklist';
 
 import { nameContradicts, bestNameMatches } from '../../src/lib/nameMatch.js';
 import { restoreCamsHeaders } from '../../src/lib/dbfHeaders.js';
@@ -494,6 +495,38 @@ export const Imports: React.FC<ImportsProps> = ({ currentUser }) => {
   const [historySearch, setHistorySearch] = useState('');
   const [historyMonth, setHistoryMonth] = useState('');
   const [remapping, setRemapping] = useState(false);
+
+  // Which RTA files are in for each month. Read when the page opens and again after every import; a pop-up lists
+  // what is still missing (newest two months only), and the chips under the month picker show the month being imported.
+  const [rtaMonths, setRtaMonths] = useState<RtaMonth[]>([]);
+  const [rtaGaps, setRtaGaps] = useState<RtaMonth[]>([]);
+  const loadRta = async (popup: 'auto' | 'always' | 'never') => {
+    try {
+      const r = await authFetch('/api/data?action=rta_checklist');
+      if (!r.ok) return;
+      const d = await r.json();
+      const months: RtaMonth[] = d.months || [];
+      setRtaMonths(months);
+      const gaps = monthsWithGaps(months);
+      if (popup === 'never' || !gaps.length) { setRtaGaps([]); return; }
+      // 'auto' (page open): once per set of gaps per browser session. 'always' (right after an import): show what is still left.
+      let seen = '';
+      try { seen = sessionStorage.getItem('rtaGapsSeen') || ''; } catch (_) { /* private mode: just show it */ }
+      if (popup === 'always' || seen !== gapSignature(gaps)) {
+        try { sessionStorage.setItem('rtaGapsSeen', gapSignature(gaps)); } catch (_) { /* ignore */ }
+        setRtaGaps(gaps);
+      }
+    } catch (_) { /* the checklist is advice; the import flow works without it */ }
+  };
+  useEffect(() => { loadRta('auto'); }, []);
+  const pickRtaFile = (period: string, f: RtaFile) => {
+    const [y, m] = period.split('-');
+    setRtaGaps([]);
+    setActiveTab('import');
+    setSelectedYear(y); setSelectedMonth(m);
+    handleSourceSelect(f.source as TransactionSource);
+  };
+
   useEffect(() => {
     if (activeTab !== 'history') return;
     let cancelled = false;
@@ -1535,11 +1568,16 @@ export const Imports: React.FC<ImportsProps> = ({ currentUser }) => {
       // re-map orphan transactions to them.
       if (newClientsFound.length > 0) await upsertClients(newClientsFound);
       showToast(`Master import complete. ${newClientsFound.length} client record${newClientsFound.length !== 1 ? 's' : ''} added or enriched.`, 'success');
+      // A folio master leaves no rows to find later, so note it for the file checklist.
+      try {
+        await authFetch('/api/data', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ action: 'rta_log', payload: { period: `${selectedYear}-${selectedMonth}`, source: selectedSource, fileName: uploadedFile?.name || '', rows: newClientsFound.length } }) });
+      } catch (_) { /* the import itself succeeded */ }
       clearUpload();
       setSelectedSource(null);
       // Auto-link any brokerage rows that were previously unmapped but now match a
       // newly-created client by folio — makes the monthly flow hands-off.
       if (newClientsFound.length > 0) { await runRemapAndRecalc(); }
+      loadRta('always');
       return;
     }
 
@@ -1684,6 +1722,7 @@ export const Imports: React.FC<ImportsProps> = ({ currentUser }) => {
     setActiveTab('history');
     clearUpload();
     setSelectedSource(null);
+    loadRta('always');
   };
 
   const clearUpload = () => {
@@ -1843,6 +1882,7 @@ export const Imports: React.FC<ImportsProps> = ({ currentUser }) => {
                     {YEARS.map(y => <option key={y} value={y}>{y}</option>)}
                   </select>
                 </div>
+                <RtaMonthChips month={rtaMonths.find(m => m.period === `${selectedYear}-${selectedMonth}`)} onPick={f => handleSourceSelect(f.source as TransactionSource)} />
                 {/* What month is actually INSIDE the file — the check that was missing */}
                 {filePeriod && (
                   filePeriod.period === `${selectedYear}-${selectedMonth}` ? (
@@ -2470,6 +2510,7 @@ export const Imports: React.FC<ImportsProps> = ({ currentUser }) => {
           </div>
         );
       })()}
+      {rtaGaps.length > 0 && <RtaMissingModal gaps={rtaGaps} onPick={pickRtaFile} onClose={() => setRtaGaps([])} />}
     </div>
   );
 };
