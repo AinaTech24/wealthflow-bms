@@ -192,7 +192,9 @@ export const Layout: React.FC<LayoutProps> = ({ children, activePage, onNavigate
   };
 
   return (
-    <div className="min-h-screen bg-slate-50 dark:bg-slate-900 flex transition-colors duration-200">
+    // h-screen, not min-h-screen: the page itself must not grow with its content. The content area below scrolls on its
+    // own, so the sidebar stays one screen tall and Sign Out stays in view instead of sitting at the bottom of a long page.
+    <div className="h-screen overflow-hidden bg-slate-50 dark:bg-slate-900 flex transition-colors duration-200">
       {/* Mobile overlay */}
       {isMobileMenuOpen && (
         <div
