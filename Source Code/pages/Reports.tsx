@@ -57,17 +57,18 @@ export const Reports: React.FC<ReportsProps> = ({ currentUser }) => {
   const { transactions, clients, team, globalConfig, invoices, addInvoice, updateInvoice, serverSummary, refreshTick } = useData();
   const { showToast, showConfirm } = useToast();
 
-  const [activeTab, setActiveTab] = useState<'overview' | 'monthly' | 'client-summary' | 'transactions' | 'invoices' | 'approvals' | 'team-payouts' | 'growth' | 'reconciliation'>('overview');
+  // Finance opens on the invoice approval queue: the rest of this page is about what people EARN, which stays with Admin.
+  const [activeTab, setActiveTab] = useState<'overview' | 'monthly' | 'client-summary' | 'transactions' | 'invoices' | 'approvals' | 'team-payouts' | 'growth' | 'reconciliation'>(currentUser.role === Role.FINANCE ? 'approvals' : 'overview');
 
   const isAdmin = currentUser.role === Role.ADMIN;
   const isFinance = currentUser.role === Role.FINANCE;
   // Super-user = admin OR finance (both see firm-wide data; finance is read-only outside payouts).
   const isSuperUser = isAdmin || isFinance;
   // Per-action permissions for the invoice approval workflow:
-  //   • Admin     → approves SUBMITTED → APPROVED
-  //   • Finance   → settles APPROVED  → PAID (the payment release)
-  //   • Either    → can reject with a reason
-  const canApproveInvoices = isAdmin;
+  //   • Admin or Finance → approves SUBMITTED → APPROVED
+  //   • Admin or Finance → settles APPROVED  → PAID (the payment release)
+  //   • Either           → can reject with a reason
+  const canApproveInvoices = isAdmin || isFinance;
   const canSettleInvoices = isAdmin || isFinance;
   const canRejectInvoices = isAdmin || isFinance;
 
@@ -1515,8 +1516,8 @@ export const Reports: React.FC<ReportsProps> = ({ currentUser }) => {
     <div className="space-y-6">
       <div className="flex flex-col md:flex-row md:items-center justify-between gap-4">
         <div>
-          <h1 className="text-2xl font-bold text-slate-900 dark:text-slate-100">Brokerage Settlements</h1>
-          <p className="text-slate-500 dark:text-slate-400 mt-1 font-medium">Financial audit and payout management.</p>
+          <h1 className="text-2xl font-bold text-slate-900 dark:text-slate-100">{isFinance ? 'Invoices' : 'Brokerage Settlements'}</h1>
+          <p className="text-slate-500 dark:text-slate-400 mt-1 font-medium">{isFinance ? 'Approve what RMs and BMs have billed, then pay it from the Payouts page.' : 'Financial audit and payout management.'}</p>
         </div>
         <div className="flex items-center gap-2 flex-wrap">
           <select value={filters.month} onChange={e => setFilters({ ...filters, month: e.target.value })} className="border border-slate-200 dark:border-slate-600 rounded-lg px-3 py-1.5 text-xs bg-white dark:bg-slate-800 dark:text-slate-100 font-bold">
@@ -1544,8 +1545,9 @@ export const Reports: React.FC<ReportsProps> = ({ currentUser }) => {
             (isAdmin || useData().team.some(m => m.parentId === currentUser.id)) && { id: 'team-payouts', label: 'Team Payouts', icon: Users },
             { id: 'growth', label: 'Growth', icon: TrendingUp },
             (isAdmin || isFinance) && { id: 'approvals', label: 'Approvals Queue', icon: ShieldCheck },
+            isFinance && { id: 'invoices', label: 'All Invoices', icon: Landmark },
             (isAdmin || isFinance) && { id: 'reconciliation', label: 'Reconciliation', icon: AlertTriangle },
-          ].filter(Boolean).map((tab: any) => (
+          ].filter(Boolean).filter((tab: any) => !isFinance || tab.id === 'approvals' || tab.id === 'invoices').map((tab: any) => (
             <button key={tab.id} onClick={() => { setActiveTab(tab.id); setCurrentPage(1); }} className={`whitespace-nowrap py-4 px-1 border-b-2 font-black uppercase tracking-widest text-[10px] flex items-center transition-all ${activeTab === tab.id ? 'border-blue-500 text-blue-600' : 'border-transparent text-slate-400 dark:text-slate-500 hover:text-slate-600 dark:hover:text-slate-300'}`}>
               <tab.icon className="w-3.5 h-3.5 mr-2" /> {tab.label}
             </button>

@@ -18,6 +18,8 @@ interface MonthRow {
   /** The same figures per product — 'MF' for fund trail, then each partner by
    *  its own code — so one product reads on its own and carries its own arrears. */
   bySource: Record<string, { earned: number; paid: number; carriedIn: number; outstanding: number; gst?: number; tds?: number; payable?: number }>;
+  /** Each payment recorded for this month, with the note that says why it was paid short, if it was. */
+  payments?: Array<{ id: string; source: string; amount: number; paidOn: string; method: string; reference: string; note: string }>;
 }
 
 // Product names live in utils/payoutSources.ts, shared with the earnings panel on
@@ -33,6 +35,19 @@ const prettyMonth = (p: string) => {
   const d = new Date(Number(y), Number(m) - 1, 1);
   return Number.isNaN(d.getTime()) ? p : d.toLocaleString('en-IN', { month: 'long', year: 'numeric' });
 };
+
+/** Why a payment fell short of what was owed. Chosen from a list so the reasons can be counted and filtered later. */
+const SHORT_REASONS = [
+  'Part payment - balance will be paid later',
+  'Held - amount under review or disputed',
+  'Held - invoice not received or not approved',
+  'Held - bank details missing or wrong',
+  'Adjusted against an advance or recovery',
+  'Paid the invoice amount (after GST and TDS)',
+  'Other (write it below)',
+];
+const METHODS = ['NEFT', 'IMPS', 'RTGS', 'UPI', 'Cheque', 'Cash', 'Other'];
+const todayIso = () => new Date().toISOString().slice(0, 10);
 
 /**
  * The accounts desk. Everyone, one month: what they earned, what has been paid,
@@ -58,6 +73,10 @@ export const Payouts: React.FC<Props> = ({ currentUser }) => {
   const [payFor, setPayFor] = useState<{ p: Person; m: MonthRow } | null>(null);
   const [amount, setAmount] = useState('');
   const [reference, setReference] = useState('');
+  const [method, setMethod] = useState('NEFT');
+  const [paidOn, setPaidOn] = useState(todayIso());
+  const [reason, setReason] = useState('');
+  const [reasonText, setReasonText] = useState('');
   const [health, setHealth] = useState<any>(null);
   const [openCheck, setOpenCheck] = useState<string | null>(null);
 
@@ -166,18 +185,28 @@ export const Payouts: React.FC<Props> = ({ currentUser }) => {
     if (!payFor) return;
     const amt = Number(amount);
     if (!Number.isFinite(amt) || amt === 0) { showToast('Enter an amount.', 'warning'); return; }
+    // Paying less than is owed is allowed, but it must say why: a balance that just sits there is how a month gets forgotten.
+    const owed = payView ? payView.outstanding : 0;
+    const shortBy = Math.round((owed - amt) * 100) / 100;
+    const isShort = amt > 0 && shortBy > 1;
+    const isOther = reason.startsWith('Other');
+    if (isShort && !reason) { showToast('You are paying ' + inr(shortBy) + ' less than is owed. Choose a reason.', 'warning'); return; }
+    if (isShort && isOther && !reasonText.trim()) { showToast('Write the reason in the note box.', 'warning'); return; }
+    const note = isShort
+      ? 'Short by ' + inr(shortBy) + ': ' + (isOther ? '' : reason) + (reasonText.trim() ? (isOther ? '' : ' - ') + reasonText.trim() : '')
+      : (reasonText.trim() || null);
     const res = await authFetch('/api/data', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
         action: 'settle',
-        payload: { source: paySource, period: payFor.m.period, userId: payFor.p.userId, amount: amt, reference: reference || null },
+        payload: { source: paySource, period: payFor.m.period, userId: payFor.p.userId, amount: amt, reference: reference || null, method, paidOn, note },
       }),
     });
     const j = await res.json();
     if (!res.ok) { showToast(j?.error || 'Could not record the payment.', 'error'); return; }
     showToast(`${inr(amt)} recorded for ${payFor.p.name} · ${prettyMonth(payFor.m.period)}.`, 'success');
-    setPayFor(null); setAmount(''); setReference('');
+    setPayFor(null); setAmount(''); setReference(''); setReason(''); setReasonText('');
     await load();
   };
 
@@ -332,6 +361,10 @@ export const Payouts: React.FC<Props> = ({ currentUser }) => {
                         <div className="text-[10px] text-slate-400 font-mono uppercase">
                           {p.code || p.userId.slice(0, 12)}{p.level != null && ` · L${p.level}`}
                         </div>
+                        {v.outstanding > 0.005 && (() => {
+                          const last = [...(m.payments || [])].reverse().find(x => x.note && x.note.startsWith('Short by'));
+                          return last ? <div className="text-[10px] text-amber-600 dark:text-amber-400 mt-0.5 max-w-[16rem] leading-snug" title={last.note}>Part paid {inr(last.amount)} · {last.note.replace(/^Short by [^:]*: ?/, '')}</div> : null;
+                        })()}
                       </td>
                       <Num v={v.carriedIn} muted />
                       {anyPartner && <Num v={m.mf} muted />}
@@ -351,7 +384,7 @@ export const Payouts: React.FC<Props> = ({ currentUser }) => {
                         {/* The settlement is booked against whichever product is on
                             screen, so a Motilal cheque clears the Motilal balance. */}
                         <button
-                          onClick={() => { setPayFor({ p, m }); setAmount(v.outstanding > 0 ? String(Math.round(v.outstanding * 100) / 100) : ''); setReference(''); }}
+                          onClick={() => { setPayFor({ p, m }); setAmount(v.outstanding > 0 ? String(Math.round(v.outstanding * 100) / 100) : ''); setReference(''); setReason(''); setReasonText(''); setMethod('NEFT'); setPaidOn(todayIso()); }}
                           className="px-2.5 py-1 rounded-lg border border-slate-200 dark:border-slate-600 text-[10px] font-black uppercase tracking-widest text-slate-600 dark:text-slate-300 hover:border-emerald-400 hover:text-emerald-600 transition whitespace-nowrap"
                         >
                           Record payment
@@ -401,6 +434,19 @@ export const Payouts: React.FC<Props> = ({ currentUser }) => {
               <Line k="Already paid" v={payView.paid} />
               <Line k="Still owed" v={payView.outstanding} strong />
             </dl>
+            {(payFor.m.payments || []).filter(x => x.source === paySource).length > 0 && (
+              <div className="mt-3 rounded-lg bg-slate-50 dark:bg-slate-900/40 border border-slate-200 dark:border-slate-700 p-2">
+                <p className="text-[10px] font-black uppercase tracking-widest text-slate-400 mb-1">Already recorded this month</p>
+                <ul className="space-y-1">
+                  {(payFor.m.payments || []).filter(x => x.source === paySource).map(x => (
+                    <li key={x.id} className="text-[11px] text-slate-600 dark:text-slate-300 leading-snug">
+                      <b className="font-mono">{inr(x.amount)}</b> · {x.paidOn}{x.method ? ' · ' + x.method : ''}{x.reference ? ' · ' + x.reference : ''}
+                      {x.note && <div className="text-amber-700 dark:text-amber-400">{x.note}</div>}
+                    </li>
+                  ))}
+                </ul>
+              </div>
+            )}
             {/* The ledger runs on earnings, not on the cheque. GST is collected on
                 the RM's behalf and TDS is withheld, so entering the payable here
                 would over-credit the balance and push it negative. Say so, and
@@ -420,6 +466,51 @@ export const Payouts: React.FC<Props> = ({ currentUser }) => {
                 Recording it leaves a credit that carries into next month.
               </p>
             )}
+            {(() => {
+              const amt = Number(amount) || 0;
+              const left = Math.round((payView.outstanding - amt) * 100) / 100;
+              const short = amt > 0 && left > 1;
+              return (
+                <>
+                  <div className="flex items-center justify-between text-[11px] mt-2">
+                    <span className="text-slate-500 dark:text-slate-400">Balance left after this payment</span>
+                    <span className={`font-mono font-bold tabular-nums ${left > 0.005 ? 'text-red-600' : 'text-emerald-600'}`}>{inr(Math.max(left, 0))}</span>
+                  </div>
+                  {short && (
+                    <div className="mt-2 rounded-lg border border-amber-300 bg-amber-50 dark:bg-amber-900/20 dark:border-amber-700 p-2.5">
+                      <label htmlFor="pay-reason" className="block text-[10px] font-black uppercase tracking-widest text-amber-700 dark:text-amber-400 mb-1">
+                        Paying {inr(left)} less than owed — why?
+                      </label>
+                      <select id="pay-reason" value={reason} onChange={e => setReason(e.target.value)}
+                        className="w-full px-2 py-2 rounded-lg border border-amber-300 dark:border-amber-700 dark:bg-slate-900 dark:text-slate-100 text-xs">
+                        <option value="">Choose a reason…</option>
+                        {SHORT_REASONS.map(r => <option key={r} value={r}>{r}</option>)}
+                      </select>
+                    </div>
+                  )}
+                  <label htmlFor="pay-note" className="block text-[10px] font-black uppercase tracking-widest text-slate-400 mt-3 mb-1">
+                    Note <span className="font-normal normal-case tracking-normal">({short && reason.startsWith('Other') ? 'required' : 'optional'})</span>
+                  </label>
+                  <input id="pay-note" value={reasonText} onChange={e => setReasonText(e.target.value)}
+                    className="w-full px-3 py-2 rounded-lg border border-slate-200 dark:border-slate-600 dark:bg-slate-900 dark:text-slate-100"
+                    placeholder="Anything finance or the RM should know" />
+                </>
+              );
+            })()}
+            <div className="grid grid-cols-2 gap-2 mt-3">
+              <div>
+                <label htmlFor="pay-method" className="block text-[10px] font-black uppercase tracking-widest text-slate-400 mb-1">Paid by</label>
+                <select id="pay-method" value={method} onChange={e => setMethod(e.target.value)}
+                  className="w-full px-2 py-2 rounded-lg border border-slate-200 dark:border-slate-600 dark:bg-slate-900 dark:text-slate-100 text-sm">
+                  {METHODS.map(x => <option key={x} value={x}>{x}</option>)}
+                </select>
+              </div>
+              <div>
+                <label htmlFor="pay-date" className="block text-[10px] font-black uppercase tracking-widest text-slate-400 mb-1">Paid on</label>
+                <input id="pay-date" type="date" value={paidOn} max={todayIso()} onChange={e => setPaidOn(e.target.value)}
+                  className="w-full px-2 py-2 rounded-lg border border-slate-200 dark:border-slate-600 dark:bg-slate-900 dark:text-slate-100 text-sm" />
+              </div>
+            </div>
             <label htmlFor="pay-ref" className="block text-[10px] font-black uppercase tracking-widest text-slate-400 mt-3 mb-1">
               Reference <span className="font-normal normal-case tracking-normal">(optional)</span>
             </label>

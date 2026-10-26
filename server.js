@@ -1818,6 +1818,17 @@ app.all('/api/data', mutationLimiter, async (req, res) => {
             e[key] = (e[key] || 0) + (Number(r.paid) || 0);
             byP.set(r.period, e);
           }
+          // The payments themselves, so the desk can read WHY a month was paid short (the note) next to the amount.
+          const payList = new Map();
+          try {
+            const [pl] = await pool.query(
+              "SELECT id, source, period, userId, amount, DATE_FORMAT(paidOn, '%Y-%m-%d') paidOn, method, reference, note FROM payout_settlements ORDER BY paidOn, createdAt");
+            for (const r of pl) {
+              const k = r.userId + '|' + r.period;
+              if (!payList.has(k)) payList.set(k, []);
+              payList.get(k).push({ id: r.id, source: String(r.source || '').toUpperCase(), amount: Number(r.amount) || 0, paidOn: r.paidOn || '', method: r.method || '', reference: r.reference || '', note: r.note || '' });
+            }
+          } catch (pe) { console.error('[payout_overview] payments list:', pe.message); }
           // MF first, then the partners alphabetically — a stable order so the
           // dropdown does not reshuffle itself between loads.
           const sources = [MF, ...[...sourceKeys].filter(k => k !== MF).sort()];
@@ -1925,6 +1936,7 @@ app.all('/api/data', mutationLimiter, async (req, res) => {
                 carriedIn: r2(carriedIn),
                 outstanding: r2(running),
                 bySource,
+                payments: payList.get(uid + '|' + p) || [],
                 ...tax,
               };
             }).filter(m => m.earned !== 0 || m.paid !== 0 || m.carriedIn !== 0);

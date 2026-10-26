@@ -222,7 +222,7 @@ export const Layout: React.FC<LayoutProps> = ({ children, activePage, onNavigate
               EARN — clients and hierarchies, rate cards, partner statements — are
               deliberately out of reach, matching the write rules on the server. */}
           {!isFinance && <SidebarItem icon={Users} label={isAdmin ? 'Clients & Map' : 'My Clients'} active={activePage === 'clients'} onClick={() => handleNavigate('clients')} />}
-          {!isFinance && <SidebarItem icon={FileText} label="Reports & Payouts" active={activePage === 'reports'} onClick={() => handleNavigate('reports')} />}
+          {<SidebarItem icon={FileText} label={isFinance ? 'Invoices' : 'Reports & Payouts'} active={activePage === 'reports'} onClick={() => handleNavigate('reports')} />}
           {!isFinance && <SidebarItem icon={Landmark} label="Brokerage Rates" active={activePage === 'brokerage'} onClick={() => handleNavigate('brokerage')} />}
           {!isFinance && <SidebarItem icon={Briefcase} label="Partner Brokerage" active={activePage === 'partner'} onClick={() => handleNavigate('partner')} />}
           {(isAdmin || isFinance) && <SidebarItem icon={Wallet} label="Payouts" active={activePage === 'payouts'} onClick={() => handleNavigate('payouts')} />}

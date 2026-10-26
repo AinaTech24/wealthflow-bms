@@ -105,7 +105,9 @@ const AppContent: React.FC = () => {
     // its own — anything still reachable by typing or a stale tab would show the
     // screens that shape what people earn, which the server already refuses to
     // let Finance change. Keep the two in step.
-    if (isFinance && ['clients', 'reports', 'brokerage', 'partner'].includes(activePage)) {
+    // Finance does get the Invoices screen (the Reports page, cut down to the invoice approval queue and the invoice list):
+    // approving what an RM billed and paying it is the accounts desk's job.
+    if (isFinance && ['clients', 'brokerage', 'partner'].includes(activePage)) {
       return <Dashboard currentUser={currentUser} />;
     }
 
