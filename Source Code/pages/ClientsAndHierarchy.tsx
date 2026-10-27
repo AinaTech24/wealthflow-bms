@@ -1,11 +1,12 @@
 
 import React, { useState, useMemo, useEffect } from 'react';
-import { Users, Search, Plus, Edit2, X, UserCheck, Shield, ChevronRight, Tags, Database, Save, Key, Copy, Check, Mail, Trash2, UserPlus, GitMerge, Phone, AlertCircle, Download } from 'lucide-react';
+import { FileSpreadsheet, Users, Search, Plus, Edit2, X, UserCheck, Shield, ChevronRight, Tags, Database, Save, Key, Copy, Check, Mail, Trash2, UserPlus, GitMerge, Phone, AlertCircle, Download } from 'lucide-react';
 import { Client, TeamMember, Role } from '../types';
 import { useData, authFetch } from '../contexts/DataContext';
 import { PromotionPanel, PromotionPreview } from '../components/PromotionPanel';
 import { Pagination } from '../components/Pagination';
 import { useToast } from '../components/Toast';
+import { TeamInfoImport } from '../components/TeamInfoImport';
 import { formatCompactINR } from '../utils/formatINR';
 import { exportToExcel } from '../utils/excelExport';
 import { useClientAum } from '../utils/clientAum';
@@ -15,13 +16,14 @@ interface ClientsAndHierarchyProps {
 }
 
 export const ClientsAndHierarchy: React.FC<ClientsAndHierarchyProps> = ({ currentUser }) => {
-  const { clients, updateClients, deleteClient, team, upsertTeamMember, deleteTeamMember, globalConfig, amcMappings, schemeMappings, updateAmcMappings, updateSchemeMappings, recalculateAllTransactions, transactions } = useData();
+  const { clients, updateClients, deleteClient, team, upsertTeamMember, deleteTeamMember, globalConfig, amcMappings, schemeMappings, updateAmcMappings, updateSchemeMappings, recalculateAllTransactions, transactions, refreshDashboard } = useData();
   const { showToast, showConfirm } = useToast();
 
   const isAdmin = currentUser.role === Role.ADMIN;
   const [activeTab, setActiveTab] = useState<'hierarchy' | 'clients' | 'standardize'>(isAdmin ? 'hierarchy' : 'clients');
 
   const [isTeamModalOpen, setIsTeamModalOpen] = useState(false);
+  const [isTeamImportOpen, setIsTeamImportOpen] = useState(false);
   const [isClientModalOpen, setIsClientModalOpen] = useState(false);
   const [editingMember, setEditingMember] = useState<TeamMember | null>(null);
   const [editingClient, setEditingClient] = useState<Client | null>(null);
@@ -261,6 +263,11 @@ export const ClientsAndHierarchy: React.FC<ClientsAndHierarchyProps> = ({ curren
       password: memberForm.password,
       parentId: memberForm.parentId,
       gstNumber: memberForm.gstNumber,
+      // SEBI/AMFI registration details, kept on the account so the invoice, the expiry alerts and the RM's own profile agree.
+      arnNumber: (memberForm as any).arnNumber || undefined,
+      arnValidTill: (memberForm as any).arnValidTill || undefined,
+      euinNumber: (memberForm as any).euinNumber || undefined,
+      euinValidTill: (memberForm as any).euinValidTill || undefined,
       bankDetails: memberForm.bankDetails,
       address: memberForm.address,
       // Consumed by the server to stamp rateHistory; never stored as profile data.
@@ -765,6 +772,9 @@ export const ClientsAndHierarchy: React.FC<ClientsAndHierarchyProps> = ({ curren
                 />
               </div>
             </div>
+            {isAdmin && (
+              <button onClick={() => setIsTeamImportOpen(true)} title="Update ARN, EUIN, email, GSTIN, address and bank details of many RMs and BMs from an Excel file" className="bg-white border border-slate-200 text-slate-700 px-5 py-2 rounded-xl text-xs font-black uppercase tracking-widest hover:bg-slate-50 flex items-center transition w-full md:w-auto justify-center"><FileSpreadsheet className="w-3.5 h-3.5 mr-2" />Import Excel</button>
+            )}
             <button onClick={() => openTeamModal()} className="bg-blue-600 text-white px-5 py-2 rounded-xl text-xs font-black uppercase tracking-widest hover:bg-blue-700 flex items-center shadow-lg shadow-blue-50 transition w-full md:w-auto justify-center"><UserPlus className="w-3.5 h-3.5 mr-2" />New User Account</button>
           </div>
           <table className="w-full text-sm text-left">
@@ -1524,6 +1534,24 @@ export const ClientsAndHierarchy: React.FC<ClientsAndHierarchyProps> = ({ curren
                     <input type="text" value={memberForm.gstNumber} onChange={e => setMemberForm({ ...memberForm, gstNumber: e.target.value.toUpperCase() })} className="w-full border border-slate-200 p-4 rounded-2xl mt-1.5 font-bold outline-none bg-white uppercase" placeholder="22AAAAA0000A1Z5" />
                   </div>
                 </div>
+                <div className="grid grid-cols-2 gap-4">
+                  <div>
+                    <label className="text-[10px] font-black text-slate-400 dark:text-slate-500 uppercase tracking-widest">ARN Number</label>
+                    <input type="text" value={(memberForm as any).arnNumber || ''} onChange={e => setMemberForm({ ...memberForm, arnNumber: e.target.value.toUpperCase() } as any)} className="w-full border border-slate-200 p-4 rounded-2xl mt-1.5 font-bold outline-none bg-white uppercase" placeholder="ARN-270604" />
+                  </div>
+                  <div>
+                    <label className="text-[10px] font-black text-slate-400 dark:text-slate-500 uppercase tracking-widest">ARN Valid Till</label>
+                    <input type="date" value={(memberForm as any).arnValidTill || ''} onChange={e => setMemberForm({ ...memberForm, arnValidTill: e.target.value } as any)} className="w-full border border-slate-200 p-4 rounded-2xl mt-1.5 font-bold outline-none bg-white" />
+                  </div>
+                  <div>
+                    <label className="text-[10px] font-black text-slate-400 dark:text-slate-500 uppercase tracking-widest">EUIN Number</label>
+                    <input type="text" value={(memberForm as any).euinNumber || ''} onChange={e => setMemberForm({ ...memberForm, euinNumber: e.target.value.toUpperCase() } as any)} className="w-full border border-slate-200 p-4 rounded-2xl mt-1.5 font-bold outline-none bg-white uppercase" placeholder="E661548" />
+                  </div>
+                  <div>
+                    <label className="text-[10px] font-black text-slate-400 dark:text-slate-500 uppercase tracking-widest">EUIN Valid Till</label>
+                    <input type="date" value={(memberForm as any).euinValidTill || ''} onChange={e => setMemberForm({ ...memberForm, euinValidTill: e.target.value } as any)} className="w-full border border-slate-200 p-4 rounded-2xl mt-1.5 font-bold outline-none bg-white" />
+                  </div>
+                </div>
               </section>
 
               <section className="space-y-4">
@@ -1911,6 +1939,7 @@ export const ClientsAndHierarchy: React.FC<ClientsAndHierarchyProps> = ({ curren
           </div>
         </div>
       )}
+      {isAdmin && isTeamImportOpen && <TeamInfoImport team={team} onClose={() => setIsTeamImportOpen(false)} onApplied={() => refreshDashboard()} />}
     </div>
   );
 };

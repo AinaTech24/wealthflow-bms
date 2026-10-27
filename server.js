@@ -14,6 +14,7 @@ import { planBranchRestructure } from './src/lib/branchRestructure.js';
 import { pickOwnerRecord } from './src/lib/folioOwner.js';
 import { scopePayoutOverview } from './src/lib/payoutScope.js';
 import { RTA_FILES, RTA_LOG_DDL, buildChecklist, fileKeyOf } from './src/lib/rtaChecklist.js';
+import { normalizeChanges, applyChanges, currentValue, maskAccount, labelOf } from './src/lib/teamImport.js';
 import { recomputePartnerLedger, PARTNER_LEDGER_DDL, PARTNER_FORMAT_DDL, estimateTax, ensurePartnerMapData, buildManualChain, manualId } from './src/lib/partnerPayout.js';
 import { memberAsOf, residualSplit, breakdownFromShares } from './src/lib/payoutEngine.js';
 import { chainAsOf, planLevelMove, effectiveMonthOr } from './src/lib/hierarchyHistory.js';
@@ -2893,6 +2894,44 @@ app.all('/api/data', mutationLimiter, async (req, res) => {
           await pool.query('INSERT INTO activity_log (userId, userName, action, description, createdAt) VALUES (?,?,?,?,NOW())', [req.user?.id || '', req.user?.name || '', 'partner_format', `${partner}: file layout saved (client "${data.clientCol}", amount "${data.amountCol}"${data.monthCol ? `, month "${data.monthCol}"` : ''})`]);
           return res.json({ success: true, partner });
         } catch (e) { console.error('[partner_format_save]', e); return res.status(500).json({ error: e.message }); }
+      }
+
+      // Update the BASIC details of RMs / BMs from a reviewed sheet: email, PAN, GSTIN, ARN, EUIN, address, bank. The list of fields lives in
+      // src/lib/teamImport.js and is enforced HERE, so a hand-made request cannot touch the sharing %, level, role, parent or password.
+      // All or nothing: the valid people are written in one transaction, and anyone who fails a check is reported back, not half-written.
+      if (action === 'team_basic_import') {
+        if (!req.user || req.user.role !== 'ADMIN') return res.status(403).json({ error: 'Admin privileges required' });
+        const updates = Array.isArray(payload?.updates) ? payload.updates.slice(0, 500) : [];
+        if (!updates.length) return res.status(400).json({ error: 'Nothing to update' });
+        const conn = await pool.getConnection();
+        try {
+          await conn.beginTransaction();
+          const applied = [], rejected = [];
+          for (const u of updates) {
+            const id = String(u?.id || '');
+            const [[row]] = await conn.query('SELECT id, name, email, role, data FROM team WHERE id = ? FOR UPDATE', [id]);
+            if (!row) { rejected.push({ id, why: 'no such team member' }); continue; }
+            if (['ADMIN', 'FINANCE'].includes(String(row.role || '').toUpperCase())) { rejected.push({ id, name: row.name, why: 'an Admin or Finance login is not an RM or BM' }); continue; }
+            const { changes, errors } = normalizeChanges(u.changes);
+            if (errors.length) { rejected.push({ id, name: row.name, why: errors.join('; ') }); continue; }
+            if (!Object.keys(changes).length) continue;
+            if (changes.email) {
+              const [dup] = await conn.query('SELECT id, name FROM team WHERE LOWER(email) = ? AND id <> ?', [changes.email, id]);
+              if (dup.length) { rejected.push({ id, name: row.name, why: `the email ${changes.email} already belongs to ${dup[0].name}` }); continue; }
+            }
+            let d = {}; try { d = JSON.parse(row.data || '{}'); } catch { /* start from empty */ }
+            const now = { ...d, email: row.email };
+            const next = applyChanges(d, row.email, changes);
+            await conn.query('UPDATE team SET email = ?, data = ? WHERE id = ?', [next.email, JSON.stringify(next.data), id]);
+            const show = (k, v) => k === 'accountNumber' ? maskAccount(v) : v;
+            const parts = Object.entries(changes).map(([k, v]) => `${labelOf(k)}: ${show(k, currentValue(now, k)) || '(blank)'} -> ${show(k, v)}`);
+            await conn.query('INSERT INTO activity_log (userId, userName, action, description, createdAt) VALUES (?,?,?,?,NOW())', [req.user?.id || '', req.user?.name || '', 'team_basic_import', `${row.name}: ${parts.join('; ')}`.slice(0, 900)]);
+            applied.push({ id, name: row.name, fields: Object.keys(changes).length });
+          }
+          await conn.commit();
+          return res.json({ success: true, applied: applied.length, people: applied, rejected });
+        } catch (e) { await conn.rollback(); console.error('[team_basic_import]', e); return res.status(500).json({ error: e.message }); }
+        finally { conn.release(); }
       }
 
       // Remember how an AMC's spreadsheet is laid out (header names, not column numbers), so the next file reads itself.
