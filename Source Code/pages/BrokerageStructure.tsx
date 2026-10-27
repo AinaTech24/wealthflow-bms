@@ -102,7 +102,20 @@ export const BrokerageStructure: React.FC<BrokerageStructureProps> = ({ currentU
     const askMapping = (fileName: string, grid: string[][], initial: SheetLayout | null, amcName: string) =>
         new Promise<MappedRows | null>(resolve => { mapperResolve.current = resolve; setMapper({ fileName, grid, initial, amcName }); });
     const closeMapper = (r: MappedRows | null) => { setMapper(null); mapperResolve.current?.(r); mapperResolve.current = null; };
-    const isSheet = (f: File) => /\.(xlsx|xls|csv)$/i.test(f.name);
+    // What a file IS, not what it is called. A rate card saved without an extension ("Grow (2)") is still a PDF; the
+    // file picker must not hide it, and it must not be mistaken for something else.
+    const sniffKind = async (f: File): Promise<'pdf' | 'sheet'> => {
+        if (/\.(xlsx|xls|csv)$/i.test(f.name)) return 'sheet';
+        if (/\.pdf$/i.test(f.name)) return 'pdf';
+        try {
+            const head = new Uint8Array(await f.slice(0, 8).arrayBuffer());
+            const text = String.fromCharCode(...head);
+            if (text.startsWith('%PDF')) return 'pdf';
+            if (text.startsWith('PK') || (head[0] === 0xD0 && head[1] === 0xCF)) return 'sheet'; // xlsx (zip) / old xls
+            if (/^[\x09\x0a\x0d\x20-\x7e]{8}$/.test(text)) return 'sheet'; // plain text: csv
+        } catch { /* fall through */ }
+        return 'pdf';
+    };
 
     const isAdmin = currentUser.role === Role.ADMIN;
 
@@ -171,8 +184,9 @@ export const BrokerageStructure: React.FC<BrokerageStructureProps> = ({ currentU
         setFileStats([]);
         setExtractionWarnings([]);
 
-        const pdfFiles = files.filter(f => !isSheet(f));
-        const sheetFiles = files.filter(isSheet);
+        const kinds = await Promise.all(files.map(sniffKind));
+        const pdfFiles = files.filter((_, i) => kinds[i] === 'pdf');
+        const sheetFiles = files.filter((_, i) => kinds[i] === 'sheet');
         let extracted: BrokerageRow[] = [];
         let allStats: FileStat[] = [];
         let warns: string[] = [];
@@ -686,7 +700,7 @@ export const BrokerageStructure: React.FC<BrokerageStructureProps> = ({ currentU
                         <div className="bg-white dark:bg-slate-800 p-8 border-2 border-dashed border-slate-200 rounded-xl flex flex-col items-center">
                             <Upload className="w-12 h-12 text-blue-600 mb-4 opacity-50" />
                             <h3 className="text-sm font-black uppercase tracking-widest text-slate-900 mb-1">Upload AMC Brokerage File</h3>
-                            <p className="text-slate-500 text-[10px] font-bold uppercase tracking-widest mb-6 text-center">PDF or Excel / CSV, in any layout</p>
+                            <p className="text-slate-500 text-[10px] font-bold uppercase tracking-widest mb-6 text-center">PDF, Excel or CSV — any layout, any file name</p>
 
                             {error && (
                                 <div className="mb-4 p-3 bg-red-50 border border-red-100 rounded-lg flex items-start gap-2 max-w-xs">
@@ -695,7 +709,7 @@ export const BrokerageStructure: React.FC<BrokerageStructureProps> = ({ currentU
                                 </div>
                             )}
 
-                            <input type="file" multiple accept=".pdf,.xlsx,.xls,.csv" onChange={handleFileChange} id="pdf-upload" className="hidden" />
+                            <input type="file" multiple onChange={handleFileChange} id="pdf-upload" className="hidden" />
                             <label htmlFor="pdf-upload" className="cursor-pointer px-8 py-3 bg-blue-600 text-white rounded-xl text-xs font-black uppercase tracking-widest hover:bg-blue-700 shadow-xl shadow-blue-50 transition">
                                 {files.length > 0 ? `Selected ${files.length} file${files.length !== 1 ? 's' : ''}` : 'Select Files'}
                             </label>
