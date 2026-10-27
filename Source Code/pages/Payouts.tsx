@@ -272,7 +272,7 @@ export const Payouts: React.FC<Props> = ({ currentUser }) => {
                 Name: p.name, Code: p.code, Level: p.level ?? '',
                 Product: labelFor(source),
                 'Brought forward': v.carriedIn,
-                ...(source === 'all' ? { 'Mutual fund': m.mf, 'Partner': m.partner } : {}),
+                ...(source === 'all' ? { 'Mutual fund': m.mf, 'Wealth products': m.partner } : {}),
                 'Earned this month': v.earned,
                 ...{ GST: t.gst, TDS: t.tds, 'Payable': t.payable,
                      'Invoice raised': t.invoiced ? (t.invoiceStatus || 'YES') : 'no' },
@@ -361,7 +361,7 @@ export const Payouts: React.FC<Props> = ({ currentUser }) => {
                     <th className="pb-2 pr-4 text-left">Person</th>
                     <th className="pb-2 pr-4 text-right">Brought fwd</th>
                     {anyPartner && <th className="pb-2 pr-4 text-right">Mutual fund</th>}
-                    {anyPartner && <th className="pb-2 pr-4 text-right">Partner</th>}
+                    {anyPartner && <th className="pb-2 pr-4 text-right">Wealth products</th>}
                     <th className="pb-2 pr-4 text-right">Earned</th>
                     {showTax && <th className="pb-2 pr-4 text-right">GST</th>}
                     {showTax && <th className="pb-2 pr-4 text-right">TDS</th>}

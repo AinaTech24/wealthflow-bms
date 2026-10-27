@@ -210,7 +210,7 @@ export const EarningsByMonth: React.FC<{ firmWide: boolean }> = ({ firmWide }) =
                   <tr className="text-[9px] font-black uppercase tracking-widest text-slate-400 border-b border-slate-200 dark:border-slate-700">
                     <th className="pb-2 pr-4 text-left">Month</th>
                     {source === 'all' && <th className="pb-2 pr-4 text-right">Mutual fund</th>}
-                    {source === 'all' && <th className="pb-2 pr-4 text-right">Partners</th>}
+                    {source === 'all' && <th className="pb-2 pr-4 text-right">Wealth products</th>}
                     <th className="pb-2 pr-4 text-right">Earned</th>
                     <th className="pb-2 pr-4 text-right">Paid</th>
                     <th className="pb-2 text-right">Still owed</th>
