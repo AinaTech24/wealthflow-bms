@@ -4938,6 +4938,8 @@ function detectAmcNameFromFilename(filename = '') {
     // create two separate rate histories for the same fund house.
     if (up.includes(b)) return canonicalAmcName(b);
   }
+  // The fund house is Groww, but the file is often saved as "Grow.pdf"; as a whole word it must not become a new AMC called GROW.
+  if (/\bGROWW?\b/.test(up)) return canonicalAmcName('GROWW');
 
   const base = filename
     .replace(/\.pdf$/i, '')
@@ -5197,7 +5199,12 @@ app.post('/api/parse-brokerage', requireAdminOrFinance, mutationLimiter, upload.
           try {
             const pdfLib = (await import('pdf-parse/lib/pdf-parse.js')).default;
             const d = await pdfLib(file.buffer);
-            const seen = new Set(rows.map(r => String(r.rawLine || '').replace(/\s+/g, ' ').trim().toLowerCase()).filter(Boolean));
+            // Compared with ALL spacing and punctuation removed. A card often prints "Groww Small Cap Fund1.00%1.00%..." with the
+            // name glued to the rates while the extracted row keeps "Groww Small Cap Fund 1.00%...", and a plain string compare
+            // reported nine schemes that had in fact been captured as "possibly missed".
+            const squash = (t) => String(t || '').toLowerCase().replace(/[^a-z0-9%.]/g, '');
+            const seen = new Set(rows.map(r => squash(r.rawLine)).filter(Boolean));
+            const names = rows.map(r => squash(r.schemeName)).filter(Boolean);
             const schemeWords = /(fund|scheme|plan|yojana|advantage|opportunit|savings|equity|debt|hybrid|liquid|gilt|bond|index|etf)/i;
             for (const raw of String(d.text || '').split('\n')) {
               const line = raw.replace(/\s+/g, ' ').trim();
@@ -5205,9 +5212,12 @@ app.post('/api/parse-brokerage', requireAdminOrFinance, mutationLimiter, upload.
               if (!schemeWords.test(line)) continue;                 // must look like a scheme
               if (!/\d\.\d{1,4}\s*%?/.test(line)) continue;          // must carry a rate
               if (/^(sr|s\.no|page|version|total|note|disclaimer|w\.e\.f|terms)/i.test(line)) continue;
-              const key = line.toLowerCase();
+              const key = squash(line);
               if (seen.has(key)) continue;
               if ([...seen].some(s => s.includes(key) || key.includes(s))) continue; // already covered
+              // the same scheme, read from a differently written copy of the line: its name is among the extracted names
+              const namePart = squash(line.split(/\d/)[0]);
+              if (namePart.length > 6 && names.some(n => n.includes(namePart) || namePart.includes(n))) continue;
               unparsed.push(line);
             }
             unparsed = [...new Set(unparsed)].slice(0, 40);

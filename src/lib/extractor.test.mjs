@@ -262,6 +262,13 @@ for (const n of ['Mutual Fundsaresubjecttomarketrisks For Mode- oftheamountoft',
   if (!looksLikeScheme(n)) pass++; else { console.log('  FAIL  should drop ' + n); fail++; }
 }
 
+// A rate of exactly 1.00% is a rate. The reader ranked a whole-number value below a fractional one, so on Groww's card
+// "Groww Small Cap Fund 1.00% 1.00% 0.95% ..." came out as 0.95 (the third column) instead of the first column's 1.00,
+// while its neighbours ("1.05% 1.05% 1.00%") read correctly.
+shouldParse('Groww Small Cap Fund1.00%1.00%0.95%1.18%1.18%1.12%', { amc: 'Groww Mutual Fund', nameHas: 'Small Cap', rate: 1.0 });
+shouldParse('Groww Large Cap Fund1.05%1.05%1.00%1.24%1.24%1.18%', { amc: 'Groww Mutual Fund', nameHas: 'Large Cap', rate: 1.05 });
+shouldParse('Groww Multicap Fund0.95%0.95%0.90%1.12%1.12%1.06%', { amc: 'Groww Mutual Fund', nameHas: 'Multi', rate: 0.95 });
+
 console.log(`\n${pass} passed, ${fail} failed`);
 process.exit(fail ? 1 : 0);
 

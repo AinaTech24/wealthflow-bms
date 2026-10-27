@@ -87,20 +87,20 @@ const guessCategory = (text) => {
 
 const extractPercentages = (text) => {
     const found = [];
-    const pushCandidate = (val, index, explicitPercent = false) => {
+    const pushCandidate = (val, index, explicitPercent = false, written = '') => {
         if (!(val >= 0.005 && val <= 5.0)) return;
         const start = Math.max(0, (index || 0) - 40);
         const end = Math.min(text.length, (index || 0) + 40);
         const snippet = text.substring(start, end).toLowerCase();
         const isExitLoad = /\b(exit|load|within|if redeemed|switch out|allotment|days?)\b/.test(snippet);
         if (!found.some(f => Math.abs(f.val - val) < 0.001 && Math.abs(f.index - (index || 0)) < 10)) {
-            found.push({ val, isExitLoad, index: index || 0, explicitPercent });
+            found.push({ val, isExitLoad, index: index || 0, explicitPercent, hasDot: String(written).includes('.') });
         }
     };
 
     const matchesArray = Array.from(text.matchAll(/([0-9]+(?:\.[0-9]+)?)\s*%/g));
     for (const match of matchesArray) {
-        pushCandidate(parseFloat(match[1]), match.index, true);
+        pushCandidate(parseFloat(match[1]), match.index, true, match[1]);
     }
 
     // Only skip implicit decimals for lines that are purely numeric WITH 2+ dots (e.g. "26.01.2026" dates).
@@ -146,7 +146,7 @@ const extractPercentages = (text) => {
         } else splitMatches.push(matchStr);
 
         for (const sMatch of splitMatches) {
-            pushCandidate(parseFloat(sMatch), match.index, false);
+            pushCandidate(parseFloat(sMatch), match.index, false, sMatch);
         }
     }
     if (found.length === 0) return [];
@@ -155,8 +155,10 @@ const extractPercentages = (text) => {
         if (a.isExitLoad && !b.isExitLoad) return 1;
         if (a.explicitPercent && !b.explicitPercent) return -1;
         if (!a.explicitPercent && b.explicitPercent) return 1;
-        const hasDecA = a.val % 1 !== 0;
-        const hasDecB = b.val % 1 !== 0;
+        // "Written with a decimal point", not "has a fractional value": a rate of 1.00% is a rate, and must not rank below 0.95%
+        // just because its value is a whole number (it used to, which made Groww Small Cap read 0.95 instead of 1.00).
+        const hasDecA = a.hasDot;
+        const hasDecB = b.hasDot;
         if (hasDecA && !hasDecB) return -1;
         if (!hasDecA && hasDecB) return 1;
         return a.index - b.index;
