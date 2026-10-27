@@ -80,7 +80,7 @@ export const Reports: React.FC<ReportsProps> = ({ currentUser }) => {
   const [currentPage, setCurrentPage] = useState(1);
   const [userSearchTerm, setUserSearchTerm] = useState('');
   const [clientSearchTerm, setClientSearchTerm] = useState('');
-  const [invoiceStatusFilter, setInvoiceStatusFilter] = useState<'ALL' | 'SUBMITTED' | 'PAID' | 'REJECTED'>('ALL');
+  const [invoiceStatusFilter, setInvoiceStatusFilter] = useState<'ALL' | 'SUBMITTED' | 'APPROVED' | 'PAID' | 'REJECTED'>('ALL');
   const pageSize = 50;
 
   // Growth tab state
@@ -909,15 +909,23 @@ export const Reports: React.FC<ReportsProps> = ({ currentUser }) => {
       : invoices.filter(i => i.userId === currentUser.id),
     [invoices, currentUser.id, isAdmin, isFinance]
   );
+  // The Month / Year dropdowns at the top of the page narrow the invoice lists too (an invoice's month is YYYY-MM).
+  const inFilterPeriod = (month: string) =>
+    (filters.year === 'All' || String(month || '').slice(0, 4) === filters.year) &&
+    (filters.month === 'All' || String(month || '').slice(5, 7) === filters.month);
   const myInvoicesFiltered = useMemo(
-    () => invoiceStatusFilter === 'ALL'
-      ? myInvoices
-      : myInvoices.filter(i => i.status === invoiceStatusFilter),
-    [myInvoices, invoiceStatusFilter]
+    () => myInvoices
+      .filter(i => invoiceStatusFilter === 'ALL' || i.status === invoiceStatusFilter)
+      .filter(i => inFilterPeriod(i.month)),
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    [myInvoices, invoiceStatusFilter, filters.year, filters.month]
   );
   const pendingApprovalInvoices = useMemo(
-    () => invoices.filter(i => i.status === InvoiceStatus.APPROVED || (isAdmin && i.status === InvoiceStatus.SUBMITTED)),
-    [invoices, isAdmin]
+    () => invoices
+      .filter(i => i.status === InvoiceStatus.APPROVED || (isAdmin && i.status === InvoiceStatus.SUBMITTED))
+      .filter(i => inFilterPeriod(i.month)),
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    [invoices, isAdmin, filters.year, filters.month]
   );
 
   // ── Growth tab: derive comparison period date ranges ───────────────────────
@@ -1907,9 +1915,10 @@ export const Reports: React.FC<ReportsProps> = ({ currentUser }) => {
               className="text-xs font-bold border border-slate-200 dark:border-slate-600 rounded-lg px-3 py-1.5 bg-white dark:bg-slate-700 text-slate-700 dark:text-slate-300 focus:ring-2 focus:ring-blue-500 outline-none"
             >
               <option value="ALL">All Statuses</option>
-              <option value="SUBMITTED">Submitted</option>
+              {!isFinance && <option value="SUBMITTED">Submitted</option>}
+              <option value="APPROVED">Approved (to pay)</option>
               <option value="PAID">Paid</option>
-              <option value="REJECTED">Rejected</option>
+              {!isFinance && <option value="REJECTED">Rejected</option>}
             </select>
           </div>
           <table className="w-full text-sm text-left">
