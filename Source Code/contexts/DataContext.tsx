@@ -38,6 +38,8 @@ interface DataContextType {
   invoices: PayoutInvoice[];
   addInvoice: (invoice: PayoutInvoice) => Promise<boolean>;
   updateInvoice: (invoice: PayoutInvoice) => void;
+  /** Re-read just the invoices from the server (another user may have approved or paid one since this session loaded). */
+  refreshInvoices: () => Promise<void>;
   recalculateAllTransactions: () => Promise<boolean>;
   refreshDashboard: () => void;
   clearAllData: () => void;
@@ -566,6 +568,17 @@ export const DataProvider: React.FC<{ children: React.ReactNode }> = ({ children
 
   const refreshDashboard = () => fetchData();
 
+  // Invoices change in other people's sessions (Admin approves, Finance pays). They are loaded once at sign-in, so a screen
+  // that depends on them asks for a fresh copy instead of showing what was true when this tab opened.
+  const refreshInvoices = async () => {
+    try {
+      const r = await authFetch('/api/data?type=invoices&_=' + Date.now(), { cache: 'no-store' });
+      if (!r.ok) return;
+      const list = await r.json();
+      if (Array.isArray(list)) setInvoices(list);
+    } catch { /* keep what is on screen */ }
+  };
+
   const clearAllData = () => {
     setLoading(true);
     if (isOnline) {
@@ -610,6 +623,7 @@ export const DataProvider: React.FC<{ children: React.ReactNode }> = ({ children
       invoices,
       addInvoice,
       updateInvoice,
+      refreshInvoices,
       recalculateAllTransactions,
       refreshDashboard,
       clearAllData,

@@ -54,7 +54,7 @@ const computeGstSplit = (baseAmount: number, gstRate: number, firmState?: string
 };
 
 export const Reports: React.FC<ReportsProps> = ({ currentUser }) => {
-  const { transactions, clients, team, globalConfig, invoices, addInvoice, updateInvoice, serverSummary, refreshTick } = useData();
+  const { transactions, clients, team, globalConfig, invoices, addInvoice, updateInvoice, refreshInvoices, serverSummary, refreshTick } = useData();
   const { showToast, showConfirm } = useToast();
 
   // Finance opens on the invoice approval queue: the rest of this page is about what people EARN, which stays with Admin.
@@ -903,6 +903,17 @@ export const Reports: React.FC<ReportsProps> = ({ currentUser }) => {
   // (pagination, search, theme changes etc.).
   // Finance & Admin see EVERY RM's invoices in the Invoices tab (they process
   // payouts for the whole team); a regular RM sees only their own.
+  // The invoice screens show what Admin and Finance have just done in their own sessions, so they re-read the invoices when
+  // opened, every 30 seconds while open, and whenever the window is brought back to the front.
+  useEffect(() => {
+    if (!(isAdmin || isFinance) || (activeTab !== 'approvals' && activeTab !== 'invoices')) return;
+    refreshInvoices();
+    const t = window.setInterval(refreshInvoices, 30000);
+    const onFocus = () => { refreshInvoices(); };
+    window.addEventListener('focus', onFocus);
+    return () => { window.clearInterval(t); window.removeEventListener('focus', onFocus); };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [activeTab, isAdmin, isFinance]);
   const myInvoices = useMemo(
     () => isAdmin ? invoices
       : isFinance ? invoices.filter(i => i.status === InvoiceStatus.APPROVED || i.status === InvoiceStatus.PAID)
