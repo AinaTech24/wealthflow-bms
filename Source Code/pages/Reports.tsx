@@ -65,12 +65,12 @@ export const Reports: React.FC<ReportsProps> = ({ currentUser }) => {
   // Super-user = admin OR finance (both see firm-wide data; finance is read-only outside payouts).
   const isSuperUser = isAdmin || isFinance;
   // Per-action permissions for the invoice approval workflow:
-  //   • Admin or Finance → approves SUBMITTED → APPROVED
-  //   • Admin or Finance → settles APPROVED  → PAID (the payment release)
-  //   • Either           → can reject with a reason
-  const canApproveInvoices = isAdmin || isFinance;
+  //   • Admin   → approves SUBMITTED → APPROVED, or rejects with a reason
+  //   • Finance → sees only what Admin has approved, and marks APPROVED → PAID (the payment release)
+  // The server enforces the same split (isFinancePaidTransition).
+  const canApproveInvoices = isAdmin;
   const canSettleInvoices = isAdmin || isFinance;
-  const canRejectInvoices = isAdmin || isFinance;
+  const canRejectInvoices = isAdmin;
 
   const [filters, setFilters] = useState({
     month: 'All',
@@ -904,8 +904,10 @@ export const Reports: React.FC<ReportsProps> = ({ currentUser }) => {
   // Finance & Admin see EVERY RM's invoices in the Invoices tab (they process
   // payouts for the whole team); a regular RM sees only their own.
   const myInvoices = useMemo(
-    () => isSuperUser ? invoices : invoices.filter(i => i.userId === currentUser.id),
-    [invoices, currentUser.id, isSuperUser]
+    () => isAdmin ? invoices
+      : isFinance ? invoices.filter(i => i.status === InvoiceStatus.APPROVED || i.status === InvoiceStatus.PAID)
+      : invoices.filter(i => i.userId === currentUser.id),
+    [invoices, currentUser.id, isAdmin, isFinance]
   );
   const myInvoicesFiltered = useMemo(
     () => invoiceStatusFilter === 'ALL'
@@ -914,8 +916,8 @@ export const Reports: React.FC<ReportsProps> = ({ currentUser }) => {
     [myInvoices, invoiceStatusFilter]
   );
   const pendingApprovalInvoices = useMemo(
-    () => invoices.filter(i => i.status === InvoiceStatus.SUBMITTED || i.status === InvoiceStatus.APPROVED),
-    [invoices]
+    () => invoices.filter(i => i.status === InvoiceStatus.APPROVED || (isAdmin && i.status === InvoiceStatus.SUBMITTED)),
+    [invoices, isAdmin]
   );
 
   // ── Growth tab: derive comparison period date ranges ───────────────────────
@@ -1517,7 +1519,7 @@ export const Reports: React.FC<ReportsProps> = ({ currentUser }) => {
       <div className="flex flex-col md:flex-row md:items-center justify-between gap-4">
         <div>
           <h1 className="text-2xl font-bold text-slate-900 dark:text-slate-100">{isFinance ? 'Invoices' : 'Brokerage Settlements'}</h1>
-          <p className="text-slate-500 dark:text-slate-400 mt-1 font-medium">{isFinance ? 'Approve what RMs and BMs have billed, then pay it from the Payouts page.' : 'Financial audit and payout management.'}</p>
+          <p className="text-slate-500 dark:text-slate-400 mt-1 font-medium">{isFinance ? 'Invoices the Admin has approved. Pay them, then mark them paid so the Admin sees the status change.' : 'Financial audit and payout management.'}</p>
         </div>
         <div className="flex items-center gap-2 flex-wrap">
           <select value={filters.month} onChange={e => setFilters({ ...filters, month: e.target.value })} className="border border-slate-200 dark:border-slate-600 rounded-lg px-3 py-1.5 text-xs bg-white dark:bg-slate-800 dark:text-slate-100 font-bold">
@@ -1545,7 +1547,7 @@ export const Reports: React.FC<ReportsProps> = ({ currentUser }) => {
             (isAdmin || useData().team.some(m => m.parentId === currentUser.id)) && { id: 'team-payouts', label: 'Team Payouts', icon: Users },
             { id: 'growth', label: 'Growth', icon: TrendingUp },
             (isAdmin || isFinance) && { id: 'approvals', label: 'Approvals Queue', icon: ShieldCheck },
-            isFinance && { id: 'invoices', label: 'All Invoices', icon: Landmark },
+            (isAdmin || isFinance) && { id: 'invoices', label: 'All Invoices', icon: Landmark },
             (isAdmin || isFinance) && { id: 'reconciliation', label: 'Reconciliation', icon: AlertTriangle },
           ].filter(Boolean).filter((tab: any) => !isFinance || tab.id === 'approvals' || tab.id === 'invoices').map((tab: any) => (
             <button key={tab.id} onClick={() => { setActiveTab(tab.id); setCurrentPage(1); }} className={`whitespace-nowrap py-4 px-1 border-b-2 font-black uppercase tracking-widest text-[10px] flex items-center transition-all ${activeTab === tab.id ? 'border-blue-500 text-blue-600' : 'border-transparent text-slate-400 dark:text-slate-500 hover:text-slate-600 dark:hover:text-slate-300'}`}>

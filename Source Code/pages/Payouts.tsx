@@ -1,7 +1,7 @@
 import React, { useState, useEffect, useMemo, useRef } from 'react';
 import { Wallet, Search, RefreshCw, AlertTriangle, Download, ShieldAlert, ChevronDown } from 'lucide-react';
 import { TeamMember, Role } from '../types';
-import { authFetch } from '../contexts/DataContext';
+import { authFetch, useData } from '../contexts/DataContext';
 import { useToast } from '../components/Toast';
 import { formatCompactINR } from '../utils/formatINR';
 import { exportToExcel } from '../utils/excelExport';
@@ -60,6 +60,7 @@ const todayIso = () => new Date().toISOString().slice(0, 10);
  */
 export const Payouts: React.FC<Props> = ({ currentUser }) => {
   const { showToast } = useToast();
+  const { updateInvoice } = useData();
   const isAdmin = currentUser.role === Role.ADMIN;
   const isFinance = currentUser.role === Role.FINANCE;
 
@@ -181,6 +182,22 @@ export const Payouts: React.FC<Props> = ({ currentUser }) => {
   const payView = payFor ? view(payFor.m) : null;
   const payTax = payFor ? taxFor(payFor.m) : null;
 
+  // The invoice and the payment are one event to the people involved: once Admin has approved an RM's invoice and the
+  // money recorded for that month reaches the invoice's base, the invoice is marked PAID, so Admin sees the status change
+  // without Finance having to do it twice. A part payment leaves the invoice APPROVED.
+  const markInvoicePaidIfCovered = async (userId: string, month: string, paidSoFar: number) => {
+    try {
+      const r = await authFetch('/api/data?type=invoices&_=' + Date.now(), { cache: 'no-store' });
+      if (!r.ok) return;
+      const list: any[] = await r.json();
+      const inv = list.find(i => i.userId === userId && i.month === month && String(i.status).toUpperCase() === 'APPROVED');
+      if (!inv || paidSoFar + 1 < Number(inv.amount || 0)) return;
+      // updateInvoice saves it and updates the invoice list this session already holds, so the Invoices screen shows PAID without a reload.
+      updateInvoice({ ...inv, status: 'PAID', paidDate: todayIso() } as any);
+      showToast('Invoice ' + (inv.invoiceNumber || inv.id) + ' is now marked PAID.', 'success');
+    } catch { /* the payment itself is recorded; the invoice can still be marked paid from the Invoices screen */ }
+  };
+
   const recordPayment = async () => {
     if (!payFor) return;
     const amt = Number(amount);
@@ -206,6 +223,7 @@ export const Payouts: React.FC<Props> = ({ currentUser }) => {
     const j = await res.json();
     if (!res.ok) { showToast(j?.error || 'Could not record the payment.', 'error'); return; }
     showToast(`${inr(amt)} recorded for ${payFor.p.name} · ${prettyMonth(payFor.m.period)}.`, 'success');
+    await markInvoicePaidIfCovered(payFor.p.userId, payFor.m.period, payFor.m.paid + amt);
     setPayFor(null); setAmount(''); setReference(''); setReason(''); setReasonText('');
     await load();
   };

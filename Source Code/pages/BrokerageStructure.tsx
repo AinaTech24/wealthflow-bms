@@ -5,6 +5,8 @@ import { TeamMember, Role } from '../types';
 import { useData, authFetch } from '../contexts/DataContext';
 import { Pagination } from '../components/Pagination';
 import { useToast } from '../components/Toast';
+import { AmcSheetMapper, type SheetLayout, type MappedRows } from '../components/AmcSheetMapper';
+import { layoutFromNames, layoutToNames, rowsFromGrid, sheetSignature } from '../../src/lib/amcSheet.js';
 
 interface BrokerageStructureProps {
     currentUser: TeamMember;
@@ -94,6 +96,13 @@ export const BrokerageStructure: React.FC<BrokerageStructureProps> = ({ currentU
     const [fileStats, setFileStats] = useState<FileStat[]>([]);
     const [extractionWarnings, setExtractionWarnings] = useState<string[]>([]);
     const pageSize = 50;
+    // A spreadsheet rate card in a layout nobody has taught yet: the mapping screen waits here for the person's answer.
+    const [mapper, setMapper] = useState<{ fileName: string; grid: string[][]; initial: SheetLayout | null; amcName: string } | null>(null);
+    const mapperResolve = React.useRef<((r: MappedRows | null) => void) | null>(null);
+    const askMapping = (fileName: string, grid: string[][], initial: SheetLayout | null, amcName: string) =>
+        new Promise<MappedRows | null>(resolve => { mapperResolve.current = resolve; setMapper({ fileName, grid, initial, amcName }); });
+    const closeMapper = (r: MappedRows | null) => { setMapper(null); mapperResolve.current?.(r); mapperResolve.current = null; };
+    const isSheet = (f: File) => /\.(xlsx|xls|csv)$/i.test(f.name);
 
     const isAdmin = currentUser.role === Role.ADMIN;
 
@@ -119,6 +128,40 @@ export const BrokerageStructure: React.FC<BrokerageStructureProps> = ({ currentU
         setError(null);
     };
 
+    // One spreadsheet rate card: read it with a layout the admin taught before if the headers match, otherwise guess the
+    // layout and ask. Returns the rows (empty when nothing could be read or the admin cancelled).
+    const readSheetFile = async (file: File): Promise<{ rows: BrokerageRow[]; stat: FileStat }> => {
+        const none = { rows: [] as BrokerageRow[], stat: { fileName: file.name, extractedRows: 0 } as FileStat };
+        const form = new FormData();
+        form.append('file', file);
+        const res = await authFetch('/api/parse-sheet', { method: 'POST', body: form });
+        const j = await res.json();
+        if (!j?.ok || !Array.isArray(j.jsonData) || j.jsonData.length < 2) return none;
+        const grid: string[][] = j.jsonData;
+        // A first guess from the file name, minus the words that describe the document rather than the AMC.
+        const stem = file.name.replace(/\.[^.]+$/, '').replace(/[_-]+/g, ' ');
+        const amcName = selectedAmc || stem
+            .replace(/\b(brokerage|rate|rates|card|structure|commission|payout|trail|grid|revised|final|copy|jan|feb|mar|apr|may|jun|jul|aug|sep|sept|oct|nov|dec|(19|20)\d\d|\d+)\b/gi, ' ')
+            .replace(/\s+/g, ' ').trim() || stem;
+        let saved: any[] = [];
+        try { const r = await authFetch('/api/data?action=amc_formats'); if (r.ok) saved = await r.json(); } catch { /* no saved layouts: ask */ }
+        let layout: SheetLayout | null = null;
+        for (const s of saved) { layout = layoutFromNames(grid, s.data); if (layout) break; }
+        let rows: any[] = layout ? rowsFromGrid(grid, layout, { amcName, sourceFile: file.name }).rows : [];
+        if (!rows.length) {
+            const made = await askMapping(file.name, grid, layout, amcName);
+            if (!made) return none;
+            rows = made.rows;
+            if (made.remember) {
+                try {
+                    await authFetch('/api/data', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({
+                        action: 'amc_format_save', payload: { signature: sheetSignature(grid, made.layout), label: made.amcName, data: layoutToNames(grid, made.layout) } }) });
+                } catch { /* the rows are still usable; the layout just is not remembered */ }
+            }
+        }
+        return { rows, stat: { fileName: file.name, extractedRows: rows.length } };
+    };
+
     const handleExtract = async () => {
         if (files.length === 0) return;
         setLoading(true);
@@ -128,41 +171,61 @@ export const BrokerageStructure: React.FC<BrokerageStructureProps> = ({ currentU
         setFileStats([]);
         setExtractionWarnings([]);
 
-        const formData = new FormData();
-        files.forEach(file => formData.append('files', file));
+        const pdfFiles = files.filter(f => !isSheet(f));
+        const sheetFiles = files.filter(isSheet);
+        let extracted: BrokerageRow[] = [];
+        let allStats: FileStat[] = [];
+        let warns: string[] = [];
 
         try {
-            const controller = new AbortController();
-            const timeoutId = window.setTimeout(() => controller.abort(), 120000);
-            let res: Response;
-            try {
-                res = await authFetch('/api/parse-brokerage', {
-                    method: 'POST',
-                    body: formData,
-                    signal: controller.signal
-                });
-            } finally {
-                window.clearTimeout(timeoutId);
+            if (pdfFiles.length > 0) {
+                const formData = new FormData();
+                pdfFiles.forEach(file => formData.append('files', file));
+                const controller = new AbortController();
+                const timeoutId = window.setTimeout(() => controller.abort(), 120000);
+                let res: Response;
+                try {
+                    res = await authFetch('/api/parse-brokerage', {
+                        method: 'POST',
+                        body: formData,
+                        signal: controller.signal
+                    });
+                } finally {
+                    window.clearTimeout(timeoutId);
+                }
+
+                const raw = await res.text();
+                let result: any = {};
+                if (raw) {
+                    try { result = JSON.parse(raw); } catch { result = {}; }
+                }
+
+                if (result.success) {
+                    extracted = result.extracted || [];
+                    allStats = result.fileStats || [];
+                    warns = result.warnings || [];
+                } else {
+                    setFileStats(result.fileStats || []);
+                    setExtractionWarnings(result.warnings || []);
+                    const errMsg = result.error || `Parsing failed (HTTP ${res.status})`;
+                    setError(errMsg);
+                    showToast(errMsg, 'error');
+                    if (sheetFiles.length === 0) return;
+                }
             }
 
-            const raw = await res.text();
-            let result: any = {};
-            if (raw) {
-                try { result = JSON.parse(raw); } catch { result = {}; }
+            for (const f of sheetFiles) {
+                const r = await readSheetFile(f);
+                extracted = [...extracted, ...r.rows];
+                allStats = [...allStats, r.stat];
             }
 
-            if (result.success) {
-                setPreviewData(result.extracted || []);
-                setFileStats(result.fileStats || []);
-                setExtractionWarnings(result.warnings || []);
+            if (extracted.length > 0 || allStats.length > 0) {
+                setPreviewData(extracted);
+                setFileStats(allStats);
+                setExtractionWarnings(warns);
                 setFiles([]);
-                showToast(`Extracted ${result.extracted?.length || 0} rows from ${result.fileStats?.length || files.length} file(s).`, 'success');
-            } else {
-                setFileStats(result.fileStats || []);
-                setExtractionWarnings(result.warnings || []);
-                const errMsg = result.error || `Parsing failed (HTTP ${res.status})`;
-                setError(errMsg);
-                showToast(errMsg, 'error');
+                showToast(`Extracted ${extracted.length} rows from ${allStats.length || files.length} file(s).`, 'success');
             }
         } catch (err: any) {
             if (err?.name === 'AbortError') {
@@ -622,8 +685,8 @@ export const BrokerageStructure: React.FC<BrokerageStructureProps> = ({ currentU
                     {isAdmin && (
                         <div className="bg-white dark:bg-slate-800 p-8 border-2 border-dashed border-slate-200 rounded-xl flex flex-col items-center">
                             <Upload className="w-12 h-12 text-blue-600 mb-4 opacity-50" />
-                            <h3 className="text-sm font-black uppercase tracking-widest text-slate-900 mb-1">Upload Brokerage PDF</h3>
-                            <p className="text-slate-500 text-[10px] font-bold uppercase tracking-widest mb-6 text-center">Auto-extract rates from AMC PDFs</p>
+                            <h3 className="text-sm font-black uppercase tracking-widest text-slate-900 mb-1">Upload AMC Brokerage File</h3>
+                            <p className="text-slate-500 text-[10px] font-bold uppercase tracking-widest mb-6 text-center">PDF or Excel / CSV, in any layout</p>
 
                             {error && (
                                 <div className="mb-4 p-3 bg-red-50 border border-red-100 rounded-lg flex items-start gap-2 max-w-xs">
@@ -632,9 +695,9 @@ export const BrokerageStructure: React.FC<BrokerageStructureProps> = ({ currentU
                                 </div>
                             )}
 
-                            <input type="file" multiple accept=".pdf" onChange={handleFileChange} id="pdf-upload" className="hidden" />
+                            <input type="file" multiple accept=".pdf,.xlsx,.xls,.csv" onChange={handleFileChange} id="pdf-upload" className="hidden" />
                             <label htmlFor="pdf-upload" className="cursor-pointer px-8 py-3 bg-blue-600 text-white rounded-xl text-xs font-black uppercase tracking-widest hover:bg-blue-700 shadow-xl shadow-blue-50 transition">
-                                {files.length > 0 ? `Selected ${files.length} PDFs` : 'Select PDF Files'}
+                                {files.length > 0 ? `Selected ${files.length} file${files.length !== 1 ? 's' : ''}` : 'Select Files'}
                             </label>
 
                             {files.length > 0 && !loading && (
@@ -987,6 +1050,7 @@ export const BrokerageStructure: React.FC<BrokerageStructureProps> = ({ currentU
                 </div>
             </div>
         )}
+        {mapper && <AmcSheetMapper fileName={mapper.fileName} grid={mapper.grid} initial={mapper.initial} amcName={mapper.amcName} onCancel={() => closeMapper(null)} onDone={r => closeMapper(r)} />}
         </>
     );
 };

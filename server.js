@@ -1082,6 +1082,24 @@ function accumulatePayoutTotals(txRows, ctx) {
   return totals;
 }
 
+// Finance pays what Admin has approved; it does not approve or reject. The only change Finance may write to an
+// invoice is APPROVED -> PAID, with every figure left exactly as it was approved. Admin is not limited by this.
+async function isFinancePaidTransition(req, payload) {
+  const list = Array.isArray(payload) ? payload : [payload];
+  if (!list.length) return false;
+  for (const inv of list) {
+    if (!inv || !inv.id) return false;
+    if (String(inv.status || '').toUpperCase() !== 'PAID') return false;
+    const [[stored]] = await pool.query('SELECT data FROM invoices WHERE id = ?', [inv.id]);
+    if (!stored) return false;
+    let d = {}; try { d = JSON.parse(stored.data || '{}'); } catch {}
+    if (String(d.status || '').toUpperCase() !== 'APPROVED') return false;
+    const same = (a, b) => Math.abs((Number(a) || 0) - (Number(b) || 0)) < 0.005;
+    if (!same(inv.amount, d.amount) || !same(inv.netPayable, d.netPayable) || !same(inv.gstAmount, d.gstAmount) || !same(inv.tdsAmount, d.tdsAmount)) return false;
+  }
+  return true;
+}
+
 // Allow an OPS/RM user to persist THEIR OWN payout invoice (status SUBMITTED)
 // without ADMIN/FINANCE write privilege — the "Raise Invoice" button is shown to
 // RMs, so they must be able to save the invoice for their own monthly payout.
@@ -1690,6 +1708,17 @@ app.all('/api/data', mutationLimiter, async (req, res) => {
       //    Partner brokerage is folded in through the same flat per-level
       //    percentages the Partner Brokerage page sets, so a person's row is what
       //    they are owed in total, not per revenue stream.
+      // ── AMC rate-card spreadsheet layouts the admin has taught (see src/lib/amcSheet.js) ────────────
+      if (action === 'amc_formats') {
+        try {
+          if (!req.user || req.user.role !== 'ADMIN') return res.status(403).json({ error: 'Admin privileges required' });
+          res.set('Cache-Control', 'no-store');
+          await pool.query("CREATE TABLE IF NOT EXISTS amc_formats (signature VARCHAR(190) NOT NULL PRIMARY KEY, label VARCHAR(120), data TEXT, updatedAt DATETIME DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP)");
+          const [rows] = await pool.query('SELECT signature, label, data FROM amc_formats ORDER BY updatedAt DESC');
+          return res.json(rows.map(r => { let d = {}; try { d = JSON.parse(r.data || '{}'); } catch {} return { signature: r.signature, label: r.label || '', data: d }; }));
+        } catch (e) { console.error('[amc_formats]', e); return res.status(500).json({ error: 'Failed to read the saved layouts' }); }
+      }
+
       // ── Which RTA files are in for each month, and which are still missing ──────────
       //    The Imports page shows this as a checklist and a pop-up. ADMIN only.
       if (action === 'rta_checklist') {
@@ -2845,6 +2874,10 @@ app.all('/api/data', mutationLimiter, async (req, res) => {
         console.warn(`🛑 [WRITE] 403 POST action=${action || '(persist)'} coll=${collection || '-'} blocked user=${req.user?.id || 'none'} role=${req.user?.role || 'none'}`);
         return res.status(403).json({ error: 'Admin or Finance privileges required to modify data' });
       }
+      if (!action && collection === 'invoices' && req.user?.role === 'FINANCE' && !(await isFinancePaidTransition(req, payload))) {
+        console.warn(`🛑 [invoice] Finance tried a change other than APPROVED -> PAID user=${req.user.id}`);
+        return res.status(403).json({ error: 'Finance can only mark an invoice the Admin has approved as paid.' });
+      }
 
       if (action === 'partner_format_save') {
         if (!canMutate(req, action)) return res.status(403).json({ error: 'Admin privileges required' });
@@ -2860,6 +2893,21 @@ app.all('/api/data', mutationLimiter, async (req, res) => {
           await pool.query('INSERT INTO activity_log (userId, userName, action, description, createdAt) VALUES (?,?,?,?,NOW())', [req.user?.id || '', req.user?.name || '', 'partner_format', `${partner}: file layout saved (client "${data.clientCol}", amount "${data.amountCol}"${data.monthCol ? `, month "${data.monthCol}"` : ''})`]);
           return res.json({ success: true, partner });
         } catch (e) { console.error('[partner_format_save]', e); return res.status(500).json({ error: e.message }); }
+      }
+
+      // Remember how an AMC's spreadsheet is laid out (header names, not column numbers), so the next file reads itself.
+      if (action === 'amc_format_save') {
+        if (!req.user || req.user.role !== 'ADMIN') return res.status(403).json({ error: 'Admin privileges required' });
+        try {
+          const signature = String(payload?.signature || '').trim().slice(0, 190);
+          const d = payload?.data || {};
+          if (!signature || !d.schemeHeader || !d.rateHeader) return res.status(400).json({ error: 'A layout needs its header names, a scheme column and a rate column.' });
+          const data = { schemeHeader: String(d.schemeHeader).slice(0, 120), rateHeader: String(d.rateHeader).slice(0, 120), categoryHeader: String(d.categoryHeader || '').slice(0, 120), amcHeader: String(d.amcHeader || '').slice(0, 120), unit: d.unit === 'fraction' ? 'fraction' : 'percent' };
+          await pool.query("CREATE TABLE IF NOT EXISTS amc_formats (signature VARCHAR(190) NOT NULL PRIMARY KEY, label VARCHAR(120), data TEXT, updatedAt DATETIME DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP)");
+          await pool.query('INSERT INTO amc_formats (signature, label, data) VALUES (?,?,?) ON DUPLICATE KEY UPDATE label = VALUES(label), data = VALUES(data)', [signature, String(payload?.label || '').slice(0, 120), JSON.stringify(data)]);
+          await pool.query('INSERT INTO activity_log (userId, userName, action, description, createdAt) VALUES (?,?,?,?,NOW())', [req.user?.id || '', req.user?.name || '', 'amc_format_save', `AMC rate-card layout remembered: ${data.schemeHeader} / ${data.rateHeader}`]);
+          return res.json({ success: true });
+        } catch (e) { console.error('[amc_format_save]', e); return res.status(500).json({ error: e.message }); }
       }
 
       // A folio master (WBR9 / MFSD211) imports clients only and leaves no rows behind, so the Imports page records each one
