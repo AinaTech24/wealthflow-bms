@@ -11,6 +11,7 @@ import { calculateUserShare } from '../services/calculationService';
 import { ComplianceAlerts } from '../components/ComplianceAlerts';
 import { TopClientsWidget } from '../components/TopClientsWidget';
 import { EarningsByMonth } from '../components/EarningsByMonth';
+import { MyTeamPanel } from '../components/MyTeamPanel';
 import { RedemptionAlerts } from '../components/RedemptionAlerts';
 import { formatCurrencyINR, formatCompactINR, formatINR } from '../utils/formatINR';
 
@@ -300,6 +301,8 @@ export const Dashboard: React.FC<DashboardProps> = ({ currentUser }) => {
   return (
     <div className="space-y-6 animate-in fade-in duration-500">
       {!isAdmin && <EarningsByMonth firmWide={false} />}
+      {/* A BM-level login sees who is under them, here and in Reports & Payouts -> Team Payouts. */}
+      {!isAdmin && Number(currentUser.level) >= 4 && <MyTeamPanel currentUser={currentUser} />}
       {txTruncated && !useServerTotals && (
         <div className="rounded-lg border border-amber-200 dark:border-amber-800 bg-amber-50 dark:bg-amber-900/20 px-4 py-2.5 text-[12px] font-semibold text-amber-800 dark:text-amber-300">
           Showing the most recent {transactions.length.toLocaleString()} of {serverSummary!.totalTx.toLocaleString()} transactions. Figures for this filtered view are based on that subset — switch to “All time” for server-authoritative totals, or use Reports → Team Payouts.

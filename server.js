@@ -83,6 +83,8 @@ app.set('trust proxy', 1);
 const SUMMARY_TTL_MS = 30_000;
 let summaryCache = null;
 let periodTotalsCache = null;   // { at, body } — 60s, same idea as summaryCache
+// my_team / team_payouts: who is under a user, kept for a minute per user.
+const downlineCache = new Map();
 // team_payouts cache: keyed by `${year}:${month}`; payout rules change rarely.
 const TEAM_PAYOUTS_TTL_MS = 60_000;
 let teamPayoutsCache = {};
@@ -2255,6 +2257,38 @@ app.all('/api/data', mutationLimiter, async (req, res) => {
         }
       }
 
+      // ── Who is "my team"? ───────────────────────────────────────────────────────────────────────────
+      //    A BM (or anyone above RM level) sees the RMs and BMs under them. "Under" is read two ways and both count: people who
+      //    report to them through the team tree (parentId, any depth), and people who sit in a LOWER slot on the clients where they
+      //    hold a slot (an RM placed under a BM on a client is that BM's RM even when the team tree does not say so).
+      const downlineOf = async (userId) => {
+        const hit = downlineCache.get(userId);
+        if (hit && Date.now() - hit.at < 60 * 1000) return hit.ids;
+        const [team] = await pool.query('SELECT id, parentId FROM team');
+        const kids = new Map();
+        for (const t of team) if (t.parentId) { if (!kids.has(t.parentId)) kids.set(t.parentId, []); kids.get(t.parentId).push(t.id); }
+        const ids = new Set(); const stack = [userId];
+        while (stack.length) { const p = stack.pop(); for (const k of (kids.get(p) || [])) if (!ids.has(k)) { ids.add(k); stack.push(k); } }
+        const [cl] = await pool.query('SELECT data FROM clients');
+        for (const c of cl) {
+          let h = {}; try { h = JSON.parse(c.data || '{}').hierarchy || {}; } catch { continue; }
+          const slots = [1, 2, 3, 4, 5, 6, 7].map(l => h['level' + l + 'Id'] || '');
+          const mine = slots.findIndex(x => x === userId);
+          if (mine > 0) for (let j = 0; j < mine; j++) if (slots[j] && slots[j] !== userId) ids.add(slots[j]);
+        }
+        ids.delete(userId);
+        downlineCache.set(userId, { at: Date.now(), ids });
+        return ids;
+      };
+      if (action === 'my_team') {
+        try {
+          if (!req.user) return res.status(401).json({ error: 'Authentication required' });
+          res.set('Cache-Control', 'no-store');
+          const ids = await downlineOf(req.user.id);
+          return res.json({ ids: [...ids] });
+        } catch (e) { console.error('[my_team]', e); return res.status(500).json({ error: 'Failed to read the team' }); }
+      }
+
       // ── Team Payouts aggregation — walks the FULL transactions table for the
       //    requested period and accumulates per-user gross / tx counts by
       //    traversing each client's hierarchy. Bypasses the row-cap entirely
@@ -2270,9 +2304,17 @@ app.all('/api/data', mutationLimiter, async (req, res) => {
           // invalidate the cache on any write).
           const tpKey = `${year}:${month}`;
           const tpNow = Date.now();
+          // The cached body holds the whole firm; each viewer is handed only their own part of it (a BM must not be sent
+          // every other RM's earnings).
+          const scopeTeam = async (body) => {
+            if (isWriter(req)) return body;
+            // a COPY: adding the viewer to the cached set itself would make them their own team member on the next read
+            const allowed = new Set(await downlineOf(req.user.id)); allowed.add(req.user.id);
+            return { ...body, payouts: (body.payouts || []).filter(p => allowed.has(p.userId)) };
+          };
           if (teamPayoutsCache[tpKey] && tpNow - teamPayoutsCache[tpKey].at < TEAM_PAYOUTS_TTL_MS) {
             res.set('X-Cache', 'HIT');
-            return res.json(teamPayoutsCache[tpKey].body);
+            return res.json(await scopeTeam(teamPayoutsCache[tpKey].body));
           }
           // Validate year/month format to keep them safe inside LIKE patterns.
           if (year !== 'All' && !/^\d{4}$/.test(year)) return res.status(400).json({ error: 'Invalid year' });
@@ -2381,7 +2423,7 @@ app.all('/api/data', mutationLimiter, async (req, res) => {
           };
           teamPayoutsCache[tpKey] = { at: tpNow, body: tpBody };
           res.set('X-Cache', 'MISS');
-          return res.json(tpBody);
+          return res.json(await scopeTeam(tpBody));
         } catch (e) {
           console.error('[team_payouts] failed:', e.message);
           return res.status(500).json({ error: e.message });

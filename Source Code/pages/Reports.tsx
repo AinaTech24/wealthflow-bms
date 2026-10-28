@@ -64,6 +64,23 @@ export const Reports: React.FC<ReportsProps> = ({ currentUser }) => {
   const isFinance = currentUser.role === Role.FINANCE;
   // Super-user = admin OR finance (both see firm-wide data; finance is read-only outside payouts).
   const isSuperUser = isAdmin || isFinance;
+  // Who is under this user: the RMs and BMs on their team tree and the ones placed beneath them on their clients. A BM sees
+  // them (and only them) in Team Payouts, month by month. Admin sees everyone.
+  const [downlineIds, setDownlineIds] = useState<Set<string> | null>(null);
+  useEffect(() => {
+    if (isAdmin || isFinance) return;
+    let cancelled = false;
+    authFetch('/api/data?action=my_team')
+      .then(r => (r.ok ? r.json() : null))
+      .then(j => { if (!cancelled && j && Array.isArray(j.ids)) setDownlineIds(new Set<string>(j.ids)); })
+      .catch(() => { /* the tab still opens; it falls back to the team tree */ });
+    return () => { cancelled = true; };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [currentUser.id, refreshTick]);
+  // Every BM-level login (L4 and above) gets the Team Payouts tab, even before anyone is placed under them, so it says so
+  // instead of the tab being missing; anyone else gets it as soon as they have a team.
+  const hasTeam = (downlineIds ? downlineIds.size > 0 : false) || team.some(m => m.parentId === currentUser.id);
+  const showTeamTab = isAdmin || Number(currentUser.level) >= 4 || hasTeam;
   // Per-action permissions for the invoice approval workflow:
   //   • Admin   → approves SUBMITTED → APPROVED, or rejects with a reason
   //   • Finance → sees only what Admin has approved, and marks APPROVED → PAID (the payment release)
@@ -857,7 +874,7 @@ export const Reports: React.FC<ReportsProps> = ({ currentUser }) => {
         // from V onwards shifted down by one and chased phantom differences.
         // Gross for a login that cannot earn is meaningless; leave it out.
         if (m.role === Role.ADMIN || m.role === Role.FINANCE) return false;
-        if (!isAdmin && m.parentId !== currentUser.id) return false;
+        if (!isAdmin && !(downlineIds ? downlineIds.has(m.id) : m.parentId === currentUser.id)) return false;
         const totals = memberTotals[m.id];
         // Include member if EITHER client side detected activity OR the server
         // sees a non-zero gross total for this user/period. The server is the
@@ -886,7 +903,7 @@ export const Reports: React.FC<ReportsProps> = ({ currentUser }) => {
         };
       })
       .sort((a, b) => b.member.level - a.member.level);
-  }, [team, isAdmin, currentUser, visibleTransactions, clients, globalConfig, serverGrossByUser, serverEarningsByUser, membersWithClients]);
+  }, [team, isAdmin, currentUser, visibleTransactions, clients, globalConfig, serverGrossByUser, serverEarningsByUser, membersWithClients, downlineIds]);
 
   // Lightweight filter on top — only re-runs when search term changes,
   // not on every pagination event.
@@ -1563,7 +1580,7 @@ export const Reports: React.FC<ReportsProps> = ({ currentUser }) => {
             { id: 'monthly', label: 'Monthly Payouts', icon: Clock },
             { id: 'client-summary', label: 'Client-wise', icon: Briefcase },
             { id: 'transactions', label: 'Logs', icon: FileText },
-            (isAdmin || useData().team.some(m => m.parentId === currentUser.id)) && { id: 'team-payouts', label: 'Team Payouts', icon: Users },
+            showTeamTab && { id: 'team-payouts', label: 'Team Payouts', icon: Users },
             { id: 'growth', label: 'Growth', icon: TrendingUp },
             (isAdmin || isFinance) && { id: 'approvals', label: 'Approvals Queue', icon: ShieldCheck },
             (isAdmin || isFinance) && { id: 'invoices', label: 'All Invoices', icon: Landmark },
@@ -2075,7 +2092,7 @@ export const Reports: React.FC<ReportsProps> = ({ currentUser }) => {
         </div>
       )}
 
-      {activeTab === 'team-payouts' && (isAdmin || useData().team.some(m => m.parentId === currentUser.id)) && (
+      {activeTab === 'team-payouts' && showTeamTab && (
         <div className="bg-white rounded-xl border border-slate-200 shadow-sm overflow-hidden animate-in fade-in">
           <div className="p-4 bg-slate-50 border-b border-slate-200 flex flex-col md:flex-row justify-between items-center gap-4">
             <div className="flex items-center gap-4 w-full md:w-auto">
@@ -2187,7 +2204,9 @@ export const Reports: React.FC<ReportsProps> = ({ currentUser }) => {
               {filteredTeamWithPayouts.length === 0 && (
                 <tr>
                   <td colSpan={isAdmin ? 6 : 5} className="py-12 text-center text-slate-400 font-bold uppercase text-[10px] tracking-widest italic">
-                    No team payout data found for this period
+                    {!isAdmin && downlineIds && downlineIds.size === 0
+                      ? 'No RM or BM is placed under you yet. When one is (Clients & Map), they appear here, month by month.'
+                      : 'No team payout data found for this period'}
                   </td>
                 </tr>
               )}
