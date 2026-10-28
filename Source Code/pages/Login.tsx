@@ -21,6 +21,9 @@ export const Login: React.FC<LoginProps> = ({ onLogin }) => {
   const [showPassword, setShowPassword] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [isAuthenticating, setIsAuthenticating] = useState(false);
+  // One email can open several accounts (a person who is an RM and a BM). When the password fits more than one, the server
+  // lists them and the person picks which to open.
+  const [choices, setChoices] = useState<Array<{ id: string; name: string; level: number; role: string }> | null>(null);
 
   // Forgot Password States
   const [otp, setOtp] = useState('');
@@ -29,6 +32,10 @@ export const Login: React.FC<LoginProps> = ({ onLogin }) => {
 
   const handleLoginSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
+    await signIn();
+  };
+
+  const signIn = async (accountId?: string) => {
     setError(null);
     setIsAuthenticating(true);
 
@@ -50,7 +57,8 @@ export const Login: React.FC<LoginProps> = ({ onLogin }) => {
               body: JSON.stringify({
                 action: 'auth',
                 identifier: identifier,
-                password: pass
+                password: pass,
+                ...(accountId ? { accountId } : {})
               }),
               signal: controller.signal
             });
@@ -64,6 +72,11 @@ export const Login: React.FC<LoginProps> = ({ onLogin }) => {
             try { data = JSON.parse(raw); } catch { data = {}; }
           }
 
+          if (response.ok && data.success && data.needsChoice && Array.isArray(data.accounts)) {
+            setChoices(data.accounts);
+            setIsAuthenticating(false);
+            return;
+          }
           if (response.ok && data.success && data.user) {
             // Store JWT token
             if (data.token) {
@@ -186,7 +199,26 @@ export const Login: React.FC<LoginProps> = ({ onLogin }) => {
 
         <div className="bg-white dark:bg-slate-800 rounded-3xl shadow-2xl shadow-slate-200 dark:shadow-slate-900 overflow-hidden border border-slate-100 dark:border-slate-700">
           <div className="p-8">
-            {view === 'LOGIN' && (
+            {view === 'LOGIN' && choices && (
+              <div className="space-y-4">
+                <div>
+                  <h3 className="text-sm font-black uppercase tracking-widest text-slate-900 dark:text-slate-100">Which account?</h3>
+                  <p className="text-xs text-slate-500 dark:text-slate-400 mt-1">This email and password open more than one account. Choose the one you want to work in.</p>
+                </div>
+                <div className="space-y-2">
+                  {choices.map(a => (
+                    <button key={a.id} type="button" disabled={isAuthenticating} onClick={() => signIn(a.id)}
+                      className="w-full flex items-center justify-between gap-3 text-left px-4 py-3 rounded-xl border border-slate-200 dark:border-slate-600 hover:border-blue-500 hover:bg-blue-50/50 dark:hover:bg-blue-900/20 transition disabled:opacity-50">
+                      <span className="font-bold text-slate-900 dark:text-slate-100 text-sm">{a.name}</span>
+                      <span className="text-[10px] font-black uppercase tracking-widest text-slate-400 whitespace-nowrap">{a.level >= 4 ? 'BM' : 'RM'} · Level {a.level}</span>
+                    </button>
+                  ))}
+                </div>
+                {error && <p className="text-xs text-red-600">{error}</p>}
+                <button type="button" onClick={() => { setChoices(null); setError(null); }} className="text-xs font-bold text-slate-500 hover:text-slate-700">Back</button>
+              </div>
+            )}
+            {view === 'LOGIN' && !choices && (
               <form onSubmit={handleLoginSubmit} className="space-y-6">
                 <div className="text-center mb-8">
                   <h1 className="text-2xl font-bold text-slate-900 dark:text-slate-100">Sign In</h1>

@@ -4347,31 +4347,42 @@ app.all('/api/data', mutationLimiter, async (req, res) => {
           AUTH_TIMEOUT_MS,
           'Authentication query'
         );
-        if (rows.length > 0) {
-          const dbUser = rows[0];
-          let passwordMatch = false;
-
+        // One email can belong to several accounts: the same person is often an RM (L2/L3) AND a BM (L4/L5) under one mailbox, and the
+        // ARN code is shared by many. The query used to take the first row it found, so the other account could never be signed in
+        // to, and a correct password for it was refused. Every matching account is now checked against the password: one match signs
+        // in as before; several matches ask which account to open (the client sends the choice back as accountId).
+        const matches = [];
+        for (const dbUser of rows) {
           // Bcrypt only. Plain-text login is NOT accepted (migration window closed).
           // Any legacy un-hashed password row simply fails auth until reset.
           if (dbUser.password && (dbUser.password.startsWith('$2b$') || dbUser.password.startsWith('$2a$'))) {
-            passwordMatch = await bcrypt.compare(password, dbUser.password);
+            if (await bcrypt.compare(password, dbUser.password)) matches.push(dbUser);
           }
-
-          if (passwordMatch) {
-            const user = { ...dbUser };
-            if (user.data) Object.assign(user, JSON.parse(user.data));
-            delete user.data;
-            delete user.password;
-
-            // Issue JWT
-            const token = jwt.sign(
-              { id: user.id, role: user.role, level: user.level },
-              JWT_SECRET,
-              { expiresIn: '7d' }
-            );
-
-            return res.json({ success: true, user, token });
+        }
+        if (matches.length > 0) {
+          matches.sort((a, b) => Number(b.level) - Number(a.level));
+          let dbUser = matches[0];
+          if (matches.length > 1) {
+            const wanted = String(body.accountId || '');
+            if (!wanted) {
+              return res.json({ success: true, needsChoice: true, accounts: matches.map(u => ({ id: u.id, name: u.name, level: Number(u.level), role: u.role })) });
+            }
+            dbUser = matches.find(u => u.id === wanted);
+            if (!dbUser) return res.status(401).json({ error: 'Invalid credentials' });
           }
+          const user = { ...dbUser };
+          if (user.data) Object.assign(user, JSON.parse(user.data));
+          delete user.data;
+          delete user.password;
+
+          // Issue JWT
+          const token = jwt.sign(
+            { id: user.id, role: user.role, level: user.level },
+            JWT_SECRET,
+            { expiresIn: '7d' }
+          );
+
+          return res.json({ success: true, user, token });
         }
         return res.status(401).json({ error: 'Invalid credentials' });
       }
