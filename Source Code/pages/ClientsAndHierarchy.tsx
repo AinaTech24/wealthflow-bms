@@ -1,6 +1,6 @@
 
 import React, { useState, useMemo, useEffect } from 'react';
-import { FileSpreadsheet, Users, Search, Plus, Edit2, X, UserCheck, Shield, ChevronRight, Tags, Database, Save, Key, Copy, Check, Mail, Trash2, UserPlus, GitMerge, Phone, AlertCircle, Download } from 'lucide-react';
+import { Eye, EyeOff, FileSpreadsheet, Users, Search, Plus, Edit2, X, UserCheck, Shield, ChevronRight, Tags, Database, Save, Key, Copy, Check, Mail, Trash2, UserPlus, GitMerge, Phone, AlertCircle, Download } from 'lucide-react';
 import { Client, TeamMember, Role } from '../types';
 import { useData, authFetch } from '../contexts/DataContext';
 import { PromotionPanel, PromotionPreview } from '../components/PromotionPanel';
@@ -24,6 +24,11 @@ export const ClientsAndHierarchy: React.FC<ClientsAndHierarchyProps> = ({ curren
 
   const [isTeamModalOpen, setIsTeamModalOpen] = useState(false);
   const [isTeamImportOpen, setIsTeamImportOpen] = useState(false);
+  // The password field can be revealed while typing. After a NEW password is saved it is shown once, so the admin can pass it on:
+  // only a hash is kept on the server, so a password set earlier can never be read back.
+  const [showPw, setShowPw] = useState(false);
+  const [pwNotice, setPwNotice] = useState<{ name: string; password: string } | null>(null);
+  const [pwNoticeCopied, setPwNoticeCopied] = useState(false);
   const [isClientModalOpen, setIsClientModalOpen] = useState(false);
   const [editingMember, setEditingMember] = useState<TeamMember | null>(null);
   const [editingClient, setEditingClient] = useState<Client | null>(null);
@@ -188,6 +193,7 @@ export const ClientsAndHierarchy: React.FC<ClientsAndHierarchyProps> = ({ curren
 
   const openTeamModal = (member?: TeamMember) => {
     if (!isAdmin) return;
+    setShowPw(false);
     setOccupiedRule('replace');
     setPromoPreview(null);
     if (member) {
@@ -292,6 +298,7 @@ export const ClientsAndHierarchy: React.FC<ClientsAndHierarchyProps> = ({ curren
       return;
     }
     setIsTeamModalOpen(false);
+    if (memberForm.password) { setPwNoticeCopied(false); setPwNotice({ name: memberForm.name || 'this user', password: String(memberForm.password) }); }
 
     if (andRecalc) {
       showToast('Saved. Recalculating payouts with the new sharing %…', 'info');
@@ -1648,7 +1655,12 @@ export const ClientsAndHierarchy: React.FC<ClientsAndHierarchyProps> = ({ curren
                   </div>
                   <div>
                     <label className="text-[10px] font-black text-slate-400 dark:text-slate-500 uppercase tracking-widest">Account Password</label>
-                    <input type="password" value={memberForm.password || ''} onChange={e => setMemberForm({ ...memberForm, password: e.target.value })} className="w-full border border-slate-200 p-4 rounded-2xl mt-1.5 font-bold outline-none bg-white" placeholder={editingMember ? 'Leave blank to keep current password' : 'Set a password'} />
+                    <div className="relative">
+                      <input type={showPw ? 'text' : 'password'} autoComplete="new-password" value={memberForm.password || ''} onChange={e => setMemberForm({ ...memberForm, password: e.target.value })} className="w-full border border-slate-200 p-4 pr-12 rounded-2xl mt-1.5 font-bold outline-none bg-white" placeholder={editingMember ? 'Leave blank to keep current password' : 'Set a password'} />
+                      <button type="button" onClick={() => setShowPw(v => !v)} aria-label={showPw ? 'Hide password' : 'Show password'} title={showPw ? 'Hide password' : 'Show password'} className="absolute right-4 top-1/2 -translate-y-1/2 mt-0.5 text-slate-400 hover:text-slate-700">
+                        {showPw ? <EyeOff className="w-5 h-5" /> : <Eye className="w-5 h-5" />}
+                      </button>
+                    </div>
                   {editingMember && <p className="text-[10px] text-slate-400 mt-1">Existing passwords are stored encrypted and can never be displayed. Leave this blank unless you want to change it.</p>}
                   </div>
                 </div>
@@ -1936,6 +1948,21 @@ export const ClientsAndHierarchy: React.FC<ClientsAndHierarchyProps> = ({ curren
             <div className="px-8 py-6 bg-white border-t border-slate-100 flex justify-end">
               <button onClick={() => setIsUserClientsModalOpen(false)} className="px-10 py-3 bg-slate-900 text-white rounded-2xl text-xs font-black uppercase tracking-widest hover:bg-slate-800 shadow-xl shadow-slate-200 transition">Close List</button>
             </div>
+          </div>
+        </div>
+      )}
+      {pwNotice && (
+        <div className="fixed inset-0 z-[70] flex items-center justify-center bg-slate-900/60 p-4" role="dialog" aria-modal="true" aria-label="Password saved">
+          <div className="bg-white rounded-2xl shadow-2xl w-full max-w-sm p-6">
+            <div className="flex items-center gap-2 text-emerald-600 mb-1"><Check className="w-5 h-5" /><h3 className="font-black text-slate-900">Password saved</h3></div>
+            <p className="text-xs text-slate-500">The new password for <b>{pwNotice.name}</b> is saved. Share it with them now: it is stored encrypted, so it cannot be shown again later (you can only set a new one).</p>
+            <div className="mt-4 flex items-center gap-2">
+              <input readOnly value={pwNotice.password} onFocus={e => e.currentTarget.select()} className="flex-1 border border-slate-200 rounded-xl px-3 py-2.5 font-mono text-sm font-bold text-slate-900 bg-slate-50" />
+              <button type="button" onClick={() => { try { navigator.clipboard.writeText(pwNotice.password); setPwNoticeCopied(true); } catch { /* the field can still be selected by hand */ } }} className="px-3 py-2.5 rounded-xl border border-slate-200 text-xs font-black uppercase tracking-widest text-slate-600 hover:bg-slate-50 flex items-center gap-1.5">
+                {pwNoticeCopied ? <Check className="w-3.5 h-3.5 text-emerald-600" /> : <Copy className="w-3.5 h-3.5" />}{pwNoticeCopied ? 'Copied' : 'Copy'}
+              </button>
+            </div>
+            <button type="button" onClick={() => setPwNotice(null)} className="mt-5 w-full px-4 py-2.5 rounded-xl bg-blue-600 text-white text-sm font-bold hover:bg-blue-700">Done</button>
           </div>
         </div>
       )}
