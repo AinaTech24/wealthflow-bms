@@ -6,6 +6,7 @@ import { useData, authFetch } from '../contexts/DataContext';
 import { useToast } from '../components/Toast';
 import { formatCompactINR } from '../utils/formatINR';
 import { labelFor } from '../utils/payoutSources';
+import { parseTradeDate, detectDateOrder, monthOfDate, findDateColumn } from '../../src/lib/tradeDate.js';
 
 interface Props { currentUser: TeamMember }
 
@@ -38,16 +39,14 @@ interface PartnerFormat {
 }
 
 // "2026-06" | "Jun 2026" | "01/06/2026" -> "2026-06"
-function monthOf(raw: string): string | null {
+// `order` is how the column's all-numeric dates are written (detectDateOrder): a CSV month like "2026-09" comes back
+// from the sheet reader as a US-style short date ("9/1/26"), month first.
+function monthOf(raw: string, order: 'dmy' | 'mdy' = 'dmy'): string | null {
   const s = String(raw || '').trim();
   if (/^\d{4}-\d{2}$/.test(s)) return s;
   const m = s.match(/^([A-Za-z]{3})[a-z]*[\s-]+(\d{4})$/);
   if (m && MONTHS[m[1].toLowerCase()]) return `${m[2]}-${MONTHS[m[1].toLowerCase()]}`;
-  // A CSV month like "2026-09" comes back from the sheet reader as a US-style short date ("9/1/26").
-  const us = s.match(/^(\d{1,2})\/(\d{1,2})\/(\d{2})$/);
-  if (us) { const a1 = Number(us[1]), b1 = Number(us[2]); const mo = a1 <= 12 ? a1 : b1; if (mo >= 1 && mo <= 12) return `20${us[3]}-${String(mo).padStart(2, '0')}`; }
-  const d = parseTradeDate(s);
-  return d ? d.slice(0, 7) : null;
+  return monthOfDate(s, order);
 }
 // A PAN column ("PAN", "PAN No", "Client PAN"…) lets the server find the client by PAN instead of by name.
 const panIndex = (header: string[]) => header.findIndex(h => /(^|[^a-z])pan([^a-z]|$)/i.test(String(h || '')));
@@ -60,10 +59,11 @@ function parseVolt(grid: string[][], header: string[]) {
   const at = (n: string) => header.findIndex(h => h.toLowerCase() === n.toLowerCase());
   const iM = at('Month'), iN = at('Customer name'), iU = at('Upfront amount'), iT = at('Trail amount'), iTot = at('Total invoice amount');
   const iP = panIndex(header);
+  const order = detectDateOrder(grid.slice(1).map(r => r?.[iM]));
   const rows: any[] = []; let skipped = 0;
   for (const r of grid.slice(1)) {
     if (!r || r.every(c => String(c ?? '').trim() === '')) continue;
-    const period = monthOf(String(r[iM] ?? '')) || '';
+    const period = monthOf(String(r[iM] ?? ''), order) || '';
     const name = String(r[iN] ?? '').replace(/\s+/g, ' ').trim();
     if (!name) { skipped++; continue; }
     const up = num(r[iU]), tr = num(r[iT]), tot = num(r[iTot]);
@@ -92,6 +92,7 @@ function customToFormat(cf: CustomFormat, fixedMonth = ''): PartnerFormat {
     parse: (grid, header) => {
       const iC = header.indexOf(cf.clientCol), iA = header.indexOf(cf.amountCol), iM = cf.monthCol ? header.indexOf(cf.monthCol) : -1;
       const iP = panIndex(header);
+      const order = iM >= 0 ? detectDateOrder(grid.slice(1).map(r => r?.[iM])) : 'dmy';
       const rows: any[] = []; let skipped = 0;
       for (const r of grid.slice(1)) {
         if (!r || r.every(c => String(c ?? '').trim() === '')) continue;
@@ -99,7 +100,7 @@ function customToFormat(cf: CustomFormat, fixedMonth = ''): PartnerFormat {
         const amt = plainNum(r[iA]);
         if (!name) { skipped++; continue; }
         if (amt === 0) continue;
-        const period = fixedMonth || (iM >= 0 ? monthOf(String(r[iM] ?? '')) || '' : '');
+        const period = fixedMonth || (iM >= 0 ? monthOf(String(r[iM] ?? ''), order) || '' : '');
         rows.push({
           clientCode: name.toUpperCase(), tradeDate: period ? lastDayOf(period) : '', period, segment: cf.label, tradeCategory: 'EARNING',
           totalBrokerage: amt, ourShare: amt, partnerShare: 0, product: '', parentProfile: '', pan: iP >= 0 ? cleanPan(r[iP]) : '',
@@ -140,25 +141,11 @@ const PARTNER_FORMATS: PartnerFormat[] = [
   },
 ];
 
-// "01 Jul 2026" → "2026-07-01". Returns null rather than an Invalid Date, so a
-// malformed row is skipped instead of poisoning a month.
 const MONTHS: Record<string, string> = {
   jan: '01', feb: '02', mar: '03', apr: '04', may: '05', jun: '06',
   jul: '07', aug: '08', sep: '09', oct: '10', nov: '11', dec: '12',
 };
-function parseTradeDate(raw: string): string | null {
-  const s = String(raw || '').trim();
-  let m = s.match(/^(\d{1,2})\s+([A-Za-z]{3})[a-z]*\s+(\d{4})$/);
-  if (m) {
-    const mm = MONTHS[m[2].toLowerCase()];
-    if (mm) return `${m[3]}-${mm}-${m[1].padStart(2, '0')}`;
-  }
-  m = s.match(/^(\d{4})-(\d{2})-(\d{2})/);
-  if (m) return `${m[1]}-${m[2]}-${m[3]}`;
-  m = s.match(/^(\d{1,2})[/-](\d{1,2})[/-](\d{4})$/);
-  if (m) return `${m[3]}-${m[2].padStart(2, '0')}-${m[1].padStart(2, '0')}`;
-  return null;
-}
+// Reading a statement's date column (any of the ways a sheet can print a day) lives in src/lib/tradeDate.js.
 
 const num = (v: any) => {
   const n = parseFloat(String(v ?? '').replace(/,/g, '').trim());
@@ -207,13 +194,24 @@ export const PartnerBrokerage: React.FC<Props> = ({ currentUser }) => {
   const [monthAsk, setMonthAsk] = useState<{ message: string; resolve: (m: string | null) => void } | null>(null);
   const [monthPick, setMonthPick] = useState('');
   const askMonth = (message: string) => new Promise<string | null>(resolve => { setMonthPick(''); setMonthAsk({ message, resolve }); });
+  // "Upload into" month. '' = Auto: every line goes to the month of its own date. A month picked here puts the whole file in it.
+  const [uploadMonth, setUploadMonth] = useState('');
+  const uploadMonthOptions = useMemo(() => {
+    const out: string[] = [];
+    const now = new Date();
+    for (let i = 0; i < 24; i++) { const d = new Date(now.getFullYear(), now.getMonth() - i, 1); out.push(`${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}`); }
+    return out;
+  }, []);
+  const [confirmAsk, setConfirmAsk] = useState<{ title: string; message: string; yes: string; resolve: (ok: boolean) => void } | null>(null);
+  const askConfirm = (title: string, message: string, yes: string) => new Promise<boolean>(resolve => setConfirmAsk({ title, message, yes, resolve }));
   const [setup, setSetup] = useState<{ fileName: string; header: string[]; grid: string[][]; resolve: (f: PartnerFormat | null) => void } | null>(null);
   const [setupForm, setSetupForm] = useState({ name: '', clientCol: '', amountCol: '', monthMode: 'column', monthCol: '', fixedMonth: '' });
   const askSetup = (fileName: string, header: string[], grid: string[][]) => new Promise<PartnerFormat | null>(resolve => {
     const guess = (re: RegExp, not = '') => header.find(h => re.test(h) && h !== not) || '';
     const clientCol = guess(/client|customer|name|code|investor|pan/i);
     const amountCol = guess(/total|amount|brok|commission|earning|earned|payout|revenue|income|fee/i, clientCol);
-    const monthCol = guess(/month|period|date/i, clientCol);
+    // The month comes from the file's own dates: a column named month/period/date, else any column that is full of dates.
+    const monthCol = guess(/month|period|date/i, clientCol) || (header[findDateColumn(grid)?.index ?? -1] || '');
     setSetupForm({ name: '', clientCol, amountCol, monthMode: monthCol ? 'column' : 'fixed', monthCol, fixedMonth: '' });
     setSetup({ fileName, header, grid, resolve });
   });
@@ -382,11 +380,17 @@ export const PartnerBrokerage: React.FC<Props> = ({ currentUser }) => {
       let out: any[] = [];
       let skipped = 0;
       if (fmt.parse) { const pr = fmt.parse(grid, header); out = pr.rows; skipped = pr.skipped; }
-      else for (const r of grid.slice(1)) {
+      else {
+      // The month of every line is the month of its own trade date: nobody chooses it. Written the same way down the
+      // column ("01 Sep 2026", "01-Sep-26", "9/1/26"...), so the way round of an all-numeric date is settled once.
+      const dateIdx = idx(fmt.columns.tradeDate);
+      const order = detectDateOrder(grid.slice(1).map(r => r?.[dateIdx]));
+      for (const r of grid.slice(1)) {
         if (!r || r.every(c => String(c ?? '').trim() === '')) continue;
-        const tradeDate = parseTradeDate(cell(r, fmt.columns.tradeDate));
         const clientCode = cell(r, fmt.columns.clientCode);
-        if (!tradeDate || !clientCode) { skipped++; continue; }
+        if (!clientCode) { skipped++; continue; }
+        // A line whose date cannot be read is kept, with no month, and asked about below, instead of its money being dropped.
+        const tradeDate = parseTradeDate(cell(r, fmt.columns.tradeDate), order) || '';
         const extra: Record<string, string> = {};
         for (const e of fmt.extra) { const v = cell(r, e); if (v) extra[e] = v; }
         const pv = panIdx >= 0 ? cleanPan(r[panIdx]) : '';
@@ -406,11 +410,27 @@ export const PartnerBrokerage: React.FC<Props> = ({ currentUser }) => {
           extra,
         });
       }
+      }
       if (!out.length) { showToast('No usable rows in that file.', 'error'); return; }
-      // Lines with no month of their own: ask which month the file is for.
+      // A month chosen in the "Upload into" box puts the whole file in that month. If the file's own dates point somewhere
+      // else, say so before anything is saved: a statement dropped into the wrong month replaces that month's earlier rows.
+      if (uploadMonth) {
+        const elsewhere = [...new Set(out.filter(r => r.period && r.period !== uploadMonth).map(r => String(r.period)))].sort();
+        if (elsewhere.length) {
+          const n = out.filter(r => r.period && r.period !== uploadMonth).length;
+          const go = await askConfirm(
+            `Dates in the file say ${elsewhere.map(prettyMonth).join(', ')}`,
+            `${n} of ${out.length} lines are dated in ${elsewhere.length > 1 ? 'other months' : prettyMonth(elsewhere[0])}, but you chose ${prettyMonth(uploadMonth)}. Put the whole file in ${prettyMonth(uploadMonth)}? ` +
+            `It replaces what ${prettyMonth(uploadMonth)} already holds for this partner. Choose Auto to follow the dates instead.`,
+            `Put it all in ${prettyMonth(uploadMonth)}`);
+          if (!go) { showToast('Upload cancelled.', 'warning'); return; }
+        }
+        for (const r of out) if (r.period !== uploadMonth) { r.period = uploadMonth; r.tradeDate = lastDayOf(uploadMonth); }
+      }
+      // Only lines whose date could not be read are asked about; a file with a date on every line never asks.
       const undated = out.filter(r => !r.period).length;
       if (undated) {
-        const m = await askMonth(`${undated} line${undated !== 1 ? 's have' : ' has'} no month in this file. Which month is it for?`);
+        const m = await askMonth(`${undated} line${undated !== 1 ? 's have' : ' has'} no readable date in this file, so the month is not known. Which month ${undated !== 1 ? 'are they' : 'is it'} for?`);
         if (!m) { showToast('Upload cancelled — no month chosen.', 'warning'); return; }
         for (const r of out) if (!r.period) { r.period = m; r.tradeDate = lastDayOf(m); }
       }
@@ -425,14 +445,17 @@ export const PartnerBrokerage: React.FC<Props> = ({ currentUser }) => {
       });
       const sj = await save.json();
       if (!save.ok) { showToast(sj?.error || 'Import failed.', 'error'); return; }
+      const savedMonths = [...new Set(out.map(r => String(r.period)))].sort();
       showToast(
         `${fmt!.label}: ${sj.written} row${sj.written !== 1 ? 's' : ''} imported` +
-        (skipped ? `, ${skipped} skipped (no month/date or client)` : '') +
+        ` for ${savedMonths.map(prettyMonth).join(', ')}` +
+        (skipped ? `, ${skipped} skipped (no client code)` : '') +
         (sj.replaced ? `. Replaced ${sj.replaced} earlier row${sj.replaced !== 1 ? 's' : ''} for the same month` : '') +
         (sj.panMatched ? `. ${sj.panMatched} client code${sj.panMatched !== 1 ? 's' : ''} attached by PAN` : '') +
         (sj.panAmbiguous ? `. ${sj.panAmbiguous} PAN${sj.panAmbiguous !== 1 ? 's match' : ' matches'} more than one client — attach by hand` : '') +
         `. ${sj.unmapped} row${sj.unmapped !== 1 ? 's' : ''} await client mapping.`,
         'success');
+      setUploadMonth('');     // back to Auto, so the next statement is never forced into this month by accident
       setPartnerList(prev => [...new Set([...prev, fmt!.code])]);
       setPartner(fmt!.code);
       const latest = await latestMonthOf(fmt!.code);
@@ -597,6 +620,18 @@ export const PartnerBrokerage: React.FC<Props> = ({ currentUser }) => {
                 className="hidden"
                 onChange={e => { const f = e.target.files?.[0]; if (f) handleFile(f); }}
               />
+              <label htmlFor="pb-upload-month" className="text-[10px] font-black uppercase tracking-widest text-slate-400 ml-1">Upload into</label>
+              <select
+                id="pb-upload-month"
+                value={uploadMonth}
+                onChange={e => setUploadMonth(e.target.value)}
+                disabled={uploading}
+                title="Auto reads the month from the dates in the file. Pick a month to put the whole file in it."
+                className="px-2 py-2 rounded-lg border border-slate-200 dark:border-slate-600 dark:bg-slate-900 dark:text-slate-100 text-xs font-bold"
+              >
+                <option value="">Auto (from the file's dates)</option>
+                {uploadMonthOptions.map(m => <option key={m} value={m}>{prettyMonth(m)}</option>)}
+              </select>
               <button
                 onClick={() => fileRef.current?.click()}
                 disabled={uploading}
@@ -884,6 +919,19 @@ export const PartnerBrokerage: React.FC<Props> = ({ currentUser }) => {
             <div className="flex gap-2 mt-4">
               <button onClick={() => { monthAsk.resolve(null); setMonthAsk(null); }} className="flex-1 px-4 py-2 rounded-lg border border-slate-200 dark:border-slate-600 text-slate-600 dark:text-slate-300 text-sm font-bold">Cancel</button>
               <button disabled={!monthPick} onClick={() => { monthAsk.resolve(monthPick); setMonthAsk(null); }} className="flex-1 px-4 py-2 rounded-lg bg-blue-600 text-white text-sm font-bold disabled:opacity-40">Continue</button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {confirmAsk && (
+        <div className="fixed inset-0 z-50 bg-slate-900/50 flex items-center justify-center p-4">
+          <div className="bg-white dark:bg-slate-800 rounded-2xl border border-slate-200 dark:border-slate-700 p-5 w-full max-w-sm">
+            <h3 className="font-bold text-slate-900 dark:text-slate-100">{confirmAsk.title}</h3>
+            <p className="text-xs text-slate-500 dark:text-slate-400 mt-2">{confirmAsk.message}</p>
+            <div className="flex gap-2 mt-4">
+              <button onClick={() => { confirmAsk.resolve(false); setConfirmAsk(null); }} className="flex-1 px-4 py-2 rounded-lg border border-slate-200 dark:border-slate-600 text-slate-600 dark:text-slate-300 text-sm font-bold">Cancel</button>
+              <button onClick={() => { confirmAsk.resolve(true); setConfirmAsk(null); }} className="flex-1 px-4 py-2 rounded-lg bg-blue-600 text-white text-sm font-bold">{confirmAsk.yes}</button>
             </div>
           </div>
         </div>
