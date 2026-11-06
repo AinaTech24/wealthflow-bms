@@ -15,9 +15,9 @@ import { pickOwnerRecord } from './src/lib/folioOwner.js';
 import { scopePayoutOverview } from './src/lib/payoutScope.js';
 import { RTA_FILES, RTA_LOG_DDL, buildChecklist, fileKeyOf } from './src/lib/rtaChecklist.js';
 import { normalizeChanges, applyChanges, currentValue, maskAccount, labelOf } from './src/lib/teamImport.js';
-import { recomputePartnerLedger, PARTNER_LEDGER_DDL, PARTNER_FORMAT_DDL, estimateTax, ensurePartnerMapData, buildManualChain, manualId } from './src/lib/partnerPayout.js';
+import { recomputePartnerLedger, PARTNER_LEDGER_DDL, PARTNER_FORMAT_DDL, estimateTax, ensurePartnerMapData, buildManualChain, manualId, manualChainOf } from './src/lib/partnerPayout.js';
 import { memberAsOf, residualSplit, breakdownFromShares } from './src/lib/payoutEngine.js';
-import { chainAsOf, planLevelMove, effectiveMonthOr } from './src/lib/hierarchyHistory.js';
+import { chainAsOf, planLevelMove, planChainChange, effectiveMonthOr } from './src/lib/hierarchyHistory.js';
 import { monthsToLock, mergeLocks } from './src/lib/lockPeriods.js';
 import bcrypt from 'bcrypt';
 import jwt from 'jsonwebtoken';
@@ -1521,7 +1521,7 @@ app.all('/api/data', mutationLimiter, async (req, res) => {
           }
           await ensurePartnerMapData(pool);
           const [manRows] = await pool.query("SELECT clientCode, label, data FROM partner_client_map WHERE partner = ? AND data IS NOT NULL AND data <> ''", [partner]);
-          for (const m of manRows) { try { hier.set(manualId(partner, m.clientCode), { name: m.label || m.clientCode, hierarchy: JSON.parse(m.data).hierarchy || {}, hierarchyHistory: undefined }); } catch { /* skip */ } }
+          for (const m of manRows) { try { const mc = manualChainOf(m.data); if (mc) hier.set(manualId(partner, m.clientCode), { name: m.label || m.clientCode, hierarchy: mc.hierarchy, hierarchyHistory: mc.hierarchyHistory }); } catch { /* skip */ } }
           const [teamRows] = await pool.query('SELECT id, name, level FROM team');
           const team = new Map(teamRows.map(t => [t.id, t]));
           const nameOf = (id) => (id ? (team.get(id)?.name || id) : '');
@@ -1599,7 +1599,7 @@ app.all('/api/data', mutationLimiter, async (req, res) => {
           const tname = new Map(tm.map(t => [t.id, t]));
           return res.json(rows.map(({ mdata, ...r }) => {
             let rmbm = null;
-            if (mdata) { try { const d = JSON.parse(mdata); rmbm = { rmId: d.rmId || null, bmId: d.bmId || null, rmName: tname.get(d.rmId)?.name || '', bmName: tname.get(d.bmId)?.name || tname.get(d.hierarchy?.level4Id)?.name || '', chain: d.hierarchy || {} }; } catch { /* ignore */ } }
+            if (mdata) { try { const d = JSON.parse(mdata); if (d.hierarchy) rmbm = { rmId: d.rmId || null, bmId: d.bmId || null, rmName: tname.get(d.rmId)?.name || '', bmName: tname.get(d.bmId)?.name || tname.get(d.hierarchy?.level4Id)?.name || '', chain: d.hierarchy || {} }; } catch { /* ignore */ } }
             return { ...r, rmbm, months: monthsOf.get(r.clientCode) || [] };
           }));
         } catch (e) {
@@ -3152,36 +3152,64 @@ app.all('/api/data', mutationLimiter, async (req, res) => {
           if (!partner || !pairs.length) return res.status(400).json({ error: 'partner and pairs are required' });
           let mapped = 0, rowsTouched = 0;
           await ensurePartnerMapData(pool);
+          // From which month a CHANGE of a code that is already attached counts. Months before it keep the client / RM / BM they
+          // were paid to (their rows are not re-pointed), and a locked month is never re-attributed: its payout stays as paid.
+          // A code with nobody attached yet is attached for every month, as it always was.
+          const effectiveFrom = effectiveMonthOr(payload?.effectiveFrom, '0000-01');
+          let lockedNow = [];
+          try {
+            const [[cfgRow]] = await pool.query("SELECT data FROM config WHERE id IN ('global_config','global') ORDER BY id = 'global_config' DESC LIMIT 1");
+            lockedNow = JSON.parse(cfgRow?.data || '{}').lockedPeriods || [];
+          } catch { lockedNow = []; }
           let teamMap = null;
           for (const p of pairs) {
             const code = String(p.clientCode || '').trim();
             if (!code) continue;
             let clientId = p.clientId ? String(p.clientId) : null, mdata = null;
+            const [oldRows] = await pool.query('SELECT clientId, data FROM partner_client_map WHERE partner = ? AND clientCode = ?', [partner, code]);
+            const old = oldRows[0] || null;
+            let oldData = {}; try { oldData = JSON.parse(old?.data || '{}') || {}; } catch { oldData = {}; }
+            const from = old && old.clientId ? effectiveFrom : '0000-01';
+            let chainData = null;
             if (!clientId && (p.rmId || p.bmId)) {
               // No WealthFlow client behind this code: attach it straight to the RM and BM chosen.
               if (!teamMap) { const [tr] = await pool.query('SELECT id, level, parentId FROM team'); teamMap = new Map(tr.map(t => [t.id, { id: t.id, level: t.level, parentId: t.parentId }])); }
               const h = buildManualChain({ rmId: p.rmId ? String(p.rmId) : null, bmId: p.bmId ? String(p.bmId) : null }, teamMap);
               if (!Object.values(h).some(Boolean)) return res.status(400).json({ error: `The RM/BM chosen for ${code} has no level set.` });
               clientId = manualId(partner, code);
-              mdata = JSON.stringify({ hierarchy: h, rmId: p.rmId || null, bmId: p.bmId || null });
+              chainData = { hierarchy: h, rmId: p.rmId || null, bmId: p.bmId || null };
+              if (old && old.clientId === clientId && from !== '0000-01' && oldData.hierarchy) {
+                // The same RM/BM attachment is changed from a month: the chain that applied before it is kept for the earlier months.
+                const plan = planChainChange({ client: { hierarchy: oldData.hierarchy, hierarchyHistory: oldData.hierarchyHistory }, hierarchy: h, effectiveFrom: from });
+                chainData = { hierarchy: plan.hierarchy, ...(plan.hierarchyHistory ? { hierarchyHistory: plan.hierarchyHistory } : {}), rmId: p.rmId || null, bmId: p.bmId || null };
+              }
             }
+            // Rows that keep their old RMBM:<code> id (earlier or locked months) still need the chain they were paid with, even after the code
+            // is attached to something else, so it is carried along as "legacy".
+            const keepLegacy = (old && old.clientId && old.clientId !== clientId && oldData.hierarchy)
+              ? { legacyHierarchy: oldData.hierarchy, ...(oldData.hierarchyHistory ? { legacyHistory: oldData.hierarchyHistory } : {}) }
+              : (oldData.legacyHierarchy ? { legacyHierarchy: oldData.legacyHierarchy, ...(oldData.legacyHistory ? { legacyHistory: oldData.legacyHistory } : {}) } : null);
+            if (chainData || keepLegacy) mdata = JSON.stringify({ ...(chainData || {}), ...(keepLegacy && !(chainData && old && old.clientId === clientId) ? keepLegacy : {}) });
             await pool.query(
               `INSERT INTO partner_client_map (partner, clientCode, clientId, label, data)
                VALUES (?,?,?,?,?)
                ON DUPLICATE KEY UPDATE clientId = VALUES(clientId), label = VALUES(label), data = VALUES(data)`,
               [partner, code, clientId, p.label ? String(p.label).slice(0, 255) : null, mdata]);
-            const [r] = await pool.query(
-              `UPDATE partner_brokerage SET mappedClientId = ? WHERE partner = ? AND clientCode = ?`,
-              [clientId, partner, code]);
+            // Re-point the statement rows: those with nobody on them always; the rest only from `from` on, and never in a locked month.
+            let sql = 'UPDATE partner_brokerage SET mappedClientId = ? WHERE partner = ? AND clientCode = ?';
+            const args = [clientId, partner, code];
+            if (from !== '0000-01') { sql += " AND (mappedClientId IS NULL OR mappedClientId = '' OR period >= ?)"; args.push(from); }
+            if (lockedNow.length) { sql += " AND (mappedClientId IS NULL OR mappedClientId = '' OR period NOT IN (?))"; args.push(lockedNow); }
+            const [r] = await pool.query(sql, args);
             mapped++; rowsTouched += r.affectedRows || 0;
           }
           invalidateSummaryCache();
           payoutOverviewCache = null;
           await pool.query('INSERT INTO activity_log (userId, userName, action, description, createdAt) VALUES (?,?,?,?,NOW())',
             [req.user?.id || '', req.user?.name || '', 'partner_map',
-             `${partner}: ${mapped} client code(s) mapped, ${rowsTouched} row(s) re-attributed`]);
+             `${partner}: ${mapped} client code(s) mapped, ${rowsTouched} row(s) re-attributed` + (effectiveFrom !== '0000-01' ? ` from ${effectiveFrom} on` : '')]);
           try { await recomputePartnerLedger(pool, { partner }); payoutOverviewCache = null; } catch (pe) { console.error('[partner_map] ledger:', pe.message); }
-          return res.json({ success: true, mapped, rowsTouched });
+          return res.json({ success: true, mapped, rowsTouched, effectiveFrom });
         } catch (e) {
           console.error('[partner_map]', e);
           return res.status(500).json({ error: e.message });

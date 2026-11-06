@@ -197,6 +197,9 @@ export interface Client {
   // the Lead-Source Sharing Matrix. Unset → treated as self-sourced (lowest
   // assigned level) = existing owner-driven behaviour.
   leadSourceLevel?: number;
+  // Older arrangements of the people above, each "valid before" a month (src/lib/hierarchyHistory.js). Set when an
+  // RM/BM change or a promotion applies from a month, so earlier months are still paid to who they were paid to.
+  hierarchyHistory?: Array<{ before: string; hierarchy: Record<string, string>; leadSourceLevel?: number }>;
   // ── AUM / holdings (populated by CAMS WBR9 master imports; partially by
   //    brokerage statements as `avg_assets`-derived estimates when WBR9 absent).
   totalAum?: number;                  // sum of all per-folio rupee balances

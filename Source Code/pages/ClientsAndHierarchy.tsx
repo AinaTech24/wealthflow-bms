@@ -5,6 +5,8 @@ import { Client, TeamMember, Role } from '../types';
 import { useData, authFetch } from '../contexts/DataContext';
 import { PromotionPanel, PromotionPreview } from '../components/PromotionPanel';
 import { Pagination } from '../components/Pagination';
+import { ChainChangeDialog } from '../components/ChainChangeDialog';
+import { planChainChange } from '../../src/lib/hierarchyHistory.js';
 import { useToast } from '../components/Toast';
 import { TeamInfoImport } from '../components/TeamInfoImport';
 import { formatCompactINR } from '../utils/formatINR';
@@ -75,7 +77,6 @@ export const ClientsAndHierarchy: React.FC<ClientsAndHierarchyProps> = ({ curren
   const [selectedClientForMapping, setSelectedClientForMapping] = useState<Client | null>(null);
   const [mappingForm, setMappingForm] = useState<Client['hierarchy'] | null>(null);
   const [mappingLeadSource, setMappingLeadSource] = useState<number | ''>('');
-  const [applyToHistorical, setApplyToHistorical] = useState(true);
   const [searchTerm, setSearchTerm] = useState('');
   // Gap filters: the four questions an operator asks after every import.
   const [gapFilter, setGapFilter] = useState<'' | 'noRm' | 'noBm' | 'noFolios'>('');
@@ -400,19 +401,69 @@ export const ClientsAndHierarchy: React.FC<ClientsAndHierarchyProps> = ({ curren
     setIsMappingModalOpen(true);
   };
 
+  // ── Changing who is mapped to a client ──────────────────────────────────────────
+  // Any change of RM / BM goes through ONE dialog that asks FROM WHICH MONTH it counts (and whether to recalculate now).
+  // The months before it keep the people they were paid with (hierarchyHistory); locked months never change.
+  const [pendingChain, setPendingChain] = useState<{
+    title: string; lines: string[];
+    items: Array<{ clientId: string; hierarchy: Record<string, string>; leadSourceLevel?: number | string }>;
+    done?: () => void;
+  } | null>(null);
+  const personName = (id?: string) => (id ? team.find(t => t.id === id)?.name || id : 'nobody');
+  const levelTitle = (l: number) => `L${l} ${globalConfig.levelNames?.[l as keyof typeof globalConfig.levelNames] ?? ''}`.trim();
+  // One line per slot that changes, e.g. "L2 Super Ninja: Anil → Bhavna".
+  const describeChange = (client: Client, hierarchy: Record<string, string>, lead: number | string | undefined) => {
+    const out: string[] = [];
+    const cur = (client.hierarchy || {}) as Record<string, string>;
+    for (let l = 0; l <= 7; l++) {
+      const a = cur[`level${l}Id`] || '', b = hierarchy[`level${l}Id`] || '';
+      if (a !== b) out.push(`${levelTitle(l)}: ${personName(a)} → ${personName(b)}`);
+    }
+    const leadNow = lead === '' || lead == null ? 0 : Number(lead);
+    if (Number(client.leadSourceLevel || 0) !== leadNow) out.push(`Lead source: ${client.leadSourceLevel ? `L${client.leadSourceLevel}` : 'self-sourced'} → ${leadNow ? `L${leadNow}` : 'self-sourced'}`);
+    return out;
+  };
+  const askChainChange = (title: string, items: Array<{ client: Client; hierarchy: Record<string, string>; leadSourceLevel?: number | string }>, lines?: string[], done?: () => void) => {
+    // A change is a difference from the people mapped NOW; older arrangements kept in the history are not compared.
+    const real = items.filter(i => describeChange(i.client, i.hierarchy, i.leadSourceLevel).length > 0);
+    if (!real.length) { showToast('Nothing to change: the same people are already mapped.', 'info'); done?.(); return false; }
+    setPendingChain({
+      title, done,
+      lines: lines || describeChange(real[0].client, real[0].hierarchy, real[0].leadSourceLevel),
+      items: real.map(i => ({ clientId: i.client.id, hierarchy: i.hierarchy, leadSourceLevel: i.leadSourceLevel })),
+    });
+    return true;
+  };
+  const applyPendingChain = async (effectiveFrom: string, recalculate: boolean) => {
+    const pc = pendingChain; if (!pc) return;
+    setPendingChain(null);
+    const byId = new Map(pc.items.map(i => [i.clientId, i]));
+    let changed = 0;
+    const next = clients.map(c => {
+      const it = byId.get(c.id); if (!it) return c;
+      const plan = planChainChange({ client: c as any, hierarchy: it.hierarchy, leadSourceLevel: it.leadSourceLevel, effectiveFrom });
+      if (!plan.changed) return c;
+      changed++;
+      const out: any = { ...c, hierarchy: plan.hierarchy, leadSourceLevel: plan.leadSourceLevel };
+      if (plan.hierarchyHistory) out.hierarchyHistory = plan.hierarchyHistory; else delete out.hierarchyHistory;
+      if (plan.leadSourceLevel === undefined) delete out.leadSourceLevel;
+      return out as Client;
+    });
+    await updateClients(next);
+    const when = effectiveFrom === '0000-01' ? 'for every month that is not locked' : `from ${new Date(`${effectiveFrom}-01T00:00:00`).toLocaleString('en-IN', { month: 'long', year: 'numeric' })} on`;
+    showToast(`${changed} client${changed !== 1 ? 's' : ''} updated ${when}.${recalculate ? ' Recalculating payouts…' : ' Payouts follow at the next Recalculate.'}`, 'success');
+    if (recalculate) recalculateAllTransactions();
+    pc.done?.();
+  };
+
   const saveMapping = () => {
     if (selectedClientForMapping && mappingForm) {
       // Note: the SAME person may hold several rungs on one client — that is how
       // the cumulative model lets them earn the full stack up to their level
       // (gross is still counted once per user). So no single-level restriction.
       const leadSourceLevel = mappingLeadSource === '' ? undefined : Number(mappingLeadSource);
-      updateClients(clients.map(c =>
-        c.id === selectedClientForMapping.id ? { ...c, hierarchy: mappingForm, leadSourceLevel } : c
-      ));
-      if (applyToHistorical) {
-        recalculateAllTransactions();
-      }
-      setIsMappingModalOpen(false);
+      const client = clients.find(c => c.id === selectedClientForMapping.id) || selectedClientForMapping;
+      askChainChange(`Change the RM / BM of ${client.name}`, [{ client, hierarchy: mappingForm as any, leadSourceLevel }], undefined, () => setIsMappingModalOpen(false));
     }
   };
 
@@ -423,18 +474,8 @@ export const ClientsAndHierarchy: React.FC<ClientsAndHierarchyProps> = ({ curren
   };
 
   const handleQuickReassign = (clientId: string, level: number, newUserId: string) => {
-    updateClients(clients.map(c => {
-      if (c.id === clientId) {
-        return {
-          ...c,
-          hierarchy: {
-            ...c.hierarchy,
-            [`level${level}Id`]: newUserId
-          }
-        };
-      }
-      return c;
-    }));
+    const client = clients.find(c => c.id === clientId); if (!client) return;
+    askChainChange(`Change the L${level} of ${client.name}`, [{ client, hierarchy: { ...(client.hierarchy as any), [`level${level}Id`]: newUserId }, leadSourceLevel: client.leadSourceLevel }]);
   };
 
   const toggleClientSelection = (id: string) => {
@@ -468,35 +509,13 @@ export const ClientsAndHierarchy: React.FC<ClientsAndHierarchyProps> = ({ curren
     }
     if (selectedClientIds.size === 0) return;
 
-    const confirmed = await showConfirm({
-      title: 'Bulk Assignment',
-      message: `Assign ${selectedClientIds.size} clients to ${team.find(t => t.id === bulkUserId)?.name} as L${bulkLevel}?`,
-      confirmText: 'Assign Now',
-      variant: 'info'
-    });
-    if (!confirmed) return;
-
-    const updatedClients = clients.map(c => {
-      if (selectedClientIds.has(c.id)) {
-        return {
-          ...c,
-          hierarchy: {
-            ...c.hierarchy,
-            [`level${bulkLevel}Id`]: bulkUserId
-          }
-        };
-      }
-      return c;
-    });
-
-    updateClients(updatedClients);
-    if (applyToHistorical) {
-      recalculateAllTransactions();
-    }
-    setSelectedClientIds(new Set());
-    setBulkLevel(null);
-    setBulkUserId('');
-    showToast(`Bulk assignment complete.${applyToHistorical ? ' Historical payouts recalculated.' : ''}`, 'success');
+    const who = team.find(t => t.id === bulkUserId)?.name || bulkUserId;
+    const items = clients.filter(c => selectedClientIds.has(c.id))
+      .map(c => ({ client: c, hierarchy: { ...(c.hierarchy as any), [`level${bulkLevel}Id`]: bulkUserId }, leadSourceLevel: c.leadSourceLevel }));
+    // The dialog is the confirmation: it says what changes and from which month, then saves (and recalculates if asked).
+    askChainChange(`Assign ${selectedClientIds.size} client${selectedClientIds.size !== 1 ? 's' : ''} to ${who} as L${bulkLevel}`, items,
+      [`${levelTitle(bulkLevel)}: ${who} on ${items.length} client${items.length !== 1 ? 's' : ''}`],
+      () => { setSelectedClientIds(new Set()); setBulkLevel(null); setBulkUserId(''); });
   };
 
   const handleBulkDelete = async () => {
@@ -1492,21 +1511,23 @@ export const ClientsAndHierarchy: React.FC<ClientsAndHierarchyProps> = ({ curren
               <p className="text-[10px] text-slate-400 mt-2">Picks the Lead-Source Sharing Matrix row (Settings → Lead Source). Leave as Self-sourced to keep the normal owner-driven split.</p>
             </div>
             <div className="px-8 py-6 bg-white border-t border-slate-100 flex justify-end space-x-3">
-              <div className="flex items-center space-x-2">
-                <input
-                  type="checkbox"
-                  id="recalc-mapping"
-                  checked={applyToHistorical}
-                  onChange={(e) => setApplyToHistorical(e.target.checked)}
-                  className="rounded border-slate-300 text-blue-600 focus:ring-blue-500 w-4 h-4"
-                />
-                <label htmlFor="recalc-mapping" className="text-[10px] font-black uppercase text-slate-500 cursor-pointer">Recalculate historical payouts</label>
-              </div>
+              <p className="mr-auto self-center text-[10px] text-slate-400 max-w-[260px]">When you save you choose the month the change starts from; earlier months keep their RM/BM.</p>
               <button onClick={() => setIsMappingModalOpen(false)} className="px-6 py-3 text-sm font-black uppercase tracking-widest text-slate-400 hover:text-slate-600">Cancel</button>
               <button onClick={saveMapping} className="px-10 py-3 bg-blue-600 text-white rounded-2xl text-xs font-black uppercase tracking-widest hover:bg-blue-700 shadow-xl shadow-blue-100 transition">Save Mapping</button>
             </div>
           </div>
         </div>
+      )}
+
+      {/* Which month does an RM / BM change count from? */}
+      {isAdmin && pendingChain && (
+        <ChainChangeDialog
+          title={pendingChain.title}
+          lines={pendingChain.lines}
+          count={pendingChain.items.length}
+          onConfirm={applyPendingChain}
+          onCancel={() => setPendingChain(null)}
+        />
       )}
 
       {/* Team Modal (Admin Only) */}

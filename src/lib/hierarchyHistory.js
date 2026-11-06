@@ -68,7 +68,7 @@ export function hierarchyAsOf(client, period) {
   return chainAsOf(client, period).hierarchy;
 }
 
-const SLOTS = [1, 2, 3, 4, 5, 6, 7];
+const SLOTS = [0, 1, 2, 3, 4, 5, 6, 7];
 const sameChain = (a, b) => SLOTS.every(l => String((a || {})[`level${l}Id`] || '') === String((b || {})[`level${l}Id`] || ''));
 
 /** Drop snapshots that say nothing new (identical to the chain that follows them). */
@@ -159,4 +159,52 @@ export function planLevelMove({ clients, personId, from, to, effectiveFrom, occu
       blocked: blocked.length,
     },
   };
+}
+
+/**
+ * A client's people are changed by hand (the Clients & Map screen: one client, a bulk assignment, a quick
+ * re-assign) and the change should count FROM a chosen month, not rewrite the months before it.
+ *
+ *   effectiveFrom  'YYYY-MM', or '0000-01' / anything else for "all months" (a correction: the chain is simply
+ *                  replaced and no history is kept)
+ *
+ * The chain that applied in the month before `effectiveFrom` is saved as a snapshot "valid before" it, so earlier
+ * months are still calculated with it (see chainAsOf). Snapshots that only describe months from `effectiveFrom`
+ * on are dropped, because the new chain now applies to them.
+ *
+ * Pure: nothing is written. `client` = { hierarchy, hierarchyHistory, leadSourceLevel }.
+ *
+ * @returns {{ changed: boolean, hierarchy: object, hierarchyHistory: Array|undefined, leadSourceLevel: number|undefined }}
+ */
+export function planChainChange({ client, hierarchy, leadSourceLevel, effectiveFrom }) {
+  const cur = (client && client.hierarchy) || {};
+  const next = { ...(hierarchy || {}) };
+  const lead = leadSourceLevel === '' || leadSourceLevel == null || Number.isNaN(Number(leadSourceLevel)) ? undefined : Number(leadSourceLevel);
+  const M = /^\d{4}-\d{2}$/.test(String(effectiveFrom || '')) && String(effectiveFrom) !== '0000-01' ? String(effectiveFrom) : '0000-01';
+  const older = Array.isArray(client && client.hierarchyHistory)
+    ? client.hierarchyHistory.map(e => ({ before: e.before, hierarchy: { ...e.hierarchy }, leadSourceLevel: e.leadSourceLevel })) : [];
+
+  // Nothing to do only when EVERY month from `M` on already uses these people: the current chain alone is not enough,
+  // because an earlier month, or one from a later snapshot, may still carry someone else.
+  const sameAs = (h, l) => {
+    const keys = new Set([...Object.keys(h || {}), ...Object.keys(next)].filter(k => /^level\d+Id$/.test(k)));
+    return [...keys].every(k => String((h || {})[k] || '') === String(next[k] || '')) && Number(l || 0) === Number(lead || 0);
+  };
+  const affected = [{ hierarchy: cur, leadSourceLevel: client && client.leadSourceLevel }];
+  if (M === '0000-01') affected.push(...older);
+  else {
+    affected.push(chainAsOf({ hierarchy: cur, hierarchyHistory: older, leadSourceLevel: client && client.leadSourceLevel }, M));
+    affected.push(...older.filter(e => String(e.before) > M));
+  }
+  if (affected.every(a => sameAs(a.hierarchy, a.leadSourceLevel))) {
+    return { changed: false, hierarchy: cur, hierarchyHistory: client && client.hierarchyHistory, leadSourceLevel: client && client.leadSourceLevel };
+  }
+
+  if (M === '0000-01') return { changed: true, hierarchy: next, hierarchyHistory: undefined, leadSourceLevel: lead };
+
+  const base = chainAsOf({ hierarchy: cur, hierarchyHistory: older, leadSourceLevel: client.leadSourceLevel }, monthBefore(M));
+  let history = older.filter(e => String(e.before) < M);
+  history.push({ before: M, hierarchy: { ...base.hierarchy }, leadSourceLevel: base.leadSourceLevel });
+  history = normalise(history, next, lead);
+  return { changed: true, hierarchy: next, hierarchyHistory: history.length ? history : undefined, leadSourceLevel: lead };
 }

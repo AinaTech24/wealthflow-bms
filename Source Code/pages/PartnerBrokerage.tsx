@@ -7,6 +7,7 @@ import { useToast } from '../components/Toast';
 import { formatCompactINR } from '../utils/formatINR';
 import { labelFor } from '../utils/payoutSources';
 import { parseTradeDate, detectDateOrder, monthOfDate, findDateColumn } from '../../src/lib/tradeDate.js';
+import { ChainChangeDialog } from '../components/ChainChangeDialog';
 
 interface Props { currentUser: TeamMember }
 
@@ -481,35 +482,56 @@ export const PartnerBrokerage: React.FC<Props> = ({ currentUser }) => {
     while (x && x.parentId && guard++ < 12) { const par = team.find(t => t.id === x!.parentId); if (!par) break; if (par.level >= 4) return par.id; x = par; }
     return '';
   };
+  // A code that is already attached to someone is being CHANGED: the person says from which month, and the months before it
+  // keep who they were paid to (locked months never change). A code with nobody on it yet is attached for every month.
+  const [chainAsk, setChainAsk] = useState<{ title: string; lines: string[]; run: (from: string) => Promise<void> } | null>(null);
+  const attachedNow = (code: string) => {
+    const c = codes.find(x => x.clientCode === code);
+    if (!c || !c.mappedClientId) return null;
+    return c.rmbm ? `${c.rmbm.rmName || 'RM'} / ${c.rmbm.bmName || 'BM'}` : (c.label || clients.find(cl => cl.id === c.mappedClientId)?.name || 'a client');
+  };
+
   const saveRmBm = async (clientCode: string, label: string | null) => {
     const v = rmbmPick[clientCode]; if (!v || (!v.rm && !v.bm)) { showToast('Choose the RM and the BM.', 'warning'); return; }
-    const res = await authFetch('/api/data', { method: 'POST', headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ action: 'partner_map', payload: { partner, pairs: [{ clientCode, rmId: v.rm || null, bmId: v.bm || null, label }] } }) });
-    const j = await res.json();
-    if (!res.ok) { showToast(j?.error || 'Could not save.', 'error'); return; }
-    showToast(`${clientCode} → ${team.find(t => t.id === v.rm)?.name || '—'} / ${team.find(t => t.id === (v.bm || bmAbove(v.rm)))?.name || '—'} · ${j.rowsTouched} row${j.rowsTouched !== 1 ? 's' : ''} now reach them`, 'success');
-    setRmbmPick(pk => { const n = { ...pk }; delete n[clientCode]; return n; });
-    await load();
+    const run = async (effectiveFrom: string) => {
+      const res = await authFetch('/api/data', { method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ action: 'partner_map', payload: { partner, ...(effectiveFrom ? { effectiveFrom } : {}), pairs: [{ clientCode, rmId: v.rm || null, bmId: v.bm || null, label }] } }) });
+      const j = await res.json();
+      if (!res.ok) { showToast(j?.error || 'Could not save.', 'error'); return; }
+      showToast(`${clientCode} → ${team.find(t => t.id === v.rm)?.name || '—'} / ${team.find(t => t.id === (v.bm || bmAbove(v.rm)))?.name || '—'} · ${j.rowsTouched} row${j.rowsTouched !== 1 ? 's' : ''} now reach them`, 'success');
+      setRmbmPick(pk => { const n = { ...pk }; delete n[clientCode]; return n; });
+      await load();
+    };
+    const was = attachedNow(clientCode);
+    if (!was) { await run(''); return; }
+    setChainAsk({ title: `Change who ${clientCode} is attached to`, run,
+      lines: [`${was} → ${team.find(t => t.id === v.rm)?.name || '—'} / ${team.find(t => t.id === (v.bm || bmAbove(v.rm)))?.name || '—'}`] });
   };
 
   const saveMapping = async (clientCode: string, clientId: string) => {
     const client = clients.find(c => c.id === clientId);
-    const res = await authFetch('/api/data', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        action: 'partner_map',
-        payload: { partner, pairs: [{ clientCode, clientId: clientId || null, label: client?.name || null }] },
-      }),
-    });
-    const j = await res.json();
-    if (!res.ok) { showToast(j?.error || 'Could not save the mapping.', 'error'); return; }
-    showToast(
-      clientId
-        ? `${clientCode} → ${client?.name || clientId} · ${j.rowsTouched} row${j.rowsTouched !== 1 ? 's' : ''} re-attributed`
-        : `${clientCode} unmapped · ${j.rowsTouched} row${j.rowsTouched !== 1 ? 's' : ''} detached`,
-      'success');
-    await load();
+    const run = async (effectiveFrom: string) => {
+      const res = await authFetch('/api/data', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          action: 'partner_map',
+          payload: { partner, ...(effectiveFrom ? { effectiveFrom } : {}), pairs: [{ clientCode, clientId: clientId || null, label: client?.name || null }] },
+        }),
+      });
+      const j = await res.json();
+      if (!res.ok) { showToast(j?.error || 'Could not save the mapping.', 'error'); return; }
+      showToast(
+        clientId
+          ? `${clientCode} → ${client?.name || clientId} · ${j.rowsTouched} row${j.rowsTouched !== 1 ? 's' : ''} re-attributed`
+          : `${clientCode} unmapped · ${j.rowsTouched} row${j.rowsTouched !== 1 ? 's' : ''} detached`,
+        'success');
+      await load();
+    };
+    const was = attachedNow(clientCode);
+    if (!was) { await run(''); return; }
+    setChainAsk({ title: clientId ? `Change who ${clientCode} is attached to` : `Detach ${clientCode}`, run,
+      lines: [`${was} → ${clientId ? (client?.name || clientId) : 'nobody'}`] });
   };
 
   // ── Derived ───────────────────────────────────────────────────────────────
@@ -922,6 +944,18 @@ export const PartnerBrokerage: React.FC<Props> = ({ currentUser }) => {
             </div>
           </div>
         </div>
+      )}
+
+      {chainAsk && (
+        <ChainChangeDialog
+          simple
+          noun="client or RM/BM"
+          title={chainAsk.title}
+          lines={chainAsk.lines}
+          count={1}
+          onConfirm={(month) => { const run = chainAsk.run; setChainAsk(null); void run(month); }}
+          onCancel={() => setChainAsk(null)}
+        />
       )}
 
       {confirmAsk && (

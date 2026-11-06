@@ -62,6 +62,20 @@ export function buildManualChain({ rmId, bmId }, team) {
   return h;
 }
 
+/**
+ * The RM/BM chain stored on partner_client_map.data, with the history of its earlier arrangements, or null when there is none.
+ * A code attached to an RM/BM NOW has { hierarchy, hierarchyHistory }. A code that was attached to an RM/BM and later re-pointed
+ * (to a client, or to nobody) from a month on keeps that old chain as { legacyHierarchy, legacyHistory }, because the rows of the
+ * months before that still carry the RMBM:<code> id and must be paid to the people they were paid to.
+ */
+export function manualChainOf(data) {
+  let d; try { d = typeof data === 'string' ? JSON.parse(data) : data; } catch { return null; }
+  if (!d || typeof d !== 'object') return null;
+  if (d.hierarchy) return { hierarchy: d.hierarchy, hierarchyHistory: Array.isArray(d.hierarchyHistory) ? d.hierarchyHistory : undefined };
+  if (d.legacyHierarchy) return { hierarchy: d.legacyHierarchy, hierarchyHistory: Array.isArray(d.legacyHistory) ? d.legacyHistory : undefined };
+  return null;
+}
+
 /** partner_client_map.data holds the RM/BM chain; older databases need the column added once. */
 export async function ensurePartnerMapData(pool) {
   try { await pool.query('ALTER TABLE partner_client_map ADD COLUMN data TEXT'); } catch (e) { if (!/Duplicate column/i.test(String(e.message))) throw e; }
@@ -96,7 +110,7 @@ export async function recomputePartnerLedger(pool, { partner } = {}) {
   const [teamRows] = await pool.query('SELECT id, level, data FROM team');
   const [manualRows] = await pool.query("SELECT partner, clientCode, data FROM partner_client_map WHERE data IS NOT NULL AND data <> ''");
   const manual = new Map();
-  for (const m of manualRows) { try { manual.set(manualId(m.partner, m.clientCode), { hierarchy: JSON.parse(m.data).hierarchy || {}, hierarchyHistory: undefined, leadSourceLevel: undefined }); } catch { /* skip */ } }
+  for (const m of manualRows) { const mc = manualChainOf(m.data); if (mc) manual.set(manualId(m.partner, m.clientCode), { hierarchy: mc.hierarchy, hierarchyHistory: mc.hierarchyHistory, leadSourceLevel: undefined }); }
   const teamMap = new Map();
   for (const t of teamRows) {
     let d = {}; try { d = JSON.parse(t.data || '{}'); } catch { /* keep {} */ }
